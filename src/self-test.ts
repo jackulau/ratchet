@@ -87,8 +87,8 @@ export async function runSelfTest(): Promise<boolean> {
   results.push(await runTest("MockBackend.connectionTest", async () => {
     const ct = await mock.connectionTest();
     assert(ct.stable, "should be stable");
-    assertEqual(ct.reads, 5, "reads");
-    assertEqual(ct.matches, 5, "matches");
+    assertEqual(ct.reads, 10, "reads");
+    assertEqual(ct.matches, 10, "matches");
   }));
 
   results.push(await runTest("MockBackend.isWriteProtected", async () => {
@@ -784,6 +784,59 @@ export async function runSelfTest(): Promise<boolean> {
     const jedecCat = result.categories.find(c => c.name === "JEDEC Validity");
     assert(jedecCat !== undefined, "should have JEDEC category");
     assert(jedecCat!.score < 100, "JEDEC score should be penalized by ffffff");
+  }));
+
+  // ─── MockBackend Connection Test Enhancement ───
+  console.log("\nMockBackend Connection Test Enhancement");
+
+  results.push(await runTest("MockBackend stable mode connectionTest returns 10/10 consistent", async () => {
+    const m = new MockBackend();
+    m.setQualityMode('stable');
+    const ct = await m.connectionTest();
+    assert(ct.stable, "should be stable");
+    assertEqual(ct.reads, 10, "reads");
+    assertEqual(ct.matches, 10, "matches");
+    assertEqual(ct.jedecId, "ef4017", "jedecId");
+    assert(ct.error === undefined, "should have no error");
+  }));
+
+  results.push(await runTest("MockBackend noisy mode connectionTest returns inconsistent reads", async () => {
+    const m = new MockBackend();
+    m.setQualityMode('noisy');
+    const ct = await m.connectionTest();
+    assert(!ct.stable, "should not be stable");
+    assertEqual(ct.reads, 10, "reads");
+    assert(ct.matches < 10, `matches should be < 10, got ${ct.matches}`);
+    assert(ct.error !== undefined, "should have error message");
+  }));
+
+  results.push(await runTest("MockBackend disconnected mode returns 000000 JEDEC", async () => {
+    const m = new MockBackend();
+    m.setQualityMode('disconnected');
+    const ct = await m.connectionTest();
+    assert(!ct.stable, "should not be stable");
+    assertEqual(ct.jedecId, "000000", "jedecId");
+    assert(ct.error !== undefined, "should have error message");
+  }));
+
+  results.push(await runTest("MockBackend connectionTest includes timings array of length 10", async () => {
+    const m = new MockBackend();
+    const ct = await m.connectionTest();
+    assert(Array.isArray(ct.timings), "timings should be an array");
+    assertEqual(ct.timings.length, 10, "timings length");
+    assert(ct.timings.every(t => typeof t === 'number' && t >= 0), "all timings should be non-negative numbers");
+  }));
+
+  results.push(await runTest("MockBackend connectionTest includes statusRegister", async () => {
+    const m = new MockBackend();
+    const ct = await m.connectionTest();
+    assert(ct.statusRegister !== undefined, "statusRegister should be defined");
+    assertEqual(ct.statusRegister, 0x00, "statusRegister value");
+
+    // Disconnected mode should have null statusRegister
+    m.setQualityMode('disconnected');
+    const ct2 = await m.connectionTest();
+    assertEqual(ct2.statusRegister, null, "disconnected statusRegister should be null");
   }));
 
   // ─── Report ───

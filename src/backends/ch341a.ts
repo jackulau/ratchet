@@ -1,6 +1,7 @@
 import { findByIds, type Device, type InEndpoint, type OutEndpoint } from "usb";
 import type { ChipInfo, ReadResult, WriteResult, EraseResult, VerifyResult, ProgrammerInfo } from "../types.js";
 import { lookupChipByJedecId, formatSize } from "../chips/database.js";
+import { wrapUsbError } from "./usb-errors.js";
 import { readFile, stat, writeFile, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -136,37 +137,50 @@ export class CH341ABackend {
     return { type: "unknown", connected: false, description: "No CH34x programmer detected" };
   }
 
-  async connectionTest(): Promise<{ stable: boolean; reads: number; matches: number; jedecId: string; error?: string }> {
+  async connectionTest(): Promise<{ stable: boolean; reads: number; matches: number; jedecId: string; error?: string; timings: number[]; statusRegister: number | null }> {
     await this.open();
     try {
       const ids: string[] = [];
+      const timings: number[] = [];
 
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < 10; i++) {
+        const t0 = Date.now();
         const rx = await this.spiCommand([SPI_CMD_RDID, 0, 0, 0]);
+        timings.push(Date.now() - t0);
         const id = rx.subarray(1, 4).toString("hex");
         ids.push(id);
       }
 
       const first = ids[0];
       const matches = ids.filter((id) => id === first).length;
-      const stable = matches === 5;
+      const stable = matches === 10;
+
+      // Attempt status register read (SR1)
+      let statusRegister: number | null = null;
+      try {
+        statusRegister = await this.readStatusRegister();
+      } catch {}
 
       if (first === "000000" || first === "ffffff") {
         return {
           stable: false,
-          reads: 5,
+          reads: 10,
           matches,
           jedecId: first,
           error: "No chip responding — check clip/socket connection",
+          timings,
+          statusRegister,
         };
       }
 
       return {
         stable,
-        reads: 5,
+        reads: 10,
         matches,
         jedecId: first,
-        error: stable ? undefined : `Unstable connection: got ${matches}/5 consistent reads — reseat SOIC clip or check ZIF socket`,
+        error: stable ? undefined : `Unstable connection: got ${matches}/10 consistent reads — reseat SOIC clip or check ZIF socket`,
+        timings,
+        statusRegister,
       };
     } catch (err: any) {
       return {
@@ -175,6 +189,8 @@ export class CH341ABackend {
         matches: 0,
         jedecId: "",
         error: err.message,
+        timings: [],
+        statusRegister: null,
       };
     } finally {
       await this.close();
@@ -373,9 +389,9 @@ export class CH341ABackend {
       try {
         await this.bulkWrite(data);
         return;
-      } catch (err) {
+      } catch (err: any) {
         this.usbErrorCount++;
-        if (attempt === USB_MAX_RETRIES - 1) throw err;
+        if (attempt === USB_MAX_RETRIES - 1) throw wrapUsbError(err);
         await this.delay(USB_RETRY_DELAYS[attempt]);
       }
     }
@@ -385,9 +401,9 @@ export class CH341ABackend {
     for (let attempt = 0; attempt < USB_MAX_RETRIES; attempt++) {
       try {
         return await this.bulkRead(length);
-      } catch (err) {
+      } catch (err: any) {
         this.usbErrorCount++;
-        if (attempt === USB_MAX_RETRIES - 1) throw err;
+        if (attempt === USB_MAX_RETRIES - 1) throw wrapUsbError(err);
         await this.delay(USB_RETRY_DELAYS[attempt]);
       }
     }
@@ -489,6 +505,20 @@ export class CH341ABackend {
       await this.spiCommand([SPI_CMD_WRSR, 0x00, 0x00]);
       await this.waitUntilReady();
     } catch {}
+  }
+
+  // --- Public status register access ---
+
+  async readStatusRegisters(): Promise<{ sr1: number; sr2: number; sr3: number }> {
+    await this.open();
+    try {
+      const sr1 = await this.readStatusRegister();
+      const sr2 = await this.readStatusRegister2();
+      const sr3 = await this.readStatusRegister3();
+      return { sr1, sr2, sr3 };
+    } finally {
+      await this.close();
+    }
   }
 
   // --- JEDEC ID ---

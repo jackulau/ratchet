@@ -1,6 +1,7 @@
 import { findByIds, type Device, type InEndpoint, type OutEndpoint } from "usb";
 import type { ChipInfo, ReadResult, WriteResult, EraseResult, VerifyResult, ProgrammerInfo } from "../types.js";
 import { lookupChipByJedecId, formatSize } from "../chips/database.js";
+import { wrapUsbError } from "./usb-errors.js";
 import { readFile, writeFile, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -105,12 +106,12 @@ export class CH347Backend {
             else resolve();
           });
         });
-      } catch (err) {
+      } catch (err: any) {
         if (attempt < USB_RETRY_COUNT) {
           await this.sleep(USB_RETRY_DELAYS[attempt]);
           continue;
         }
-        throw err;
+        throw wrapUsbError(err);
       }
     }
   }
@@ -126,16 +127,15 @@ export class CH347Backend {
             else resolve(data || Buffer.alloc(0));
           });
         });
-      } catch (err) {
+      } catch (err: any) {
         if (attempt < USB_RETRY_COUNT) {
           await this.sleep(USB_RETRY_DELAYS[attempt]);
           continue;
         }
-        throw err;
+        throw wrapUsbError(err);
       }
     }
 
-    // Unreachable, but TypeScript needs it
     throw new Error("USB read failed after retries");
   }
 
@@ -355,28 +355,27 @@ export class CH347Backend {
 
       try {
         const readBuf = Buffer.alloc(totalBytes);
-        // Use larger read chunks for speed — CH347 can handle up to 510 bytes payload
-        // Fast Read: cmd + addr + dummy byte + data
+        // Batch large SPI reads — spiTransfer splits into 510-byte USB packets internally
         const addrLen = needs4Byte ? 4 : 3;
         const headerLen = 1 + addrLen + 1; // cmd + addr + dummy
-        const dataPerPacket = CH347_MAX_SPI_PAYLOAD - headerLen;
+        const maxChunk = 32 * 1024; // 32KB per SPI transaction
         let offset = 0;
         const readStartTime = Date.now();
 
         while (offset < totalBytes) {
-          const chunkSize = Math.min(dataPerPacket, totalBytes - offset);
+          const chunkSize = Math.min(maxChunk, totalBytes - offset);
           const addr = this.encodeAddress(offset);
           const readCmd = needs4Byte ? SPI_CMD_FAST_READ_4BYTE : SPI_CMD_FAST_READ;
-          const dummyData = new Array(chunkSize).fill(0);
+          const txBuf = Buffer.alloc(headerLen + chunkSize);
+          txBuf[0] = readCmd;
+          for (let i = 0; i < addr.length; i++) txBuf[1 + i] = addr[i];
+          // dummy byte and data bytes stay 0x00
 
-          // Fast Read: command + address + 1 dummy byte + read data
-          const rx = await this.spiCommand([readCmd, ...addr, 0x00, ...dummyData]);
-
-          // Response: skip command echo + address echo + dummy byte
+          const rx = await this.spiTransfer(txBuf);
           rx.copy(readBuf, offset, headerLen, headerLen + chunkSize);
           offset += chunkSize;
 
-          if (onProgress && offset % (64 * 1024) < dataPerPacket) {
+          if (onProgress && offset % (64 * 1024) < maxChunk) {
             const elapsed = (Date.now() - readStartTime) / 1000;
             const speed = elapsed > 0 ? offset / elapsed : 0;
             const remaining = totalBytes - offset;
@@ -443,24 +442,33 @@ export class CH347Backend {
     return { type: "unknown", connected: false, description: "No CH347 programmer detected" };
   }
 
-  async connectionTest(): Promise<{ stable: boolean; reads: number; matches: number; jedecId: string; error?: string }> {
+  async connectionTest(): Promise<{ stable: boolean; reads: number; matches: number; jedecId: string; error?: string; timings: number[]; statusRegister: number | null }> {
     await this.open();
     try {
       const ids: string[] = [];
-      for (let i = 0; i < 5; i++) {
+      const timings: number[] = [];
+      for (let i = 0; i < 10; i++) {
+        const t0 = Date.now();
         const rx = await this.spiCommand([SPI_CMD_RDID, 0, 0, 0]);
+        timings.push(Date.now() - t0);
         ids.push(rx.subarray(1, 4).toString("hex"));
       }
       const first = ids[0];
       const matches = ids.filter((id) => id === first).length;
-      const stable = matches === 5;
+      const stable = matches === 10;
+
+      // Attempt status register read (SR1)
+      let statusRegister: number | null = null;
+      try {
+        statusRegister = await this.readStatusRegister();
+      } catch {}
 
       if (first === "000000" || first === "ffffff") {
-        return { stable: false, reads: 5, matches, jedecId: first, error: "No chip responding — check clip/socket connection" };
+        return { stable: false, reads: 10, matches, jedecId: first, error: "No chip responding — check clip/socket connection", timings, statusRegister };
       }
-      return { stable, reads: 5, matches, jedecId: first, error: stable ? undefined : `Unstable: ${matches}/5 consistent — reseat SOIC clip` };
+      return { stable, reads: 10, matches, jedecId: first, error: stable ? undefined : `Unstable: ${matches}/10 consistent — reseat SOIC clip`, timings, statusRegister };
     } catch (err: any) {
-      return { stable: false, reads: 0, matches: 0, jedecId: "", error: err.message };
+      return { stable: false, reads: 0, matches: 0, jedecId: "", error: err.message, timings: [], statusRegister: null };
     } finally {
       await this.close();
     }
@@ -549,6 +557,16 @@ export class CH347Backend {
       this.device = null;
       this.epIn = null;
       this.epOut = null;
+    }
+  }
+
+  async readStatusRegisters(): Promise<{ sr1: number; sr2: number; sr3: number }> {
+    await this.open();
+    try {
+      const sr1 = await this.readStatusRegister();
+      return { sr1, sr2: 0, sr3: 0 };
+    } finally {
+      await this.close();
     }
   }
 
