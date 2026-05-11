@@ -1,0 +1,4 @@
+node_modules/
+dist/
+*.backup.*.bin
+.DS_Store
