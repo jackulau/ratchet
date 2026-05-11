@@ -2,7 +2,6 @@
 
 import { CH341ABackend, type ProgressCallback } from "./backends/ch341a.js";
 import { CH347Backend } from "./backends/ch347.js";
-import { FlashromBackend } from "./backends/flashrom.js";
 import { BiosAnalyzer } from "./analysis/bios.js";
 import { SerialDebug } from "./serial/debug.js";
 import { searchChips, CHIP_DATABASE, formatSize, getChipVoltage, needs4ByteAddressing, getManufacturerName, lookupChipByJedecId } from "./chips/database.js";
@@ -13,11 +12,10 @@ import { join } from "node:path";
 import * as out from "./output.js";
 import type { ChipInfo, ReadResult } from "./types.js";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 
 const ch341a = new CH341ABackend();
 const ch347 = new CH347Backend();
-const flashrom = new FlashromBackend();
 const analyzer = new BiosAnalyzer();
 const serial = new SerialDebug();
 
@@ -28,17 +26,16 @@ function vlog(msg: string): void {
 
 // ─── Backend selection ───
 
-type BackendKind = "ch341a" | "ch347" | "flashrom";
+type BackendKind = "ch341a" | "ch347";
 
 async function pickBackend(force?: string): Promise<{ kind: BackendKind }> {
-  if (force === "flashrom") {
-    await flashrom.findFlashrom();
-    return { kind: "flashrom" };
+  if (force) {
+    if (force === "ch347") return { kind: "ch347" };
+    if (force === "ch341a" || force === "native") return { kind: "ch341a" };
+    out.fail(`Unknown backend: "${force}". Supported: ch341a, ch347`);
+    process.exit(1);
   }
-  if (force === "ch347") return { kind: "ch347" };
-  if (force === "ch341a" || force === "native") return { kind: "ch341a" };
 
-  // Auto-detect: CH341A → CH347 → flashrom
   try {
     const info = await ch341a.detectProgrammer();
     if (info.connected && info.type === "ch341a") {
@@ -55,16 +52,21 @@ async function pickBackend(force?: string): Promise<{ kind: BackendKind }> {
     }
   } catch {}
 
-  try {
-    await flashrom.findFlashrom();
-    vlog("Falling back to flashrom");
-    return { kind: "flashrom" };
-  } catch {}
-
-  return { kind: "ch341a" };
+  out.fail("No CH341A or CH347 programmer detected.");
+  console.log();
+  out.dim("Troubleshooting:");
+  out.dim("  1. Check USB connection — unplug and reconnect the programmer");
+  out.dim("  2. Verify the programmer is powered (LED should be on)");
+  out.dim("  3. Try a different USB port (avoid hubs)");
+  out.dim("  4. Check driver installation:");
+  out.dim("     macOS: no driver needed (libusb)");
+  out.dim("     Linux: ensure user is in 'plugdev' group, or run with sudo");
+  out.dim("     Windows: install WCH drivers or use Zadig for libusb");
+  out.dim("  5. If using SOIC clip: check clip seating on chip (pin 1 alignment)");
+  process.exit(1);
 }
 
-async function identifyAny(programmer?: string): Promise<ChipInfo | null> {
+async function identifyAny(): Promise<ChipInfo | null> {
   try {
     vlog("Trying CH341A chip identification...");
     return await ch341a.identifyChip();
@@ -76,12 +78,6 @@ async function identifyAny(programmer?: string): Promise<ChipInfo | null> {
     return await ch347.identifyChip();
   } catch (err: any) {
     vlog(`CH347: ${err.message}`);
-  }
-  try {
-    vlog("Trying flashrom chip identification...");
-    return await flashrom.identifyChip(programmer);
-  } catch (err: any) {
-    vlog(`Flashrom: ${err.message}`);
   }
   return null;
 }
@@ -119,7 +115,7 @@ async function cmdStatus(args: Args) {
   }
 
   out.header("Flash Chip");
-  const chip = await identifyAny(args.programmer);
+  const chip = await identifyAny();
   if (chip) {
     out.ok(`${chip.vendorName} ${chip.name}`);
     out.kvLine("JEDEC ID", chip.jedecId);
@@ -140,13 +136,6 @@ async function cmdStatus(args: Args) {
     out.dim("Check chip seating in ZIF socket (pin 1 aligned with dot/notch)");
   }
 
-  out.header("Flashrom");
-  try {
-    const ver = await flashrom.getVersion();
-    out.ok(`v${ver} (fallback backend)`);
-  } catch {
-    out.dim("Not installed (optional — native USB backends preferred)");
-  }
   console.log();
 }
 
@@ -185,7 +174,7 @@ async function cmdDetect() {
 
 async function cmdIdentify(args: Args) {
   out.header("Identifying chip...");
-  const chip = await identifyAny(args.programmer);
+  const chip = await identifyAny();
   if (!chip) {
     out.fail("No chip detected");
     out.dim("1. Check programmer is connected");
@@ -262,12 +251,9 @@ async function cmdRead(args: Args) {
       result = await ch341a.readChip(outPath, makeProgress("Reading"));
     }
     out.writeProgress("Reading", 100);
-  } else if (backend.kind === "ch347") {
+  } else {
     result = await ch347.readChip(outPath, makeProgress("Reading"));
     out.writeProgress("Reading", 100);
-  } else {
-    out.info("Reading via flashrom (no progress available)...");
-    result = await flashrom.readChip(outPath, args.programmer, args.chip);
   }
 
   if (!result.success) {
@@ -350,11 +336,11 @@ async function cmdWrite(args: Args) {
         out.ok(`Connection stable (${connTest.matches}/${connTest.reads} reads consistent)`);
       }
     } catch {
-      // No native programmer — skip test, flashrom will handle errors
+      // Programmer not connected — skip pre-write test
     }
   }
 
-  const chip = await identifyAny(args.programmer);
+  const chip = await identifyAny();
   if (chip) {
     out.info(`Chip: ${chip.vendorName} ${chip.name} (${chip.sizeHuman})`);
 
@@ -415,11 +401,9 @@ async function cmdWrite(args: Args) {
     if (backend.kind === "ch341a") {
       result = await ch341a.writeChip(writePath, makeProgress("Writing"), { skipBackup: noBackup, skipVerify: noVerify });
       out.writeProgress("Writing", 100);
-    } else if (backend.kind === "ch347") {
+    } else {
       result = await ch347.writeChip(writePath, makeProgress("Writing"), { skipBackup: noBackup, skipVerify: noVerify });
       out.writeProgress("Writing", 100);
-    } else {
-      result = await flashrom.writeChip(writePath, args.programmer, args.chip, !noVerify);
     }
   } finally {
     if (tmpWritePath) try { await unlink(tmpWritePath); } catch {}
@@ -456,11 +440,9 @@ async function cmdBlankCheck(args: Args) {
     if (backend.kind === "ch341a") {
       result = await ch341a.readChip(tmpPath, makeProgress("Reading"));
       out.writeProgress("Reading", 100);
-    } else if (backend.kind === "ch347") {
+    } else {
       result = await ch347.readChip(tmpPath, makeProgress("Reading"));
       out.writeProgress("Reading", 100);
-    } else {
-      result = await flashrom.readChip(tmpPath, args.programmer, args.chip);
     }
 
     if (!result.success) {
@@ -544,8 +526,7 @@ async function cmdErase(args: Args) {
 
   let result;
   if (backend.kind === "ch341a") result = await ch341a.eraseChip();
-  else if (backend.kind === "ch347") result = await ch347.eraseChip();
-  else result = await flashrom.eraseChip(args.programmer, args.chip);
+  else result = await ch347.eraseChip();
 
   process.removeListener("SIGINT", sigHandler);
 
@@ -582,11 +563,6 @@ async function cmdRegionErase(args: Args) {
   out.header(`Region erase: 0x${startAddr.toString(16)} — ${formatSize(length)}`);
 
   const backend = await pickBackend(args.backend);
-  if (backend.kind === "flashrom") {
-    out.fail("Region erase requires native USB backend (no CH341A/CH347 detected, or use -b ch341a)");
-    process.exit(1);
-  }
-
   out.info(`Backend: ${backend.kind}`);
 
   let result;
@@ -616,8 +592,7 @@ async function cmdVerify(args: Args) {
 
   let result;
   if (backend.kind === "ch341a") result = await ch341a.verifyChip(filePath);
-  else if (backend.kind === "ch347") result = await ch347.verifyChip(filePath);
-  else result = await flashrom.verifyChip(filePath, args.programmer, args.chip);
+  else result = await ch347.verifyChip(filePath);
 
   if (result.matches) {
     out.ok(`Match confirmed in ${out.formatDuration(result.durationMs)}`);
@@ -967,16 +942,6 @@ async function cmdSetup() {
     out.warn(`CH347 USB: ${err.message}`);
   }
 
-  // Flashrom
-  try {
-    const ver = await flashrom.getVersion();
-    out.ok(`flashrom v${ver} (fallback backend)`);
-  } catch {
-    out.dim("flashrom not installed (optional)");
-    out.dim("  macOS: brew install flashrom");
-    out.dim("  Linux: sudo apt install flashrom");
-  }
-
   // Serialport
   try {
     await serial.listPorts();
@@ -996,7 +961,6 @@ async function cmdSetup() {
 interface Args {
   command: string;
   positional: string[];
-  programmer?: string;
   chip?: string;
   backend?: string;
   flags: string[];
@@ -1006,14 +970,12 @@ function parseArgs(): Args {
   const raw = process.argv.slice(2);
   const positional: string[] = [];
   const flags: string[] = [];
-  let programmer: string | undefined;
   let chip: string | undefined;
   let backend: string | undefined;
   let command = "";
 
   for (let i = 0; i < raw.length; i++) {
     const arg = raw[i];
-    if (arg === "--programmer" || arg === "-p") { programmer = raw[++i]; continue; }
     if (arg === "--chip" || arg === "-c") { chip = raw[++i]; continue; }
     if (arg === "--backend" || arg === "-b") { backend = raw[++i]; continue; }
     if (arg === "--verbose" || arg === "-v") { flags.push("--verbose"); continue; }
@@ -1023,7 +985,7 @@ function parseArgs(): Args {
     positional.push(arg);
   }
 
-  return { command, positional, programmer, chip, backend, flags };
+  return { command, positional, chip, backend, flags };
 }
 
 function showHelp(): void {
@@ -1068,8 +1030,7 @@ ${"\x1b[1m"}SETUP:${"\x1b[0m"}
   setup                      Check all dependencies and connections
 
 ${"\x1b[1m"}OPTIONS:${"\x1b[0m"}
-  -b, --backend <type>       Force: ch341a | ch347 | flashrom
-  -p, --programmer <type>    flashrom programmer (default: ch341a_spi)
+  -b, --backend <type>       Force: ch341a | ch347
   -c, --chip <name>          Force chip name
   -v, --verbose              Show debug output
   -V, --version              Show version
@@ -1084,7 +1045,6 @@ ${"\x1b[1m"}OPTIONS:${"\x1b[0m"}
 ${"\x1b[1m"}BACKENDS:${"\x1b[0m"}
   ch341a    Native USB — 31B/packet, 3/4-byte addressing, SFDP
   ch347     Native USB — 510B/packet, up to 60MHz SPI clock
-  flashrom  CLI fallback — requires flashrom installed
 
 ${"\x1b[1m"}EXAMPLES:${"\x1b[0m"}
   biospy status                        # what's connected?

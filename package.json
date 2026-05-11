@@ -1,6 +1,6 @@
 {
   "name": "biospy",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Modern BIOS chip programmer and debugger for CH341A/CH347 USB programmers",
   "type": "module",
   "bin": {

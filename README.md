@@ -2,7 +2,7 @@
 
 Modern BIOS chip programmer and debugger for CH341A / CH347 USB programmers.
 
-Replaces AsProgrammer, NeoProgrammer, and flashrom's CLI with a single tool that has native USB support, safety guards, BIOS image analysis, and real progress reporting.
+Replaces AsProgrammer and NeoProgrammer with a single tool that has native USB support, safety guards, BIOS image analysis, and real progress reporting. No external tools required.
 
 ## Install
 
@@ -96,14 +96,14 @@ biospy verify new_bios.bin
 
 ```
 biospy
-├── Native USB backend     ← direct CH341A SPI via libusb (preferred)
-├── Flashrom backend       ← fallback, wraps flashrom CLI
+├── CH341A backend         ← direct SPI via libusb, 31B/packet
+├── CH347 backend          ← direct SPI via libusb, 510B/packet, up to 60MHz
 ├── BIOS analyzer          ← UEFI FV, Intel FD, vendor detection
 ├── Chip database          ← 55+ chips with voltage/pinout specs
 └── Serial debug           ← CH343 UART streaming
 ```
 
-**Native USB** talks directly to the CH341A over libusb — no flashrom needed. Flashrom is auto-detected as a fallback if the native backend can't connect.
+**Fully native USB** — talks directly to CH341A/CH347 hardware over libusb. No external tools required.
 
 ## Supported Hardware
 
@@ -117,9 +117,8 @@ Winbond, Macronix, GigaDevice, SST, EON, Spansion, Micron, ISSI, XMC, PUYA — b
 ## Options
 
 ```
--p, --programmer <type>    Flashrom programmer type (default: ch341a_spi)
 -c, --chip <name>          Force chip name
--b, --backend <type>       Force: native | flashrom
+-b, --backend <type>       Force: ch341a | ch347
 --force-1.8v               Acknowledge 1.8V voltage risk
 --confirm                  Required for erase
 ```
@@ -129,4 +128,3 @@ Winbond, Macronix, GigaDevice, SST, EON, Spansion, Micron, ISSI, XMC, PUYA — b
 - Node.js 20+
 - macOS, Linux, or Windows
 - CH341A or CH347 USB programmer
-- flashrom (optional, for fallback backend)

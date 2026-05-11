@@ -1,4 +1,4 @@
-export type BackendType = "native" | "flashrom";
+export type BackendType = "native";
 
 export interface ProgrammerInfo {
   type: "ch341a" | "ch347" | "ch343" | "unknown";
