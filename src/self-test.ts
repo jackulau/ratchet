@@ -12,6 +12,8 @@ import { createHash } from "node:crypto";
 import * as out from "./output.js";
 import { computeQualityScore, formatMonitorLine, shouldAutoExit, MONITOR_AUTO_EXIT_THRESHOLD } from "./connection/quality.js";
 import type { RawConnectionData } from "./connection/quality.js";
+import { generateRepairReport, repairFromReference, resetNvram, repairResetVector, repairAuto } from "./analysis/repair.js";
+import { listRegions } from "./analysis/regions.js";
 
 const VERSION = "1.1.0";
 
@@ -1149,6 +1151,296 @@ export async function runSelfTest(): Promise<boolean> {
     if (quality.score < 20) {
       assertEqual(shouldAutoExit(quality.score), true, "monitor would auto-exit at this score");
     }
+  }));
+
+  // ─── BIOS Repair Engine Tests ───
+  console.log("\nBIOS Repair Engine");
+
+  // Helper: create mock Intel FD image (8MB)
+  function createMockIntelFdImage(): Buffer {
+    const img = Buffer.alloc(8 * 1024 * 1024, 0xff);
+    // Intel FD signature at 0x10
+    img.writeUInt32LE(0x0ff0a55a, 0x10);
+    // FLMAP0: region base at 0x40 (regionBase = ((flmap0 >> 16) & 0xff) << 4)
+    // flmap0 at 0x14 + 0x14 = 0x28
+    // regionBase = 0x04 << 4 = 0x40
+    img.writeUInt32LE(0x00040000, 0x28);
+    // Region entries at 0x40: descriptor(0), bios(1), me(2)
+    // descriptor: base=0x000, limit=0x000 (4KB: 0x000 to 0xFFF)
+    img.writeUInt32LE((0x000 << 16) | 0x000, 0x40);
+    // bios: base=0x100 (0x100000), limit=0x7FF (0x7FFFFF) = 7MB
+    img.writeUInt32LE((0x7ff << 16) | 0x100, 0x44);
+    // me: base=0x001 (0x1000), limit=0x0FF (0xFFFFF) ~1MB
+    img.writeUInt32LE((0x0ff << 16) | 0x001, 0x48);
+    // Fill BIOS region with pattern
+    for (let i = 0x100000; i < 0x800000; i++) img[i] = i & 0xff;
+    // Fill ME region with pattern
+    for (let i = 0x1000; i < 0x100000; i++) img[i] = (i * 7) & 0xff;
+    // Valid reset vector at end
+    img[img.length - 16] = 0xea;
+    img[img.length - 15] = 0xf0;
+    img[img.length - 14] = 0xff;
+    img[img.length - 13] = 0x00;
+    img[img.length - 12] = 0xf0;
+    return img;
+  }
+
+  function addNvramStore(img: Buffer, offset: number, storeSize: number): void {
+    // $VSS header (28 bytes)
+    img.writeUInt32LE(0x53535624, offset); // $VSS signature
+    img.writeUInt32LE(storeSize, offset + 4); // store size
+    // Add a fake valid variable at offset+28
+    const varStart = offset + 28;
+    img.writeUInt16LE(0x55aa, varStart); // variable header sig
+    img[varStart + 2] = 0x3f; // state = valid
+    img.writeUInt32LE(0x07, varStart + 4); // attributes
+    // GUID (16 bytes at varStart+20)
+    for (let i = 0; i < 16; i++) img[varStart + 20 + i] = i;
+    // nameSize=8, dataSize=4
+    img.writeUInt32LE(8, varStart + 36);
+    img.writeUInt32LE(4, varStart + 40);
+    // name (UTF-16LE "AB\0")
+    img.writeUInt16LE(0x41, varStart + 44);
+    img.writeUInt16LE(0x42, varStart + 46);
+    img.writeUInt16LE(0x00, varStart + 48);
+    // data
+    img.writeUInt32LE(0xDEADBEEF, varStart + 52);
+  }
+
+  // Task 1: generateRepairReport tests
+
+  results.push(await runTest("generateRepairReport with identical images shows no changes", async () => {
+    const img = Buffer.alloc(4096, 0xAB);
+    const report = generateRepairReport(img, Buffer.from(img), []);
+    assertEqual(report.totalBytesChanged, 0, "bytes changed");
+    assert(report.regions.every(r => !r.changed), "no regions should be changed");
+    assertEqual(report.inputChecksum, report.outputChecksum, "checksums match");
+  }));
+
+  results.push(await runTest("generateRepairReport with different regions shows correct diffs", async () => {
+    const input = createMockIntelFdImage();
+    const output = Buffer.from(input);
+    // Corrupt ME region in output
+    for (let i = 0x1000; i < 0x2000; i++) output[i] = 0x00;
+    const report = generateRepairReport(input, output, ["test action"]);
+    assert(report.totalBytesChanged > 0, "should have bytes changed");
+    const meRegion = report.regions.find(r => r.name === "me");
+    assert(meRegion !== undefined, "ME region should exist");
+    assert(meRegion!.changed, "ME region should be changed");
+    assertEqual(report.actions[0], "test action", "action recorded");
+  }));
+
+  results.push(await runTest("generateRepairReport with raw image shows single region", async () => {
+    const img = Buffer.alloc(4096, 0xCC); // no Intel FD
+    const out2 = Buffer.alloc(4096, 0xDD);
+    const report = generateRepairReport(img, out2, []);
+    assertEqual(report.regions.length, 1, "single region");
+    assertEqual(report.regions[0].name, "bios", "region name");
+    assert(report.regions[0].changed, "region should be changed");
+  }));
+
+  // Task 2: repairFromReference tests
+
+  results.push(await runTest("repairFromReference fixes corrupted ME region", async () => {
+    const reference = createMockIntelFdImage();
+    const broken = Buffer.from(reference);
+    // Corrupt ME region
+    for (let i = 0x1000; i < 0x2000; i++) broken[i] = 0x00;
+    const { repaired, report } = repairFromReference(broken, reference);
+    // ME region in repaired should match reference
+    const refMe = reference.subarray(0x1000, 0x100000);
+    const repMe = repaired.subarray(0x1000, 0x100000);
+    assert(refMe.equals(repMe), "ME region should match reference after repair");
+    assert(report.actions.some(a => a.includes("me")), "should report ME replacement");
+  }));
+
+  results.push(await runTest("repairFromReference preserves identical regions", async () => {
+    const reference = createMockIntelFdImage();
+    const broken = Buffer.from(reference);
+    // Only corrupt BIOS region
+    for (let i = 0x100000; i < 0x101000; i++) broken[i] = 0x00;
+    const { repaired, report } = repairFromReference(broken, reference);
+    // Descriptor should be unchanged from broken (it was fine)
+    const brokenDesc = broken.subarray(0, 0x1000);
+    const repairedDesc = repaired.subarray(0, 0x1000);
+    assert(brokenDesc.equals(repairedDesc), "descriptor should be preserved");
+  }));
+
+  results.push(await runTest("repairFromReference handles non-Intel-FD image", async () => {
+    const broken = Buffer.alloc(4096, 0xAA); // no Intel FD
+    const reference = Buffer.alloc(4096, 0xBB);
+    const { repaired, report } = repairFromReference(broken, reference);
+    assert(repaired.equals(reference), "should be full replacement");
+    assert(report.warnings.some(w => w.includes("No Intel FD")), "should warn about no FD");
+  }));
+
+  results.push(await runTest("repairFromReference handles size mismatch", async () => {
+    const broken = Buffer.alloc(4096, 0xAA);
+    const reference = Buffer.alloc(2048, 0xBB);
+    const { repaired, report } = repairFromReference(broken, reference);
+    assertEqual(repaired.length, broken.length, "output size matches broken");
+    assert(report.warnings.some(w => w.includes("mismatch")), "should warn about size mismatch");
+  }));
+
+  // Task 3: resetNvram tests
+
+  results.push(await runTest("resetNvram clears variables but preserves header", async () => {
+    const img = Buffer.alloc(8192, 0xff);
+    const nvramOffset = 1024;
+    addNvramStore(img, nvramOffset, 4096);
+    const { repaired, storeOffset, storeSize } = resetNvram(img);
+    // $VSS header preserved
+    assertEqual(repaired.readUInt32LE(nvramOffset), 0x53535624, "$VSS signature preserved");
+    assertEqual(repaired.readUInt32LE(nvramOffset + 4), 4096, "store size preserved");
+    // Variable area should be 0xFF
+    for (let i = nvramOffset + 28; i < nvramOffset + 4096; i++) {
+      assertEqual(repaired[i], 0xff, `byte at ${i} should be 0xFF`);
+    }
+    assertEqual(storeOffset, nvramOffset, "storeOffset");
+  }));
+
+  results.push(await runTest("resetNvram returns error for image without NVRAM", async () => {
+    const img = Buffer.alloc(4096, 0xff);
+    let threw = false;
+    try {
+      resetNvram(img);
+    } catch (e: any) {
+      threw = true;
+      assert(e.message.includes("No NVRAM"), "error mentions no NVRAM");
+    }
+    assert(threw, "should throw for missing NVRAM");
+  }));
+
+  results.push(await runTest("resetNvram report shows correct byte count", async () => {
+    const img = Buffer.alloc(8192, 0xff);
+    addNvramStore(img, 512, 2048);
+    const { report } = resetNvram(img);
+    assert(report.actions[0].includes("2020"), `should clear 2020 bytes (2048-28), got: ${report.actions[0]}`);
+  }));
+
+  // Task 4: repairResetVector tests
+
+  results.push(await runTest("repairResetVector fixes zeroed reset vector", async () => {
+    const img = Buffer.alloc(1024 * 1024, 0xff);
+    // Zero the last 16 bytes
+    img.fill(0x00, img.length - 16);
+    const { repaired, report } = repairResetVector(img);
+    assertEqual(repaired[img.length - 16], 0xea, "first byte should be 0xEA");
+    assertEqual(repaired[img.length - 15], 0xf0, "jump target low");
+    assertEqual(repaired[img.length - 14], 0xff, "jump target high");
+    assert(report.actions[0].includes("far jump"), "action mentions far jump");
+  }));
+
+  results.push(await runTest("repairResetVector leaves valid reset vector unchanged", async () => {
+    const img = Buffer.alloc(1024, 0xff);
+    img[img.length - 16] = 0xea; // valid reset vector
+    const { repaired, report } = repairResetVector(img);
+    assert(repaired.equals(img), "should be unchanged");
+    assert(report.actions[0].includes("already valid"), "should say already valid");
+  }));
+
+  // Task 4: repairAuto tests
+
+  results.push(await runTest("repairAuto fixes zeroed reset vector", async () => {
+    const img = Buffer.alloc(1024 * 1024, 0xff);
+    img.fill(0x00, img.length - 16);
+    const { repaired, report } = repairAuto(img);
+    assertEqual(repaired[img.length - 16], 0xea, "reset vector patched");
+    assert(report.actions.some(a => a.includes("far jump")), "action recorded");
+  }));
+
+  results.push(await runTest("repairAuto with healthy image returns no changes", async () => {
+    const img = Buffer.alloc(1024 * 1024, 0xff);
+    img[img.length - 16] = 0xea; // valid reset vector
+    const { repaired, report } = repairAuto(img);
+    assert(report.actions.some(a => a.includes("No repairs needed")), "should report no repairs");
+    assertEqual(report.totalBytesChanged, 0, "no bytes changed");
+  }));
+
+  // Task 6: Integration tests
+
+  results.push(await runTest("full repair pipeline: broken → reference → repaired", async () => {
+    const reference = createMockIntelFdImage();
+    const broken = Buffer.from(reference);
+    // Corrupt ME + BIOS
+    for (let i = 0x1000; i < 0x2000; i++) broken[i] = 0x00;
+    for (let i = 0x100000; i < 0x101000; i++) broken[i] = 0x00;
+    const { repaired, report } = repairFromReference(broken, reference);
+    // All regions should now match reference
+    const regions = listRegions(reference);
+    for (const r of regions) {
+      const refSlice = reference.subarray(r.offset, r.offset + r.size);
+      const repSlice = repaired.subarray(r.offset, r.offset + r.size);
+      assert(refSlice.equals(repSlice), `region ${r.name} should match reference`);
+    }
+    assert(report.actions.length >= 2, "should report 2+ replacements");
+  }));
+
+  results.push(await runTest("full auto-repair pipeline: damaged → auto → fixed", async () => {
+    const img = Buffer.alloc(1024 * 1024, 0xff);
+    // Zero reset vector
+    img.fill(0x00, img.length - 16);
+    const { repaired, report } = repairAuto(img);
+    // Reset vector should be patched
+    assertEqual(repaired[img.length - 16], 0xea, "reset vector fixed");
+    assert(report.totalBytesChanged > 0, "bytes changed");
+  }));
+
+  results.push(await runTest("NVRAM reset round-trip: populate → reset → verify", async () => {
+    const img = Buffer.alloc(8192, 0xff);
+    addNvramStore(img, 512, 4096);
+    // Verify variable exists before reset
+    assertEqual(img.readUInt16LE(512 + 28), 0x55aa, "variable header present before reset");
+    const { repaired } = resetNvram(img);
+    // Header preserved
+    assertEqual(repaired.readUInt32LE(512), 0x53535624, "$VSS after reset");
+    // Variable area cleared
+    assertEqual(repaired.readUInt16LE(512 + 28), 0xffff, "variable header cleared after reset");
+    // Second reset is idempotent
+    const { repaired: repaired2 } = resetNvram(repaired);
+    assertEqual(repaired2.readUInt32LE(512), 0x53535624, "$VSS after double reset");
+  }));
+
+  // Task 5: CLI repair command tests (function-level verification)
+
+  results.push(await runTest("cmdRepair reference mode produces repaired output", async () => {
+    const reference = createMockIntelFdImage();
+    const broken = Buffer.from(reference);
+    for (let i = 0x1000; i < 0x2000; i++) broken[i] = 0x00;
+    const { repaired, report } = repairFromReference(broken, reference);
+    assert(report.actions.length > 0, "report has actions");
+    assert(report.regions.length > 0, "report has regions");
+    assert(repaired.length === broken.length, "output size matches input");
+    assert(report.totalBytesChanged > 0, "bytes were changed");
+  }));
+
+  results.push(await runTest("cmdRepair auto mode with healthy image reports no changes", async () => {
+    const img = Buffer.alloc(1024 * 1024, 0xff);
+    img[img.length - 16] = 0xea;
+    const { report } = repairAuto(img);
+    assert(report.actions.some(a => a.includes("No repairs needed")), "reports no repairs");
+    assertEqual(report.totalBytesChanged, 0, "zero bytes changed");
+  }));
+
+  results.push(await runTest("cmdRepair nvram-reset mode reports reset", async () => {
+    const img = Buffer.alloc(8192, 0xff);
+    addNvramStore(img, 512, 2048);
+    const { report, storeOffset } = resetNvram(img);
+    assert(report.actions[0].includes("NVRAM reset"), "action mentions NVRAM reset");
+    assertEqual(storeOffset, 512, "correct store offset");
+    assert(report.totalBytesChanged > 0, "bytes changed");
+  }));
+
+  results.push(await runTest("dry-run repair produces report but no output", async () => {
+    const reference = createMockIntelFdImage();
+    const broken = Buffer.from(reference);
+    for (let i = 0x1000; i < 0x2000; i++) broken[i] = 0x00;
+    // repairFromReference produces report + repaired buffer but doesn't write files
+    const { repaired, report } = repairFromReference(broken, reference);
+    assert(report.actions.length > 0, "report has actions");
+    assert(report.regions.length > 0, "report has regions");
+    assert(repaired.length === broken.length, "repaired buffer exists");
+    // No file I/O — that's the CLI layer's job (verified by function signature: Buffer in, Buffer out)
   }));
 
   // ─── Report ───

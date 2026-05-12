@@ -10,6 +10,7 @@ import { parseMeRegion } from "./analysis/me.js";
 import { parseNvramStore } from "./analysis/nvram.js";
 import { listRegions as listBiosRegions, extractRegion, extractRegionToFile, replaceRegionInFile } from "./analysis/regions.js";
 import { analyzeBiosHealth } from "./analysis/recovery.js";
+import { repairFromReference, resetNvram, repairAuto, type RepairReport } from "./analysis/repair.js";
 import { SerialDebug } from "./serial/debug.js";
 import { searchChips, CHIP_DATABASE, formatSize, getChipVoltage, needs4ByteAddressing, getManufacturerName, lookupChipByJedecId, lookupChipByName, fuzzyMatchJedec, getChipRecommendations } from "./chips/database.js";
 import type { ChipDef } from "./chips/database.js";
@@ -760,6 +761,100 @@ async function cmdChecksum(args: Args) {
   out.kvLine("MD5", sums.md5);
   out.kvLine("SHA256", sums.sha256);
   out.kvLine("CRC32", sums.crc32);
+  console.log();
+}
+
+function displayRepairReport(report: RepairReport): void {
+  out.header("Repair Report");
+  for (const action of report.actions) out.info(action);
+
+  if (report.regions.length > 0) {
+    console.log();
+    const rows = [["Region", "Offset", "Size", "Changed"]];
+    for (const r of report.regions) {
+      rows.push([r.name, `0x${r.offset.toString(16)}`, `${r.size}`, r.changed ? "YES" : "no"]);
+    }
+    out.table(rows);
+  }
+
+  console.log();
+  out.kvLine("Bytes modified", report.totalBytesChanged.toString());
+  out.kvLine("Input checksum", report.inputChecksum.substring(0, 16) + "...");
+  out.kvLine("Output checksum", report.outputChecksum.substring(0, 16) + "...");
+
+  for (const w of report.warnings) out.warn(w);
+}
+
+async function cmdRepair(args: Args) {
+  const filePath = args.positional[0];
+  if (!filePath) {
+    out.fail("Usage: biospy repair <broken.bin> [--reference <good.bin>] [--auto] [--nvram-reset] [--output <path>] [--dry-run]");
+    process.exit(1);
+  }
+  if (!existsSync(filePath)) { out.fail(`File not found: ${filePath}`); process.exit(1); }
+
+  const refIdx = args.flags.indexOf("--reference");
+  const refPath = refIdx >= 0 ? args.flags[refIdx + 1] : null;
+  const outIdx = args.flags.indexOf("--output");
+  const outputPath = outIdx >= 0 ? args.flags[outIdx + 1] : null;
+  const isAuto = args.flags.includes("--auto");
+  const isNvramReset = args.flags.includes("--nvram-reset");
+  const isDryRun = args.flags.includes("--dry-run");
+
+  const inputData = await readFile(filePath);
+  const baseName = filePath.replace(/^.*[\\/]/, "");
+  const defaultOutput = `repaired_${baseName}`;
+
+  if (refPath) {
+    if (!existsSync(refPath)) { out.fail(`Reference file not found: ${refPath}`); process.exit(1); }
+    out.header(`Reference repair: ${filePath} → ${refPath}`);
+    const refData = await readFile(refPath);
+    const { repaired, report } = repairFromReference(inputData, refData);
+    displayRepairReport(report);
+    if (!isDryRun) {
+      const dest = outputPath || defaultOutput;
+      await writeFile(dest, repaired);
+      out.ok(`Repaired image written to ${dest}`);
+    } else {
+      out.info("Dry run — no output file written");
+    }
+  } else if (isNvramReset) {
+    out.header(`NVRAM reset: ${filePath}`);
+    try {
+      const { repaired, report, storeOffset, storeSize } = resetNvram(inputData);
+      out.kvLine("Store offset", `0x${storeOffset.toString(16)}`);
+      out.kvLine("Store size", `${storeSize} bytes`);
+      displayRepairReport(report);
+      if (!isDryRun) {
+        const dest = outputPath || defaultOutput;
+        await writeFile(dest, repaired);
+        out.ok(`Repaired image written to ${dest}`);
+      } else {
+        out.info("Dry run — no output file written");
+      }
+    } catch (e: any) {
+      out.fail(e.message);
+      process.exit(1);
+    }
+  } else if (isAuto) {
+    out.header(`Auto-repair: ${filePath}`);
+    const { repaired, report } = repairAuto(inputData);
+    displayRepairReport(report);
+    if (!isDryRun) {
+      if (report.totalBytesChanged > 0) {
+        const dest = outputPath || defaultOutput;
+        await writeFile(dest, repaired);
+        out.ok(`Repaired image written to ${dest}`);
+      } else {
+        out.ok("No repairs needed — no output file written");
+      }
+    } else {
+      out.info("Dry run — no output file written");
+    }
+  } else {
+    out.fail("Specify repair mode: --reference <file>, --auto, or --nvram-reset");
+    process.exit(1);
+  }
   console.log();
 }
 
@@ -3248,6 +3343,7 @@ async function main() {
       case "test-connection":
       case "test":         await cmdConnectionTest(); break;
       case "connect":      await cmdConnect(args); break;
+      case "repair":       await cmdRepair(args); break;
       case "reset":        await cmdReset(); break;
       case "analyze":
       case "info":         await cmdAnalyze(args); break;

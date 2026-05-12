@@ -1,26 +1,26 @@
 ---
 status: active
 mode: auto
-objective: 'Make biospy the best CLI tool for hardware debugging and repair. Fully custom implementation (no flashrom dependency). Professional-grade motherboard diagnostics, BIOS repair, hardware fault detection, and component-level debugging.'
-created_at: 2026-05-11T00:00:00Z
-updated_at: 2026-05-11T00:00:00Z
-turns: 0
-current_deliverable: 1
+objective: 'Ensure biosMCP is fully working end-to-end with proper USB connection establishment, automatic verification/validation, actual BIOS repair capability (not just diagnostics), and easy workflow for connection setup and component integrity verification.'
+created_at: 2026-05-11T21:00:00Z
+updated_at: 2026-05-11T21:00:00Z
+turns: 1
+current_deliverable: 3
 current_spec: ""
-auto_started_at: 2026-05-11T00:00:00Z
+auto_started_at: 2026-05-11T21:00:00Z
 sessions: 0
 consecutive_failures: 0
 ---
 
 ## Deliverables
 
-- [ ] 1. Remove flashrom dependency — eliminate flashrom backend, make native CH341A/CH347 the only path, improve auto-detection and error messages when no programmer found
-- [ ] 2. Motherboard diagnostic engine — POST code decoder (AMI/Award/Phoenix/UEFI), power sequence analyzer, common failure pattern database, guided troubleshooting workflows for no-boot scenarios
-- [ ] 3. Advanced BIOS analysis & repair — deep UEFI volume parsing (DXE/PEI/SEC phases), Intel ME region handling, NVRAM variable editor, BIOS region surgery (extract/replace/rebuild individual regions), corrupted BIOS recovery wizard
-- [ ] 4. Hardware fault detection system — SPI bus integrity analyzer (signal quality scoring, timing analysis), voltage rail diagnostics via CH341A GPIO, component-level test sequences (capacitor/resistor/transistor checks via probe), automated diagnostic report generation
-- [ ] 5. Enhanced chip database & smart identification — expand to 200+ chips, fuzzy JEDEC matching for unknown chips, chip capability auto-discovery via SFDP, voltage/timing recommendation engine, community chip submission format
-- [ ] 6. Interactive debug console — REPL mode for live hardware interaction, SPI bus sniffer/monitor, register watch with auto-refresh, macro recording/playback for repetitive operations, scriptable automation via JS plugin system
+- [x] 1. Connection wizard & signal quality — Single `biospy connect` command that auto-detects programmer type (CH341A/CH347), identifies chip via JEDEC, runs multi-pass signal integrity test (5-10 reads checking consistency), reports connection quality score (0-100%), diagnoses bad clips/wiring/orientation, suggests specific fixes. Add `--monitor` flag for continuous quality assessment during long operations. Integrate into read/write commands as pre-flight check.
+- [x] 2. Automated BIOS repair engine — Actual repair capability beyond diagnostics: extract/replace corrupted regions from reference image, rebuild damaged Intel Flash Descriptor, repair corrupted NVRAM variable store (clear bad entries, rebuild header), inject known-good ME firmware region, patch reset vector if zeroed. New commands: `biospy repair <broken.bin> --reference <good.bin>`, `biospy repair --auto` (self-diagnose and fix what it can), `biospy repair --nvram-reset`. All repairs produce diff report showing what changed.
+- [ ] 3. One-command end-to-end workflow — `biospy full-repair` command that chains: connect → pre-flight signal check → read chip (double-verify) → analyze for corruption → repair automatically → write repaired image → post-write verify → final health report. Each step reports progress and can bail with clear error. Also `biospy full-backup` for read → verify → analyze → save with metadata. Both commands handle write protection automatically.
+- [ ] 4. Integration validation & edge case hardening — Expand self-test to cover: full repair workflow with mock (corrupt image → repair → verify fixed), connection quality scoring with simulated noise, partial read failures with retry/recovery, write-during-disconnect graceful handling, region extraction/replacement round-trip, NVRAM rebuild consistency. Target: every user-facing command has at least one self-test path. Fix any bugs found.
 
 ## Progress Log
 
-- [00:00] Created goal — entering auto-execution mode
+- [21:00] Created goal — entering auto-execution mode
+- [22:30] Deliverable 1 COMPLETE — biospy connect command with quality scoring (0-100%), 10-read signal integrity test, --monitor continuous mode, pre-flight quality gate for read/write, MockBackend quality modes (stable/noisy/disconnected), 29 new self-tests, 112/112 total pass
+- [23:00] Deliverable 2 COMPLETE — BIOS repair engine: repairFromReference (region-by-region), resetNvram ($VSS header preserved), repairResetVector (x86 far jump), repairAuto (health-based), CLI `biospy repair` with --reference/--auto/--nvram-reset/--dry-run/--output, diff reports, 21 new self-tests, 133/133 total pass
