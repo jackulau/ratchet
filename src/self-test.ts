@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import * as out from "./output.js";
-import { computeQualityScore } from "./connection/quality.js";
+import { computeQualityScore, formatMonitorLine, shouldAutoExit, MONITOR_AUTO_EXIT_THRESHOLD } from "./connection/quality.js";
 import type { RawConnectionData } from "./connection/quality.js";
 
 const VERSION = "1.1.0";
@@ -905,6 +905,57 @@ export async function runSelfTest(): Promise<boolean> {
     const quality2 = computeQualityScore(rawData2);
     assert(quality2.score < 50, `Disconnected mode score should be < 50, got ${quality2.score}`);
     assert(quality2.grade === "Poor", `Disconnected grade should be Poor, got ${quality2.grade}`);
+  }));
+
+  // ─── Monitor Mode Tests ───
+  console.log("\nMonitor Mode");
+
+  results.push(await runTest("formatMonitorLine shows score and trend", async () => {
+    // First reading — no previous score
+    const first = formatMonitorLine(85, null);
+    assert(first.includes("85/100"), `first line should include '85/100', got: ${first}`);
+    assert(first.includes("Quality:"), "should start with 'Quality:'");
+
+    // Improvement: current > previous → green up arrow
+    const improved = formatMonitorLine(90, 80);
+    assert(improved.includes("↑"), `improvement should include up arrow, got: ${improved}`);
+    assert(improved.includes("+10"), `should show +10 delta, got: ${improved}`);
+    assert(improved.includes("90/100"), `should show current score 90/100`);
+
+    // Stable: no change
+    const stable = formatMonitorLine(75, 75);
+    assert(stable.includes("stable"), `no-change should include 'stable', got: ${stable}`);
+  }));
+
+  results.push(await runTest("formatMonitorLine shows degradation warning", async () => {
+    // Small drop
+    const smallDrop = formatMonitorLine(70, 75);
+    assert(smallDrop.includes("↓"), `degradation should include down arrow, got: ${smallDrop}`);
+    assert(smallDrop.includes("-5"), `should show -5 delta, got: ${smallDrop}`);
+
+    // Large drop (>= 15 points) — should trigger warning
+    const bigDrop = formatMonitorLine(50, 70);
+    assert(bigDrop.includes("↓"), `big drop should include down arrow`);
+    assert(bigDrop.includes("WARNING"), `big drop (>=15) should include WARNING, got: ${bigDrop}`);
+
+    // Critical drop below threshold — should trigger CRITICAL message
+    const critical = formatMonitorLine(15, 40);
+    assert(critical.includes("CRITICAL"), `score below ${MONITOR_AUTO_EXIT_THRESHOLD} should include CRITICAL, got: ${critical}`);
+    assert(critical.includes("auto-exiting"), `critical should mention auto-exiting`);
+  }));
+
+  results.push(await runTest("monitor auto-exit threshold", async () => {
+    // Below threshold — should auto-exit
+    assertEqual(shouldAutoExit(19), true, "score 19 should trigger auto-exit");
+    assertEqual(shouldAutoExit(0), true, "score 0 should trigger auto-exit");
+    assertEqual(shouldAutoExit(10), true, "score 10 should trigger auto-exit");
+
+    // At threshold — should NOT auto-exit (threshold is < 20, not <=)
+    assertEqual(shouldAutoExit(20), false, "score 20 should NOT trigger auto-exit");
+
+    // Above threshold — should NOT auto-exit
+    assertEqual(shouldAutoExit(50), false, "score 50 should NOT trigger auto-exit");
+    assertEqual(shouldAutoExit(100), false, "score 100 should NOT trigger auto-exit");
   }));
 
   // ─── Report ───

@@ -20,7 +20,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as out from "./output.js";
-import { computeQualityScore } from "./connection/quality.js";
+import { computeQualityScore, formatMonitorLine, shouldAutoExit } from "./connection/quality.js";
 import type { RawConnectionData } from "./connection/quality.js";
 import type { ChipInfo, ReadResult } from "./types.js";
 
@@ -1066,6 +1066,84 @@ async function cmdConnect(args: Args) {
     out.dim("Run 'biospy connect' after fixing to re-check");
   }
   console.log();
+
+  // ── Monitor mode ──
+  if (args.flags.includes("--monitor")) {
+    out.header("Monitor Mode");
+    out.info("Re-checking quality every 2 seconds. Press Ctrl+C to stop.");
+    console.log();
+
+    let previousScore: number = quality.score;
+    let iterationCount = 1;
+    let exitReason = "";
+
+    // Clean exit on SIGINT
+    const sigintHandler = () => {
+      console.log();
+      out.header("Monitor Summary");
+      out.kvLine("Iterations", String(iterationCount));
+      out.kvLine("Final Score", `${previousScore}/100`);
+      if (exitReason) out.warn(exitReason);
+      console.log();
+      process.exit(0);
+    };
+    process.on("SIGINT", sigintHandler);
+
+    // Continuous re-check loop
+    const monitorLoop = async (): Promise<void> => {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        await new Promise<void>(resolve => setTimeout(resolve, 2000));
+        iterationCount++;
+
+        let ct;
+        try {
+          ct = await backend.connectionTest();
+        } catch (err: any) {
+          out.fail(`Connection lost: ${err.message}`);
+          exitReason = "Connection lost during monitoring";
+          break;
+        }
+
+        const readings: string[] = [];
+        for (let i = 0; i < ct.matches; i++) readings.push(ct.jedecId);
+        for (let i = ct.matches; i < ct.reads; i++) readings.push("000000");
+
+        const raw: RawConnectionData = {
+          jedecReadings: readings,
+          timingsMs: ct.timings,
+          statusRegisterOk: ct.statusRegister !== null,
+        };
+
+        const q = computeQualityScore(raw);
+        console.log(formatMonitorLine(q.score, previousScore));
+
+        if (shouldAutoExit(q.score)) {
+          console.log();
+          out.fail(`Quality dropped to ${q.score}/100 — below critical threshold (20)`);
+          out.warn("Auto-exiting monitor. Check physical connection immediately.");
+          exitReason = "Auto-exit: critical degradation";
+          previousScore = q.score;
+          break;
+        }
+
+        previousScore = q.score;
+      }
+
+      // Print summary on loop exit
+      process.removeListener("SIGINT", sigintHandler);
+      console.log();
+      out.header("Monitor Summary");
+      out.kvLine("Iterations", String(iterationCount));
+      out.kvLine("Final Score", `${previousScore}/100`);
+      if (exitReason) out.warn(exitReason);
+      console.log();
+      process.exit(1);
+    };
+
+    await monitorLoop();
+    return; // unreachable, but satisfies TS
+  }
 
   // Exit code: 0 if score >= 50, 1 if < 50
   if (quality.score < 50) {

@@ -204,3 +204,59 @@ export function computeQualityScore(data: RawConnectionData): ConnectionQualityR
 
   return { score, grade, categories, diagnostics };
 }
+
+// ── Monitor helpers ──
+
+const ANSI_GREEN  = "\x1b[32m";
+const ANSI_RED    = "\x1b[31m";
+const ANSI_YELLOW = "\x1b[33m";
+const ANSI_RESET  = "\x1b[0m";
+
+/** Threshold below which the monitor loop auto-exits. */
+export const MONITOR_AUTO_EXIT_THRESHOLD = 20;
+
+/**
+ * Format a single monitor line showing the current score, trend arrow, and
+ * optional degradation warning.
+ *
+ * @param currentScore  Current quality score (0-100)
+ * @param previousScore Previous quality score (0-100), or null for first reading
+ * @returns Formatted string with ANSI color codes
+ */
+export function formatMonitorLine(currentScore: number, previousScore: number | null): string {
+  const grade = gradeFromScore(currentScore);
+  const scoreStr = `${currentScore}/100 ${grade}`;
+
+  // First reading — no trend
+  if (previousScore === null) {
+    return `Quality: ${scoreStr}`;
+  }
+
+  const delta = currentScore - previousScore;
+
+  if (delta > 0) {
+    // Improvement
+    return `Quality: ${scoreStr} ${ANSI_GREEN}↑+${delta}${ANSI_RESET}`;
+  } else if (delta < 0) {
+    // Degradation
+    const line = `Quality: ${scoreStr} ${ANSI_RED}↓${delta}${ANSI_RESET}`;
+    if (currentScore < MONITOR_AUTO_EXIT_THRESHOLD) {
+      return `${line} ${ANSI_RED}CRITICAL — score below ${MONITOR_AUTO_EXIT_THRESHOLD}, auto-exiting${ANSI_RESET}`;
+    }
+    if (Math.abs(delta) >= 15) {
+      return `${line} ${ANSI_YELLOW}WARNING — significant degradation${ANSI_RESET}`;
+    }
+    return line;
+  }
+
+  // No change
+  return `Quality: ${scoreStr} ↔ stable`;
+}
+
+/**
+ * Returns true when the score is below the auto-exit threshold.
+ * Separated from the monitor loop so it can be unit-tested.
+ */
+export function shouldAutoExit(score: number): boolean {
+  return score < MONITOR_AUTO_EXIT_THRESHOLD;
+}
