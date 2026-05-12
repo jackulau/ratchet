@@ -13,7 +13,9 @@ import * as out from "./output.js";
 import { computeQualityScore, formatMonitorLine, shouldAutoExit, MONITOR_AUTO_EXIT_THRESHOLD } from "./connection/quality.js";
 import type { RawConnectionData } from "./connection/quality.js";
 import { generateRepairReport, repairFromReference, resetNvram, repairResetVector, repairAuto } from "./analysis/repair.js";
-import { listRegions } from "./analysis/regions.js";
+import { listRegions, extractRegion, replaceRegion, rebuildImage } from "./analysis/regions.js";
+import { analyzeBiosHealthFromBuffer } from "./analysis/recovery.js";
+import { parseNvramStore, findNvramStore } from "./analysis/nvram.js";
 import { runPipeline, buildBackupPipeline, buildRepairPipeline, generateBackupMetadata, createContext, type PipelineStep, type PipelineContext } from "./workflows/pipeline.js";
 
 const VERSION = "1.1.0";
@@ -1657,6 +1659,169 @@ export async function runSelfTest(): Promise<boolean> {
     assertEqual(result.success, false, "pipeline failed");
     assertEqual(result.errorStep, "Connection quality check", "failed at quality check");
     assertEqual(result.stepsCompleted, 1, "only 1 step ran");
+  }));
+
+  // ─── Integration Hardening ───
+  console.log("\nIntegration Hardening");
+
+  // Region extraction/replacement round-trip
+  results.push(await runTest("region extract → replace round-trip preserves data", async () => {
+    const img = createMockIntelFdImage();
+    const regions = listRegions(img);
+    assert(regions.length >= 3, "should have multiple regions");
+
+    for (const region of regions) {
+      const extracted = extractRegion(img, region.name);
+      assert(extracted !== null, `should extract ${region.name}`);
+      const replaced = replaceRegion(img, region.name, extracted!.data);
+      assert(replaced !== null, `should replace ${region.name}`);
+      // Image should be identical after round-trip
+      assert(replaced!.data.equals(img), `round-trip should preserve ${region.name}`);
+    }
+  }));
+
+  results.push(await runTest("rebuildImage with multiple replacements", async () => {
+    const img = createMockIntelFdImage();
+    const meData = extractRegion(img, "me")!.data;
+    const biosData = extractRegion(img, "bios")!.data;
+    const result = rebuildImage(img, { me: meData, bios: biosData });
+    assert(result.data.equals(img), "rebuild with same data should match");
+    assertEqual(result.warnings.length, 0, "no warnings for exact-size replacement");
+  }));
+
+  // Write protection handling
+  results.push(await runTest("MockBackend write protection toggle", async () => {
+    const m = new MockBackend();
+    assertEqual(await m.isWriteProtected(), false, "default not protected");
+    // MockBackend doesn't have setWriteProtected, but disableWriteProtection works
+    await m.disableWriteProtection();
+    assertEqual(await m.isWriteProtected(), false, "still not protected after disable");
+  }));
+
+  // Disconnect error handling
+  results.push(await runTest("UsbDisconnectError caught in pipeline", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = [
+      {
+        name: "Disconnect step",
+        number: 1,
+        total: 1,
+        execute: async () => { throw new UsbDisconnectError("device vanished"); },
+      } as PipelineStep,
+    ];
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, false, "pipeline failed");
+    assert(result.errorDetail!.includes("vanished"), "error detail preserved");
+  }));
+
+  // Health analysis edge cases
+  results.push(await runTest("analyzeBiosHealth blank image detects all-FF", async () => {
+    const blank = Buffer.alloc(1024 * 1024, 0xff);
+    const report = analyzeBiosHealthFromBuffer(blank);
+    assertEqual(report.overallStatus, "fail", "blank should fail");
+    assert(report.checks.some(c => c.name === "Content check" && c.status === "fail"), "content check fails");
+  }));
+
+  results.push(await runTest("analyzeBiosHealth zero image detects all-00", async () => {
+    const zeros = Buffer.alloc(1024 * 1024, 0x00);
+    const report = analyzeBiosHealthFromBuffer(zeros);
+    assertEqual(report.overallStatus, "fail", "zeros should fail");
+    assert(report.checks.some(c => c.detail.includes("0x00")), "detects zero fill");
+  }));
+
+  // NVRAM edge cases
+  results.push(await runTest("findNvramStore returns -1 for blank image", async () => {
+    const blank = Buffer.alloc(4096, 0xff);
+    assertEqual(findNvramStore(blank), -1, "no store in blank");
+  }));
+
+  results.push(await runTest("parseNvramStore handles missing store gracefully", async () => {
+    const blank = Buffer.alloc(4096, 0xff);
+    const store = parseNvramStore(blank);
+    assertEqual(store.found, false, "not found");
+    assertEqual(store.variables.length, 0, "no variables");
+  }));
+
+  // Repair edge: tiny image
+  results.push(await runTest("repairResetVector on tiny image returns unchanged", async () => {
+    const tiny = Buffer.alloc(8, 0xAB);
+    const { repaired, report } = repairResetVector(tiny);
+    assert(repaired.equals(tiny), "tiny image unchanged");
+    assert(report.actions[0].includes("too small"), "reports too small");
+  }));
+
+  // Quality scoring: noisy mock → pipeline warns
+  results.push(await runTest("noisy mock gives pipeline degraded quality score", async () => {
+    const mockBackend = new MockBackend();
+    mockBackend.setQualityMode('noisy');
+    const ct = await mockBackend.connectionTest();
+    const jedecReadings = Array(ct.matches).fill(ct.jedecId);
+    for (let i = ct.matches; i < ct.reads; i++) jedecReadings.push("000000");
+    const rawData: RawConnectionData = {
+      jedecReadings,
+      timingsMs: ct.timings,
+      statusRegisterOk: ct.statusRegister !== null,
+    };
+    const quality = computeQualityScore(rawData);
+    assert(quality.score < 100, "noisy should reduce score");
+    assert(quality.diagnostics.length > 0, "should have diagnostics");
+  }));
+
+  // BiosAnalyzer checksum (CLI command coverage for analyze/checksum)
+  results.push(await runTest("BiosAnalyzer analyze produces valid analysis", async () => {
+    const tmpPath = join(tmpDir, `biospy-selftest-analyze-${Date.now()}.bin`);
+    const data = Buffer.alloc(1024, 0xAB);
+    await writeFile(tmpPath, data);
+    try {
+      const analysis = await new BiosAnalyzer().analyze(tmpPath);
+      assert(analysis.fileSize === 1024, "size correct");
+      assert(analysis.checksum.length === 64, "sha256 present");
+    } finally {
+      try { await unlink(tmpPath); } catch {}
+    }
+  }));
+
+  results.push(await runTest("BiosAnalyzer diff detects identical files", async () => {
+    const tmpA = join(tmpDir, `biospy-selftest-diff-a-${Date.now()}.bin`);
+    const tmpB = join(tmpDir, `biospy-selftest-diff-b-${Date.now()}.bin`);
+    const data = Buffer.alloc(256, 0xCD);
+    await writeFile(tmpA, data);
+    await writeFile(tmpB, data);
+    try {
+      const diff = await new BiosAnalyzer().diff(tmpA, tmpB);
+      assertEqual(diff.identical, true, "identical files");
+    } finally {
+      try { await unlink(tmpA); } catch {}
+      try { await unlink(tmpB); } catch {}
+    }
+  }));
+
+  results.push(await runTest("BiosAnalyzer diff detects differences", async () => {
+    const tmpA = join(tmpDir, `biospy-selftest-diff-c-${Date.now()}.bin`);
+    const tmpB = join(tmpDir, `biospy-selftest-diff-d-${Date.now()}.bin`);
+    await writeFile(tmpA, Buffer.alloc(256, 0xAA));
+    await writeFile(tmpB, Buffer.alloc(256, 0xBB));
+    try {
+      const diff = await new BiosAnalyzer().diff(tmpA, tmpB);
+      assertEqual(diff.identical, false, "different files");
+      assert(diff.totalDifferences > 0, "has differences");
+    } finally {
+      try { await unlink(tmpA); } catch {}
+      try { await unlink(tmpB); } catch {}
+    }
+  }));
+
+  // Double-verify read with MockBackend
+  results.push(await runTest("MockBackend readChipDoubleVerify returns same as readChip", async () => {
+    const m = new MockBackend();
+    const pathA = join(tmpDir, `biospy-selftest-dv-a-${Date.now()}.bin`);
+    const pathB = join(tmpDir, `biospy-selftest-dv-b-${Date.now()}.bin`);
+    const resultA = await m.readChip(pathA);
+    const resultB = await m.readChipDoubleVerify(pathB);
+    assertEqual(resultA.checksum, resultB.checksum, "checksums match");
+    try { await unlink(pathA); } catch {}
+    try { await unlink(pathB); } catch {}
   }));
 
   // ─── Report ───
