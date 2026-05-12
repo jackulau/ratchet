@@ -839,6 +839,74 @@ export async function runSelfTest(): Promise<boolean> {
     assertEqual(ct2.statusRegister, null, "disconnected statusRegister should be null");
   }));
 
+  // ─── Connect Command Tests ───
+  console.log("\nConnect Command");
+
+  results.push(await runTest("cmdConnect dry-run produces valid output", async () => {
+    // Simulate what cmdConnect does in dry-run mode via MockBackend
+    const m = new MockBackend();
+    const info = await m.detectProgrammer();
+    assert(info.connected, "mock should report connected");
+
+    const chip = await m.identifyChip();
+    assert(chip !== null, "mock should identify chip");
+
+    const ct = await m.connectionTest();
+    assert(ct.timings.length === 10, "should have 10 timings");
+
+    // Map connectionTest data to RawConnectionData (same as cmdConnect)
+    const jedecReadings: string[] = [];
+    for (let i = 0; i < ct.matches; i++) jedecReadings.push(ct.jedecId);
+    for (let i = ct.matches; i < ct.reads; i++) jedecReadings.push("000000");
+
+    const rawData: RawConnectionData = {
+      jedecReadings,
+      timingsMs: ct.timings,
+      statusRegisterOk: ct.statusRegister !== null,
+    };
+
+    const quality = computeQualityScore(rawData);
+    assert(quality.score > 0, `Quality score should be > 0, got ${quality.score}`);
+    assert(quality.grade === "Excellent", `Grade should be Excellent for stable mock, got ${quality.grade}`);
+    assert(quality.categories.length === 4, "should have 4 categories");
+  }));
+
+  results.push(await runTest("connect command quality scoring integration", async () => {
+    // Test with noisy mode — should produce lower score
+    const m = new MockBackend();
+    m.setQualityMode('noisy');
+
+    const ct = await m.connectionTest();
+    assert(!ct.stable, "noisy mode should be unstable");
+
+    const jedecReadings: string[] = [];
+    for (let i = 0; i < ct.matches; i++) jedecReadings.push(ct.jedecId);
+    for (let i = ct.matches; i < ct.reads; i++) jedecReadings.push("000000");
+
+    const rawData: RawConnectionData = {
+      jedecReadings,
+      timingsMs: ct.timings,
+      statusRegisterOk: ct.statusRegister !== null,
+    };
+
+    const quality = computeQualityScore(rawData);
+    assert(quality.score < 90, `Noisy mode score should be < 90, got ${quality.score}`);
+    assert(quality.diagnostics.length > 0, "noisy connection should produce diagnostics");
+
+    // Test with disconnected mode — should produce very low score
+    m.setQualityMode('disconnected');
+    const ct2 = await m.connectionTest();
+    const jedecReadings2 = Array(ct2.reads).fill(ct2.jedecId);
+    const rawData2: RawConnectionData = {
+      jedecReadings: jedecReadings2,
+      timingsMs: ct2.timings,
+      statusRegisterOk: ct2.statusRegister !== null,
+    };
+    const quality2 = computeQualityScore(rawData2);
+    assert(quality2.score < 50, `Disconnected mode score should be < 50, got ${quality2.score}`);
+    assert(quality2.grade === "Poor", `Disconnected grade should be Poor, got ${quality2.grade}`);
+  }));
+
   // ─── Report ───
   console.log();
   console.log("━".repeat(40));
