@@ -1010,6 +1010,147 @@ export async function runSelfTest(): Promise<boolean> {
     assertEqual(wouldBlock, true, "score < 50 should trigger block");
   }));
 
+  // ─── Integration Tests: Full Connect Workflow ───
+  console.log("\nIntegration: Connect Workflow");
+
+  results.push(await runTest("full connect workflow: MockBackend → connectionTest → computeQualityScore", async () => {
+    // End-to-end: create mock, detect programmer, identify chip, run connection test, score quality
+    const m = new MockBackend();
+    const info = await m.detectProgrammer();
+    assert(info.connected, "programmer should be detected");
+    assertEqual(info.type, "ch341a", "type");
+
+    const chip = await m.identifyChip();
+    assert(chip !== null, "chip should be identified");
+    assertEqual(chip!.jedecId, "ef4017", "jedecId");
+    assertEqual(chip!.sizeBytes, 8 * 1024 * 1024, "size");
+
+    const ct = await m.connectionTest();
+    assert(ct.stable, "stable mode should be stable");
+    assertEqual(ct.reads, 10, "10 reads");
+    assertEqual(ct.matches, 10, "10 matches");
+    assert(ct.timings.length === 10, "10 timings");
+    assert(ct.statusRegister !== null, "status register present");
+
+    // Build RawConnectionData from connectionTest results (same pipeline as cmdConnect)
+    const jedecReadings: string[] = Array(ct.matches).fill(ct.jedecId);
+    const rawData: RawConnectionData = {
+      jedecReadings,
+      timingsMs: ct.timings,
+      statusRegisterOk: ct.statusRegister !== null,
+    };
+
+    const quality = computeQualityScore(rawData);
+    assertEqual(quality.score, 100, "perfect connection score");
+    assertEqual(quality.grade, "Excellent", "grade");
+    assertEqual(quality.categories.length, 4, "4 categories");
+    assertEqual(quality.diagnostics.length, 0, "no diagnostics for perfect connection");
+
+    // Verify exit code logic: score >= 50 → exit 0
+    const exitOk = quality.score >= 50;
+    assertEqual(exitOk, true, "should exit 0");
+  }));
+
+  results.push(await runTest("noisy connection flow: reduced score and diagnostics", async () => {
+    const m = new MockBackend();
+    m.setQualityMode('noisy');
+
+    const ct = await m.connectionTest();
+    assert(!ct.stable, "noisy should be unstable");
+    assertEqual(ct.reads, 10, "10 reads");
+    assert(ct.matches < 10, "matches < 10");
+    assert(ct.timings.length === 10, "10 timings");
+
+    // Build RawConnectionData replicating individual reads from noisy mode
+    // Noisy mode: indices 2,5,8 are inconsistent with different IDs
+    const jedecReadings: string[] = [];
+    const noisyIds = ["ab1234", "cd5678", "000000"];
+    for (let i = 0; i < 10; i++) {
+      if (i % 3 === 2) {
+        jedecReadings.push(noisyIds[i % noisyIds.length]);
+      } else {
+        jedecReadings.push("ef4017");
+      }
+    }
+
+    const rawData: RawConnectionData = {
+      jedecReadings,
+      timingsMs: ct.timings,
+      statusRegisterOk: ct.statusRegister !== null,
+    };
+
+    const quality = computeQualityScore(rawData);
+    assert(quality.score < 100, `noisy score should be < 100, got ${quality.score}`);
+    assert(quality.score > 0, `noisy score should be > 0, got ${quality.score}`);
+    assert(quality.diagnostics.length > 0, "noisy connection should produce diagnostics");
+
+    // Verify score is in a reasonable range — not Excellent due to inconsistency
+    assert(quality.score < 90, `noisy score should not be Excellent, got ${quality.score}`);
+
+    // Monitor line should show appropriate warning if score dropped
+    const line = formatMonitorLine(quality.score, 100);
+    assert(line.includes("↓"), "monitor should show degradation from 100");
+  }));
+
+  results.push(await runTest("read with pre-flight: quality check integrates with read flow", async () => {
+    // Simulate read pre-flight: run quality check, then proceed with read if score >= 50
+    const m = new MockBackend();
+    const ct = await m.connectionTest();
+
+    const jedecReadings = Array(ct.matches).fill(ct.jedecId);
+    const rawData: RawConnectionData = {
+      jedecReadings,
+      timingsMs: ct.timings,
+      statusRegisterOk: ct.statusRegister !== null,
+    };
+
+    const quality = computeQualityScore(rawData);
+    assert(quality.score >= 70, "stable mock should pass pre-flight");
+
+    // Pre-flight passes — proceed with read
+    const readPath = join(tmpDir, `biospy-selftest-preflight-read-${Date.now()}.bin`);
+    const readResult = await m.readChip(readPath);
+    assert(readResult.success, "read should succeed after pre-flight passes");
+    assertEqual(readResult.sizeBytes, 8 * 1024 * 1024, "read size");
+    assert(readResult.checksum.length === 64, "checksum present");
+
+    // Cleanup
+    try { await unlink(readPath); } catch {}
+  }));
+
+  results.push(await runTest("write with quality block: disconnected mock blocks operation", async () => {
+    // Simulate write pre-flight with disconnected backend — quality gate should block
+    const m = new MockBackend();
+    m.setQualityMode('disconnected');
+
+    const ct = await m.connectionTest();
+    assert(!ct.stable, "disconnected should be unstable");
+    assertEqual(ct.jedecId, "000000", "disconnected JEDEC");
+
+    const jedecReadings = Array(ct.reads).fill(ct.jedecId);
+    const rawData: RawConnectionData = {
+      jedecReadings,
+      timingsMs: ct.timings,
+      statusRegisterOk: ct.statusRegister !== null,
+    };
+
+    const quality = computeQualityScore(rawData);
+    assert(quality.score < 50, `disconnected score should be < 50, got ${quality.score}`);
+    assertEqual(quality.grade, "Poor", "grade should be Poor");
+
+    // Quality gate blocks: score < 50 means we should NOT proceed with write
+    const shouldBlock = quality.score < 50;
+    assertEqual(shouldBlock, true, "write should be blocked");
+
+    // Verify diagnostics explain the problem
+    assert(quality.diagnostics.length > 0, "should have diagnostics explaining why blocked");
+
+    // Verify shouldAutoExit would trigger for monitor mode at this score
+    if (quality.score < 20) {
+      assertEqual(shouldAutoExit(quality.score), true, "monitor would auto-exit at this score");
+    }
+  }));
+
   // ─── Report ───
   console.log();
   console.log("━".repeat(40));
