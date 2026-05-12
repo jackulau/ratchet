@@ -14,6 +14,7 @@ import { computeQualityScore, formatMonitorLine, shouldAutoExit, MONITOR_AUTO_EX
 import type { RawConnectionData } from "./connection/quality.js";
 import { generateRepairReport, repairFromReference, resetNvram, repairResetVector, repairAuto } from "./analysis/repair.js";
 import { listRegions } from "./analysis/regions.js";
+import { runPipeline, buildBackupPipeline, buildRepairPipeline, generateBackupMetadata, createContext, type PipelineStep, type PipelineContext } from "./workflows/pipeline.js";
 
 const VERSION = "1.1.0";
 
@@ -1441,6 +1442,221 @@ export async function runSelfTest(): Promise<boolean> {
     assert(report.regions.length > 0, "report has regions");
     assert(repaired.length === broken.length, "repaired buffer exists");
     // No file I/O — that's the CLI layer's job (verified by function signature: Buffer in, Buffer out)
+  }));
+
+  // ─── End-to-End Workflow Tests ───
+  console.log("\nEnd-to-End Workflow");
+
+  // Task 1: Pipeline step infrastructure
+
+  results.push(await runTest("runPipeline with all passing steps completes", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps: PipelineStep[] = [
+      { name: "Step A", number: 1, total: 3, execute: async () => "done A" },
+      { name: "Step B", number: 2, total: 3, execute: async () => "done B" },
+      { name: "Step C", number: 3, total: 3, execute: async () => "done C" },
+    ];
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "pipeline success");
+    assertEqual(result.stepsCompleted, 3, "steps completed");
+    assertEqual(result.errorStep, null, "no error step");
+  }));
+
+  results.push(await runTest("runPipeline stops on first failure", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps: PipelineStep[] = [
+      { name: "Step A", number: 1, total: 3, execute: async () => "ok" },
+      { name: "Step B", number: 2, total: 3, execute: async () => { throw new Error("boom"); } },
+      { name: "Step C", number: 3, total: 3, execute: async () => "ok" },
+    ];
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, false, "pipeline failed");
+    assertEqual(result.errorStep, "Step B", "failed at Step B");
+    assertEqual(result.stepsCompleted, 2, "2 steps ran (A + B)");
+  }));
+
+  results.push(await runTest("runPipeline collects step timing", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps: PipelineStep[] = [
+      { name: "Step A", number: 1, total: 1, execute: async () => "ok" },
+    ];
+    const result = await runPipeline(steps, ctx);
+    assert(result.stepResults[0].durationMs >= 0, "step has timing");
+    assert(result.totalDurationMs >= 0, "pipeline has timing");
+  }));
+
+  // Task 2: Backup pipeline
+
+  results.push(await runTest("buildBackupPipeline creates 4 steps", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildBackupPipeline(ctx);
+    assertEqual(steps.length, 4, "4 steps");
+    assertEqual(steps[0].name, "Connection quality check", "step 1");
+    assertEqual(steps[1].name, "Read chip (double-verify)", "step 2");
+    assertEqual(steps[2].name, "Analyze health", "step 3");
+    assertEqual(steps[3].name, "Save backup with metadata", "step 4");
+  }));
+
+  results.push(await runTest("generateBackupMetadata includes all required fields", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    ctx.imageData = Buffer.alloc(1024, 0xAB);
+    ctx.qualityScore = 95;
+    ctx.chipInfo = { jedecId: "ef4017", name: "W25Q64", vendorName: "Winbond", sizeBytes: 8*1024*1024, sizeHuman: "8MB", type: "spi" };
+    const meta = generateBackupMetadata(ctx);
+    assert(meta.timestamp.length > 0, "has timestamp");
+    assert(meta.sha256.length === 64, "has sha256");
+    assertEqual(meta.sizeBytes, 1024, "size correct");
+    assertEqual(meta.qualityScore, 95, "quality score");
+    assert(meta.chipInfo !== null, "has chipInfo");
+  }));
+
+  results.push(await runTest("backup pipeline with MockBackend completes", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildBackupPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "pipeline success");
+    assertEqual(result.stepsCompleted, 4, "all 4 steps completed");
+    assert(ctx.imageData !== null, "image data captured");
+    assert(ctx.healthReport !== null, "health report generated");
+    assert(ctx.metadata !== null, "metadata generated");
+  }));
+
+  // Task 3: Repair pipeline
+
+  results.push(await runTest("buildRepairPipeline creates correct step sequence", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildRepairPipeline(ctx);
+    assertEqual(steps.length, 7, "7 steps");
+    assertEqual(steps[0].name, "Connection quality check", "step 1");
+    assertEqual(steps[3].name, "Auto-repair", "step 4 auto");
+    assertEqual(steps[4].name, "Write repaired image", "step 5");
+    assertEqual(steps[6].name, "Final health report", "step 7");
+  }));
+
+  results.push(await runTest("repair pipeline with healthy image skips write", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildRepairPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "pipeline success");
+    assertEqual(ctx.repairsNeeded, false, "no repairs needed");
+    // Write step should report skipped
+    const writeStep = result.stepResults.find(s => s.name === "Write repaired image");
+    assert(writeStep !== undefined, "write step exists");
+    assert(writeStep!.detail.includes("skipped"), "write was skipped");
+  }));
+
+  results.push(await runTest("repair pipeline with damaged image performs full cycle", async () => {
+    const mockBackend = new MockBackend();
+    // Write a damaged image to mock flash (zeroed reset vector)
+    const flash = mockBackend.getFlashBuffer();
+    flash.fill(0x00, flash.length - 16);
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildRepairPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "pipeline success");
+    assertEqual(ctx.repairsNeeded, true, "repairs were needed");
+    assert(ctx.repairReport !== null, "repair report exists");
+    assert(ctx.repairReport!.totalBytesChanged > 0, "bytes changed");
+  }));
+
+  results.push(await runTest("repair pipeline with reference uses reference repair", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any, referencePath: null });
+    const steps = buildRepairPipeline(ctx);
+    assertEqual(steps[3].name, "Auto-repair", "default is auto");
+
+    const ctx2 = createContext({ backend: mockBackend as any, referencePath: "/tmp/ref.bin" });
+    const steps2 = buildRepairPipeline(ctx2);
+    assertEqual(steps2[3].name, "Repair from reference", "with ref uses reference repair");
+  }));
+
+  // Task 4: CLI command tests (function-level)
+
+  results.push(await runTest("full-backup dry-run completes with MockBackend", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any, dryRun: true });
+    const steps = buildBackupPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "backup completes");
+    assert(ctx.metadata !== null, "metadata generated");
+    assert(ctx.metadata!.sha256.length === 64, "sha256 present");
+  }));
+
+  results.push(await runTest("full-repair dry-run with healthy mock reports no repairs", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any, dryRun: true });
+    const steps = buildRepairPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "pipeline success");
+    assertEqual(ctx.repairsNeeded, false, "no repairs needed");
+  }));
+
+  results.push(await runTest("full-repair with --skip-write skips write step", async () => {
+    const mockBackend = new MockBackend();
+    const flash = mockBackend.getFlashBuffer();
+    flash.fill(0x00, flash.length - 16); // damage
+    const ctx = createContext({ backend: mockBackend as any, skipWrite: true });
+    const steps = buildRepairPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "pipeline success");
+    assertEqual(ctx.repairsNeeded, true, "repairs needed");
+    const writeStep = result.stepResults.find(s => s.name === "Write repaired image");
+    assert(writeStep!.detail.includes("skip"), "write was skipped");
+  }));
+
+  // Task 5: Integration tests
+
+  results.push(await runTest("full-backup end-to-end: mock read → analyze → metadata", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildBackupPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "success");
+    assertEqual(result.stepsCompleted, 4, "all steps");
+    assert(ctx.imageData!.length === 8 * 1024 * 1024, "full 8MB read");
+    assert(ctx.healthReport !== null, "health analyzed");
+    assert(ctx.metadata!.timestamp.length > 0, "metadata has timestamp");
+  }));
+
+  results.push(await runTest("full-repair end-to-end: mock healthy → no write needed", async () => {
+    const mockBackend = new MockBackend();
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildRepairPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "success");
+    assertEqual(ctx.repairsNeeded, false, "no repairs");
+    assertEqual(ctx.finalHealthReport!.overallStatus, ctx.healthReport!.overallStatus, "health unchanged");
+  }));
+
+  results.push(await runTest("full-repair end-to-end: mock damaged → repair → write → verify", async () => {
+    const mockBackend = new MockBackend();
+    const flash = mockBackend.getFlashBuffer();
+    flash.fill(0x00, flash.length - 16); // zero reset vector
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildRepairPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "pipeline success");
+    assertEqual(ctx.repairsNeeded, true, "repairs done");
+    assert(ctx.repairReport!.totalBytesChanged > 0, "bytes changed");
+  }));
+
+  results.push(await runTest("pipeline bail-out: step failure stops execution", async () => {
+    const mockBackend = new MockBackend();
+    mockBackend.setQualityMode('disconnected');
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildRepairPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, false, "pipeline failed");
+    assertEqual(result.errorStep, "Connection quality check", "failed at quality check");
+    assertEqual(result.stepsCompleted, 1, "only 1 step ran");
   }));
 
   // ─── Report ───

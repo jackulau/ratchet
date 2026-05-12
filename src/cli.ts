@@ -11,6 +11,7 @@ import { parseNvramStore } from "./analysis/nvram.js";
 import { listRegions as listBiosRegions, extractRegion, extractRegionToFile, replaceRegionInFile } from "./analysis/regions.js";
 import { analyzeBiosHealth } from "./analysis/recovery.js";
 import { repairFromReference, resetNvram, repairAuto, type RepairReport } from "./analysis/repair.js";
+import { runPipeline, buildBackupPipeline, buildRepairPipeline, createContext, type PipelineResult } from "./workflows/pipeline.js";
 import { SerialDebug } from "./serial/debug.js";
 import { searchChips, CHIP_DATABASE, formatSize, getChipVoltage, needs4ByteAddressing, getManufacturerName, lookupChipByJedecId, lookupChipByName, fuzzyMatchJedec, getChipRecommendations } from "./chips/database.js";
 import type { ChipDef } from "./chips/database.js";
@@ -856,6 +857,99 @@ async function cmdRepair(args: Args) {
     process.exit(1);
   }
   console.log();
+}
+
+function displayPipelineResult(result: PipelineResult): void {
+  console.log();
+  for (const step of result.stepResults) {
+    const icon = step.success ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
+    console.log(`  ${icon} [${step.number}/${result.stepResults.length > 0 ? result.stepResults[result.stepResults.length - 1].number : 0}] ${step.name} — ${step.detail} (${out.formatDuration(step.durationMs)})`);
+  }
+  console.log();
+  if (result.success) {
+    out.ok(`Pipeline complete in ${out.formatDuration(result.totalDurationMs)}`);
+  } else {
+    out.fail(`Pipeline failed at step "${result.errorStep}": ${result.errorDetail}`);
+  }
+}
+
+async function cmdFullBackup(args: Args) {
+  out.header("Full Backup Pipeline");
+
+  const outputDir = (() => {
+    const idx = args.flags.indexOf("--output");
+    return idx >= 0 ? args.flags[idx + 1] : ".";
+  })();
+
+  const backend = dryRun ? new MockBackend() : (await pickBackend(args.backend)).kind === "ch347" ? ch347 : ch341a;
+  const ctx = createContext({
+    backend: backend as any,
+    dryRun,
+    outputDir,
+  });
+
+  const steps = buildBackupPipeline(ctx);
+  const result = await runPipeline(steps, ctx);
+  displayPipelineResult(result);
+
+  if (result.success && ctx.metadata && ctx.imageData) {
+    const now = new Date();
+    const dateStr = now.toISOString().replace(/[-:T]/g, "").substring(0, 15);
+    const chipName = ctx.chipInfo?.name || "chip";
+    const baseName = `${chipName}_${dateStr}`;
+    const binPath = join(outputDir, `${baseName}.bin`);
+    const jsonPath = join(outputDir, `${baseName}.json`);
+
+    if (!dryRun) {
+      await writeFile(binPath, ctx.imageData);
+      await writeFile(jsonPath, JSON.stringify(ctx.metadata, null, 2));
+      out.ok(`Dump: ${binPath}`);
+      out.ok(`Metadata: ${jsonPath}`);
+    } else {
+      out.info(`Would write: ${binPath}`);
+      out.info(`Would write: ${jsonPath}`);
+    }
+  }
+  console.log();
+
+  if (!result.success) process.exit(1);
+}
+
+async function cmdFullRepair(args: Args) {
+  out.header("Full Repair Pipeline");
+
+  const refIdx = args.flags.indexOf("--reference");
+  const refPath = refIdx >= 0 ? args.flags[refIdx + 1] : null;
+  const outputDir = (() => {
+    const idx = args.flags.indexOf("--output");
+    return idx >= 0 ? args.flags[idx + 1] : ".";
+  })();
+  const skipWrite = args.flags.includes("--skip-write");
+
+  if (refPath && !existsSync(refPath)) {
+    out.fail(`Reference file not found: ${refPath}`);
+    process.exit(1);
+  }
+
+  const backend = dryRun ? new MockBackend() : (await pickBackend(args.backend)).kind === "ch347" ? ch347 : ch341a;
+  const ctx = createContext({
+    backend: backend as any,
+    dryRun,
+    referencePath: refPath,
+    outputDir,
+    skipWrite,
+  });
+
+  const steps = buildRepairPipeline(ctx);
+  const result = await runPipeline(steps, ctx);
+  displayPipelineResult(result);
+
+  if (result.success && ctx.repairReport) {
+    displayRepairReport(ctx.repairReport);
+  }
+  console.log();
+
+  if (!result.success) process.exit(1);
 }
 
 async function cmdDump(args: Args) {
@@ -3344,6 +3438,8 @@ async function main() {
       case "test":         await cmdConnectionTest(); break;
       case "connect":      await cmdConnect(args); break;
       case "repair":       await cmdRepair(args); break;
+      case "full-repair":  await cmdFullRepair(args); break;
+      case "full-backup":  await cmdFullBackup(args); break;
       case "reset":        await cmdReset(); break;
       case "analyze":
       case "info":         await cmdAnalyze(args); break;
