@@ -245,6 +245,80 @@ async function cmdIdentify(args: Args) {
   console.log();
 }
 
+// ─── Pre-flight quality gate ───
+
+/**
+ * Run a connection quality check before read/write operations.
+ * Returns the score if proceeding is allowed, or exits the process if blocked.
+ *
+ * Thresholds:
+ *   >= 70: proceed silently (show score in verbose mode)
+ *   50-69: warn user, proceed
+ *   < 50:  block operation, print diagnostics, exit 1
+ */
+async function runPreFlightQualityCheck(operation: string): Promise<number> {
+  // Try CH341A first, then CH347
+  let connResult;
+  try {
+    connResult = await ch341a.connectionTest();
+    if (!connResult.stable && connResult.reads === 0) {
+      connResult = await ch347.connectionTest();
+    }
+  } catch {
+    try {
+      connResult = await ch347.connectionTest();
+    } catch {
+      // Neither programmer available — skip quality check
+      return 100;
+    }
+  }
+
+  // Map connectionTest data to RawConnectionData
+  const jedecReadings: string[] = [];
+  for (let i = 0; i < connResult.matches; i++) {
+    jedecReadings.push(connResult.jedecId);
+  }
+  for (let i = connResult.matches; i < connResult.reads; i++) {
+    jedecReadings.push("000000");
+  }
+
+  const rawData: RawConnectionData = {
+    jedecReadings,
+    timingsMs: connResult.timings,
+    statusRegisterOk: connResult.statusRegister !== null,
+  };
+
+  const quality = computeQualityScore(rawData);
+
+  if (quality.score >= 70) {
+    // Good or Excellent — proceed silently
+    vlog(`Pre-flight quality: ${quality.score}/100 (${quality.grade})`);
+    return quality.score;
+  }
+
+  if (quality.score >= 50) {
+    // Fair — warn but proceed
+    out.warn(`Connection quality: ${quality.score}/100 (${quality.grade})`);
+    out.warn(`Proceeding with ${operation} — connection is marginal`);
+    if (quality.diagnostics.length > 0) {
+      for (const diag of quality.diagnostics) {
+        out.dim(`  ${diag}`);
+      }
+    }
+    return quality.score;
+  }
+
+  // Poor (< 50) — block the operation
+  out.fail(`Connection quality too low for ${operation}: ${quality.score}/100 (${quality.grade})`);
+  if (quality.diagnostics.length > 0) {
+    for (const diag of quality.diagnostics) {
+      out.warn(diag);
+    }
+  }
+  out.dim("Run 'biospy connect' for detailed connection diagnostics.");
+  process.exit(1);
+}
+
 async function cmdRead(args: Args) {
   const outPath = args.positional[0];
   if (!outPath) { out.fail("Usage: biospy read <output.bin>"); process.exit(1); }
@@ -255,6 +329,11 @@ async function cmdRead(args: Args) {
     out.header(`Reading chip → ${outPath} (double-verify mode)`);
   } else {
     out.header(`Reading chip → ${outPath}`);
+  }
+
+  // Pre-flight quality gate
+  if (!dryRun && !args.flags.includes("--skip-quality-check")) {
+    await runPreFlightQualityCheck("read");
   }
 
   const backend = await pickBackend(args.backend);
@@ -336,26 +415,9 @@ async function cmdWrite(args: Args) {
     process.exit(1);
   }
 
-  // Pre-write connection stability check
-  if (!args.flags.includes("--skip-test")) {
-    try {
-      let connTest = await ch341a.connectionTest();
-      if (!connTest.stable && connTest.reads === 0) {
-        // CH341A not found, try CH347
-        connTest = await ch347.connectionTest();
-      }
-      if (connTest.reads > 0 && !connTest.stable) {
-        out.fail(`Connection unstable: ${connTest.error}`);
-        out.dim("Fix your SOIC clip/ZIF socket connection before writing.");
-        out.dim("Or use --skip-test to bypass (NOT recommended for writes).");
-        process.exit(1);
-      }
-      if (connTest.stable) {
-        out.ok(`Connection stable (${connTest.matches}/${connTest.reads} reads consistent)`);
-      }
-    } catch {
-      // Programmer not connected — skip pre-write test
-    }
+  // Pre-write quality gate (replaces old --skip-test connection check)
+  if (!dryRun && !args.flags.includes("--skip-quality-check") && !args.flags.includes("--skip-test")) {
+    await runPreFlightQualityCheck("write");
   }
 
   const chip = await identifyAny();
@@ -3114,6 +3176,7 @@ ${"\x1b[1m"}OPTIONS:${"\x1b[0m"}
   --no-backup                Skip backup read before write (faster)
   --no-verify                Skip post-write verification (faster)
   --skip-test                Skip pre-write connection stability test
+  --skip-quality-check       Skip pre-flight quality gate on read/write
   --raw                      Write file as-is, don't strip capsule headers
 
 ${"\x1b[1m"}BACKENDS:${"\x1b[0m"}

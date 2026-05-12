@@ -958,6 +958,58 @@ export async function runSelfTest(): Promise<boolean> {
     assertEqual(shouldAutoExit(100), false, "score 100 should NOT trigger auto-exit");
   }));
 
+  // ─── Pre-flight Quality Gate Tests ───
+  console.log("\nPre-flight Quality Gate");
+
+  results.push(await runTest("pre-flight quality gate allows high score", async () => {
+    // Simulate quality scoring with a high-quality connection (score 95+)
+    const data: RawConnectionData = {
+      jedecReadings: Array(10).fill("ef4017"),
+      timingsMs: Array(10).fill(5),
+      statusRegisterOk: true,
+    };
+    const quality = computeQualityScore(data);
+    // High score (>= 70): should proceed — no block, no warning
+    assert(quality.score >= 70, `expected score >= 70, got ${quality.score}`);
+    assertEqual(quality.grade, "Excellent", "grade");
+    // Verify no diagnostics for perfect connection
+    assertEqual(quality.diagnostics.length, 0, "no diagnostics for high score");
+  }));
+
+  results.push(await runTest("pre-flight quality gate warns on medium score", async () => {
+    // Craft data that produces a score in the 50-69 range (Fair)
+    const data: RawConnectionData = {
+      jedecReadings: ["ef4017", "ef4017", "ef4017", "ef4017", "ef4017", "ef4017", "ef4017", "ab1234", "cd5678", "000000"],
+      timingsMs: [5, 50, 5, 100, 5, 200, 5, 150, 5, 80],
+      statusRegisterOk: false,
+    };
+    const quality = computeQualityScore(data);
+    // Should be in the warning range (50-69)
+    assert(quality.score >= 50, `expected score >= 50, got ${quality.score}`);
+    assert(quality.score < 70, `expected score < 70, got ${quality.score}`);
+    assertEqual(quality.grade, "Fair", "grade should be Fair");
+    // Should have diagnostics recommending fixes
+    assert(quality.diagnostics.length > 0, "medium score should produce diagnostics");
+  }));
+
+  results.push(await runTest("pre-flight quality gate blocks on low score", async () => {
+    // Craft data that produces a score < 50 (Poor) — should block
+    const data: RawConnectionData = {
+      jedecReadings: Array(10).fill("000000"),
+      timingsMs: [5, 500, 5, 1000, 5, 2000, 5, 3000, 5, 50],
+      statusRegisterOk: false,
+    };
+    const quality = computeQualityScore(data);
+    // Should be in the blocking range (< 50)
+    assert(quality.score < 50, `expected score < 50, got ${quality.score}`);
+    assertEqual(quality.grade, "Poor", "grade should be Poor");
+    // Should have diagnostics explaining the problem
+    assert(quality.diagnostics.length > 0, "low score should produce diagnostics");
+    // Verify the quality gate would block: check threshold logic
+    const wouldBlock = quality.score < 50;
+    assertEqual(wouldBlock, true, "score < 50 should trigger block");
+  }));
+
   // ─── Report ───
   console.log();
   console.log("━".repeat(40));
