@@ -80,6 +80,74 @@ biospy verify new_bios.bin
 | `serial <port> [baud]` | Stream serial debug output (CH343) |
 | `serial-list` | List available serial ports |
 
+## Agent Interface (MCP)
+
+biospy ships an **MCP server** (`biospy-mcp`) so AI agents — Claude Desktop, mcp-cli, custom SDK clients — can drive the hardware directly. JSON-RPC over stdio. 18 tools cover detection, identification, read/write/verify/erase, image analysis, the chip database, POST-code decoding, failure-pattern search, and voltage references.
+
+```bash
+# Run the server manually (stdio)
+biospy-mcp
+
+# Mock mode (no hardware required, for testing)
+BIOSPY_FORCE_MOCK=1 biospy-mcp
+```
+
+Register with Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "biospy": {
+      "command": "node",
+      "args": ["/absolute/path/to/biospy/dist/mcp/server.js"]
+    }
+  }
+}
+```
+
+Or after `npm link` / global install: `"command": "biospy-mcp"`.
+
+### Tools
+
+| Tool | Purpose |
+|------|---------|
+| `detect` | Scan USB for CH34x programmers |
+| `identify` | Read JEDEC ID + SFDP + DB lookup |
+| `sfdp` | Read SFDP parameter table |
+| `wp_status` | Read write-protection bits |
+| `read_chip` | Dump flash to file |
+| `write_chip` | Program file → flash (requires `confirm:true`) |
+| `verify_chip` | Compare chip vs file |
+| `erase_chip` | Full erase (requires `confirm:true`) |
+| `region_erase` | Partial erase (requires `confirm:true`) |
+| `blank_check` | Verify chip is all 0xFF |
+| `analyze_image` | Parse BIOS image (regions, UEFI, vendor) |
+| `bios_regions` | Deep region layout (Intel FD + UEFI + ME + NVRAM) |
+| `nvram_vars` | List UEFI NVRAM variables |
+| `search_chips` | Fuzzy search the 806-chip database |
+| `chip_info` | Full chip details + write recommendations |
+| `post_decode` | Decode AMI/Award/Phoenix/UEFI POST codes |
+| `failure_search` | Search motherboard failure patterns |
+| `voltage_reference` | ATX/EPS/PCIe/board voltage tables |
+
+Destructive tools (`write_chip`, `erase_chip`, `region_erase`) require `confirm:true`. The voltage gate refuses writes to 1.8V chips on stock CH341A unless `force_1_8v:true` is set. Every tool returns a stable envelope: `{ok, command, data?|error, nextAction?}`.
+
+### CLI JSON Mode
+
+Every inspection command also accepts `--json` and emits the same envelope on stdout — useful for shell-driving agents or piping into `jq`:
+
+```bash
+biospy status --json
+biospy chip-info ef4017 --json
+biospy analyze backup.bin --json | jq '.data.regions'
+```
+
+Hardware ops accept `--ndjson` for line-delimited progress events:
+
+```bash
+biospy read backup.bin --ndjson   # emits {type:"progress"...}, then {type:"result"...}
+```
+
 ## Safety Features
 
 **biospy refuses to let you brick your board:**

@@ -3824,6 +3824,14 @@ ${"\x1b[1m"}EXAMPLES:${"\x1b[0m"}
   biospy region-erase 0x0 0x10000 --confirm  # erase first 64KB
   biospy status --dry-run              # test without hardware
   biospy --self-test                   # run full self-test suite
+  biospy status --json                 # machine-readable envelope for agents
+  biospy read backup.bin --ndjson      # streaming progress events
+
+${"\x1b[1m"}AGENT INTERFACE:${"\x1b[0m"}
+  biospy-mcp                           # run the MCP server (stdio JSON-RPC)
+                                       # 18 tools for Claude / mcp-cli / SDK clients
+  BIOSPY_FORCE_MOCK=1 biospy-mcp       # mock mode (no hardware needed)
+  See README.md for Claude Desktop config.
 `);
 }
 
