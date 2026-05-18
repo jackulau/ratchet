@@ -25,6 +25,7 @@ import * as out from "./output.js";
 import { computeQualityScore, formatMonitorLine, shouldAutoExit } from "./connection/quality.js";
 import type { RawConnectionData } from "./connection/quality.js";
 import type { ChipInfo, ReadResult } from "./types.js";
+import { emitOk as agentOk, emitFail as agentFail, wantsJson, wantsNdjson } from "./agent/envelope.js";
 
 const VERSION = "1.1.0";
 
@@ -114,11 +115,40 @@ function makeProgress(label: string): ProgressCallback {
 // ─── Commands ───
 
 async function cmdStatus(args: Args) {
-  out.header("Programmer");
-
+  const json = wantsJson(args.flags);
   const ch341aInfo = await ch341a.detectProgrammer();
   const ch347Info = await ch347.detectProgrammer();
+  const chip = await identifyAny();
 
+  if (json) {
+    const programmer = ch341aInfo.connected && ch341aInfo.type === "ch341a"
+      ? { connected: true, type: "ch341a", description: ch341aInfo.description, vendorId: ch341aInfo.vendorId, productId: ch341aInfo.productId, maxPayload: 31 }
+      : ch347Info.connected
+      ? { connected: true, type: ch347Info.type, description: ch347Info.description, vendorId: ch347Info.vendorId, productId: ch347Info.productId, maxPayload: 510 }
+      : { connected: false };
+    const chipData = chip ? {
+      detected: true,
+      vendor: chip.vendorName,
+      name: chip.name,
+      jedecId: chip.jedecId,
+      sizeBytes: chip.sizeBytes,
+      sizeHuman: chip.sizeHuman,
+      type: chip.type,
+      manufacturer: getManufacturerName(chip.jedecId),
+      voltage: chip.voltage ?? null,
+      addressing: needs4ByteAddressing(chip.jedecId) ? "4-byte" : "3-byte",
+      voltageWarning: chip.voltage && chip.voltage < 2.0 ? "1.8V chip — stock CH341A outputs 3.3V. Use a voltage adapter." : null,
+    } : { detected: false };
+    const nextAction = !programmer.connected
+      ? "Connect a CH341A or CH347 programmer via USB, then re-run."
+      : !chip
+      ? "Check chip seating in ZIF socket (pin 1 alignment)."
+      : "Use `identify` for full chip details or `read <out.bin>` to dump.";
+    agentOk("status", { programmer, chip: chipData }, nextAction);
+    return;
+  }
+
+  out.header("Programmer");
   if (ch341aInfo.connected && ch341aInfo.type === "ch341a") {
     out.ok(`${ch341aInfo.description} (${ch341aInfo.type})`);
     out.kvLine("USB ID", `${ch341aInfo.vendorId}:${ch341aInfo.productId}`);
@@ -135,7 +165,6 @@ async function cmdStatus(args: Args) {
   }
 
   out.header("Flash Chip");
-  const chip = await identifyAny();
   if (chip) {
     out.ok(`${chip.vendorName} ${chip.name}`);
     out.kvLine("JEDEC ID", chip.jedecId);
@@ -159,7 +188,22 @@ async function cmdStatus(args: Args) {
   console.log();
 }
 
-async function cmdDetect() {
+async function cmdDetect(args?: Args) {
+  const json = args ? wantsJson(args.flags) : false;
+  if (json) {
+    const ch341aInfo = await ch341a.detectProgrammer();
+    const ch347Info = await ch347.detectProgrammer();
+    const found: Array<Record<string, unknown>> = [];
+    if (ch341aInfo.connected && ch341aInfo.type === "ch341a") {
+      found.push({ type: ch341aInfo.type, description: ch341aInfo.description, vendorId: ch341aInfo.vendorId, productId: ch341aInfo.productId, bus: ch341aInfo.bus ?? null, address: ch341aInfo.address ?? null, portPath: ch341aInfo.portPath ?? null, viaHub: ch341aInfo.viaHub ?? false, maxPayload: 31 });
+    }
+    if (ch347Info.connected) {
+      found.push({ type: ch347Info.type, description: ch347Info.description, vendorId: ch347Info.vendorId, productId: ch347Info.productId, bus: ch347Info.bus ?? null, address: ch347Info.address ?? null, portPath: ch347Info.portPath ?? null, viaHub: ch347Info.viaHub ?? false, maxPayload: 510 });
+    }
+    agentOk("detect", { count: found.length, programmers: found }, found.length === 0 ? "No CH34x found — check USB connection or try a different port." : "Use `status` to also identify the chip, or `read <out.bin>` to dump it.");
+    return;
+  }
+
   out.header("Scanning USB...");
 
   const ch341aInfo = await ch341a.detectProgrammer();
@@ -195,15 +239,48 @@ async function cmdDetect() {
 }
 
 async function cmdIdentify(args: Args) {
-  out.header("Identifying chip...");
+  const json = wantsJson(args.flags);
   const chip = await identifyAny();
   if (!chip) {
+    if (json) {
+      agentFail("identify", "NO_CHIP", "No chip detected", "Check chip seating in ZIF socket. Pin 1 (dot/notch) must align with socket marking.", "Re-seat the chip and re-run, or run `detect` to confirm programmer is present.");
+      process.exit(1);
+    }
+    out.header("Identifying chip...");
     out.fail("No chip detected");
     out.dim("1. Check programmer is connected");
     out.dim("2. Check chip is seated correctly in ZIF socket");
     out.dim("3. Pin 1 (dot/notch) must align with socket marking");
     process.exit(1);
   }
+
+  if (json) {
+    const dbChip = lookupChipByJedecId(chip.jedecId);
+    let sfdp: unknown = null;
+    try { sfdp = await ch341a.readSFDP(); } catch {}
+    const data: Record<string, unknown> = {
+      jedecId: chip.jedecId,
+      vendor: chip.vendorName,
+      name: chip.name,
+      sizeBytes: chip.sizeBytes,
+      type: chip.type,
+      voltage: chip.voltage ?? null,
+      manufacturer: getManufacturerName(chip.jedecId),
+      needs4ByteAddr: needs4ByteAddressing(chip.jedecId),
+      knownInDatabase: !!dbChip,
+    };
+    if (dbChip) {
+      data.dbChip = dbChip;
+      data.recommendations = getChipRecommendations(dbChip);
+    } else {
+      data.fuzzy = fuzzyMatchJedec(chip.jedecId);
+    }
+    if (sfdp) data.sfdp = sfdp;
+    agentOk("identify", data, dbChip ? "Chip is in the database — safe to read/write with default settings." : "Unknown chip — review fuzzy match and confirm voltage before writing.");
+    return;
+  }
+
+  out.header("Identifying chip...");
 
   const dbChip = lookupChipByJedecId(chip.jedecId);
   if (dbChip) {
@@ -558,38 +635,43 @@ async function cmdBlankCheck(args: Args) {
 }
 
 async function cmdWPStatus(args: Args) {
+  const json = wantsJson(args.flags);
+
+  const tryBackend = async (backend: typeof ch341a | typeof ch347, type: string): Promise<{ ok: true; wp: boolean; type: string } | null> => {
+    try {
+      const info = await backend.detectProgrammer();
+      if (info.connected) {
+        const wp = await backend.isWriteProtected();
+        return { ok: true, wp, type };
+      }
+    } catch {}
+    return null;
+  };
+
+  const result = (await tryBackend(ch341a, "ch341a")) ?? (await tryBackend(ch347, "ch347"));
+
+  if (!result) {
+    if (json) {
+      agentFail("wp-status", "NO_PROGRAMMER", "No native USB programmer detected", "WP check requires a CH341A or CH347 programmer.", "Run `detect` to confirm USB connection.");
+      process.exit(1);
+    }
+    out.header("Write protection status");
+    out.fail("No native USB programmer detected (WP check requires CH341A/CH347)");
+    process.exit(1);
+  }
+
+  if (json) {
+    agentOk("wp-status", { writeProtected: result.wp, backend: result.type }, result.wp ? "Chip is write-protected — `write` will clear protection automatically before programming." : "Chip is writable — safe to proceed with write operations.");
+    return;
+  }
+
   out.header("Write protection status");
-
-  try {
-    const info = await ch341a.detectProgrammer();
-    if (info.connected && info.type === "ch341a") {
-      const wp = await ch341a.isWriteProtected();
-      if (wp) {
-        out.warn("Write protection is ENABLED");
-        out.dim("The write command clears this automatically before programming.");
-      } else {
-        out.ok("Write protection is disabled — chip is writable");
-      }
-      return;
-    }
-  } catch {}
-
-  try {
-    const info = await ch347.detectProgrammer();
-    if (info.connected) {
-      const wp = await ch347.isWriteProtected();
-      if (wp) {
-        out.warn("Write protection is ENABLED");
-        out.dim("The write command clears this automatically before programming.");
-      } else {
-        out.ok("Write protection is disabled — chip is writable");
-      }
-      return;
-    }
-  } catch {}
-
-  out.fail("No native USB programmer detected (WP check requires CH341A/CH347)");
-  process.exit(1);
+  if (result.wp) {
+    out.warn("Write protection is ENABLED");
+    out.dim("The write command clears this automatically before programming.");
+  } else {
+    out.ok("Write protection is disabled — chip is writable");
+  }
 }
 
 async function cmdErase(args: Args) {
@@ -692,13 +774,35 @@ async function cmdVerify(args: Args) {
 }
 
 async function cmdAnalyze(args: Args) {
+  const json = wantsJson(args.flags);
   const filePath = args.positional[0];
-  if (!filePath) { out.fail("Usage: biospy analyze <firmware.bin>"); process.exit(1); }
-  if (!existsSync(filePath)) { out.fail(`File not found: ${filePath}`); process.exit(1); }
+  if (!filePath) {
+    if (json) { agentFail("analyze", "MISSING_ARG", "File path required", "Pass a path to a BIOS image file.", "biospy analyze <firmware.bin>"); process.exit(1); }
+    out.fail("Usage: biospy analyze <firmware.bin>"); process.exit(1);
+  }
+  if (!existsSync(filePath)) {
+    if (json) { agentFail("analyze", "FILE_NOT_FOUND", `File not found: ${filePath}`); process.exit(1); }
+    out.fail(`File not found: ${filePath}`); process.exit(1);
+  }
 
-  out.header(`Analyzing ${filePath}`);
   const analysis = await analyzer.analyze(filePath);
 
+  if (json) {
+    agentOk("analyze", {
+      file: filePath,
+      sizeBytes: analysis.fileSize,
+      checksum: analysis.checksum,
+      isUefi: analysis.isUefi,
+      biosVendor: analysis.biosVendor ?? null,
+      biosVersion: analysis.biosVersion ?? null,
+      buildDate: analysis.buildDate ?? null,
+      regions: analysis.regions,
+      warnings: analysis.warnings,
+    }, "Use `bios-regions` for deep region layout or `nvram` to list UEFI variables.");
+    return;
+  }
+
+  out.header(`Analyzing ${filePath}`);
   out.kvLine("Size", out.formatBytes(analysis.fileSize));
   out.kvLine("SHA256", analysis.checksum.substring(0, 16) + "...");
   out.kvLine("UEFI", analysis.isUefi ? "yes" : "no (legacy BIOS)");
@@ -1187,15 +1291,26 @@ async function cmdSearch(args: Args) {
   console.log();
 }
 
-async function cmdSFDP() {
-  out.header("Reading SFDP (Serial Flash Discoverable Parameters)...");
+async function cmdSFDP(args?: Args) {
+  const json = args ? wantsJson(args.flags) : false;
   try {
     const sfdp = await ch341a.readSFDP();
     if (!sfdp) {
+      if (json) {
+        agentFail("sfdp", "NO_SFDP", "Chip does not support SFDP or is not connected", "SFDP is optional — check chip datasheet for support. Use `chip-info <jedec>` for database lookup instead.", "Try `identify` to read JEDEC ID and look up parameters from the chip database.");
+        process.exit(1);
+      }
+      out.header("Reading SFDP (Serial Flash Discoverable Parameters)...");
       out.fail("Chip does not support SFDP or is not connected");
       process.exit(1);
     }
 
+    if (json) {
+      agentOk("sfdp", sfdp, "Use SFDP-reported geometry as ground truth for write/erase operations.");
+      return;
+    }
+
+    out.header("Reading SFDP (Serial Flash Discoverable Parameters)...");
     out.ok("SFDP table found");
     out.kvLine("Density", `${formatSize(sfdp.densityBytes)} (${sfdp.densityBits.toLocaleString()} bits)`);
     out.kvLine("Page Size", `${sfdp.pageSize} bytes`);
@@ -1206,6 +1321,10 @@ async function cmdSFDP() {
     out.kvLine("4-Byte Addressing", sfdp.supports4ByteAddr ? "supported" : "not supported");
     out.kvLine("Raw Header", sfdp.rawHeader);
   } catch (err: any) {
+    if (json) {
+      agentFail("sfdp", "READ_FAILED", err.message ?? "SFDP read failed");
+      process.exit(1);
+    }
     out.fail(err.message);
     process.exit(1);
   }
@@ -1620,8 +1739,10 @@ async function cmdSetup() {
 // ─── Diagnostic commands ───
 
 async function cmdPostDecode(args: Args) {
+  const json = wantsJson(args.flags);
   const code = args.positional[0];
   if (!code) {
+    if (json) { agentFail("post-decode", "MISSING_ARG", "POST code required", undefined, "biospy post-decode <hex-code> [--standard ami|award|phoenix|uefi]"); process.exit(1); }
     out.fail("Usage: biospy post-decode <hex-code> [--standard ami|award|phoenix|uefi]");
     process.exit(1);
   }
@@ -1646,9 +1767,17 @@ async function cmdPostDecode(args: Args) {
 
   if (results.length === 0) {
     const cleaned = code.replace(/^0x/i, "").toUpperCase().padStart(2, "0");
+    const nearby = searchPostCodes(cleaned);
+    if (json) {
+      if (!isHex) {
+        agentFail("post-decode", "INVALID_CODE", `"${code}" is not a valid POST code`, "POST codes are 1-4 hex digits, optionally prefixed with 0x.");
+        process.exit(1);
+      }
+      agentOk("post-decode", { query: code, matches: [], nearby: nearby.slice(0, 5).map((e) => ({ standard: e.standard, code: e.code, phase: e.phase, description: e.description, causes: e.causes })) }, nearby.length > 0 ? "No exact match — nearby returns descriptions that mention this code." : "No information available for this code in the database.");
+      return;
+    }
     out.warn(`No exact match for POST code 0x${cleaned}${standard ? ` (${standard})` : ""}`);
     console.log();
-    const nearby = searchPostCodes(cleaned);
     if (nearby.length > 0) {
       out.info("Searching descriptions...");
       const shown = nearby.slice(0, 5);
@@ -1670,6 +1799,11 @@ async function cmdPostDecode(args: Args) {
     process.exit(1);
   }
 
+  if (json) {
+    agentOk("post-decode", { query: code, standard: standard ?? null, matches: results.map((e) => ({ standard: e.standard, code: e.code, phase: e.phase, phaseDescription: getPhaseDescription(e.phase), description: e.description, causes: e.causes })) });
+    return;
+  }
+
   for (const entry of results) {
     out.header(`[${entry.standard.toUpperCase()}] POST Code 0x${entry.code}`);
     out.kvLine("Phase", entry.phase);
@@ -1687,6 +1821,7 @@ async function cmdPostDecode(args: Args) {
 }
 
 async function cmdFailureDb(args: Args) {
+  const json = wantsJson(args.flags);
   let categoryFilter: string | undefined;
   const catIdx = args.flags.indexOf("--category");
   if (catIdx >= 0 && args.flags[catIdx + 1]) {
@@ -1696,8 +1831,13 @@ async function cmdFailureDb(args: Args) {
   if (categoryFilter) {
     const patterns = getPatternsByCategory(categoryFilter);
     if (patterns.length === 0) {
+      if (json) { agentFail("failure-db", "UNKNOWN_CATEGORY", `No patterns in category "${categoryFilter}"`, "Valid categories: power, display, boot, stability, bios, peripheral."); process.exit(1); }
       out.fail(`No patterns in category "${categoryFilter}". Categories: power, display, boot, stability, bios, peripheral`);
       process.exit(1);
+    }
+    if (json) {
+      agentOk("failure-db", { mode: "category", category: categoryFilter, count: patterns.length, patterns: patterns.map((p) => ({ id: p.id, name: p.name, category: p.category, difficulty: p.difficulty })) }, "Search by symptom for full diagnostic detail: `failure-db \"<symptom>\"`");
+      return;
     }
     out.header(`Failure Patterns — ${categoryFilter.toUpperCase()} (${patterns.length} patterns)`);
     console.log();
@@ -1711,6 +1851,7 @@ async function cmdFailureDb(args: Args) {
 
   const query = args.positional.join(" ");
   if (!query) {
+    if (json) { agentFail("failure-db", "MISSING_ARG", "Query or category required", undefined, "biospy failure-db <symptom> | --category <power|display|boot|stability|bios|peripheral>"); process.exit(1); }
     out.fail("Usage: biospy failure-db <symptom> | biospy failure-db --category <category>");
     out.dim("Examples:");
     out.dim('  biospy failure-db "no power"');
@@ -1722,8 +1863,14 @@ async function cmdFailureDb(args: Args) {
 
   const results = searchFailurePatterns(query);
   if (results.length === 0) {
+    if (json) { agentOk("failure-db", { mode: "search", query, count: 0, patterns: [] }, "Try broader terms: power, display, boot, ram, gpu, usb, bios"); return; }
     out.warn(`No failure patterns match "${query}"`);
     out.dim("Try broader terms: power, display, boot, ram, gpu, usb, bios");
+    return;
+  }
+
+  if (json) {
+    agentOk("failure-db", { mode: "search", query, count: results.length, patterns: results.slice(0, 10).map((p) => ({ id: p.id, name: p.name, category: p.category, difficulty: p.difficulty, symptoms: p.symptoms, causes: p.causes, diagnosticSteps: p.diagnosticSteps, tools: p.tools })) });
     return;
   }
 
@@ -2899,12 +3046,35 @@ async function cmdDiagnose(args: Args) {
 // ─── BIOS analysis commands ───
 
 async function cmdBiosRegions(args: Args) {
+  const json = wantsJson(args.flags);
   const file = args.positional[0];
-  if (!file) { out.fail("Usage: biospy bios-regions <file.bin>"); process.exit(1); }
-  if (!existsSync(file)) { out.fail(`File not found: ${file}`); process.exit(1); }
+  if (!file) {
+    if (json) { agentFail("bios-regions", "MISSING_ARG", "File path required", undefined, "biospy bios-regions <file.bin>"); process.exit(1); }
+    out.fail("Usage: biospy bios-regions <file.bin>"); process.exit(1);
+  }
+  if (!existsSync(file)) {
+    if (json) { agentFail("bios-regions", "FILE_NOT_FOUND", `File not found: ${file}`); process.exit(1); }
+    out.fail(`File not found: ${file}`); process.exit(1);
+  }
 
   const data = await readFile(file);
   const regions = listBiosRegions(data);
+
+  if (json) {
+    const fvs = scanFirmwareVolumes(data);
+    const meExtract = extractRegion(data, "me");
+    const me = meExtract ? parseMeRegion(meExtract.data, meExtract.region.offset) : null;
+    const nvram = parseNvramStore(data);
+    agentOk("bios-regions", {
+      file,
+      sizeBytes: data.length,
+      regions,
+      uefiVolumes: fvs.map((fv) => ({ phase: fv.phase, offset: fv.offset, size: fv.size, fileCount: fv.files.length, files: fv.files.slice(0, 50) })),
+      me: me ? { version: me.version, state: me.state, partitions: me.partitions, warnings: me.warnings } : null,
+      nvram: nvram.found ? { format: nvram.format, offset: nvram.offset, totalSize: nvram.totalSize, usedSize: nvram.usedSize, freeSize: nvram.freeSize, deletedCount: nvram.deletedCount, validCount: nvram.variables.filter((v) => v.state === "valid").length, warnings: nvram.warnings } : null,
+    }, "Use `nvram <file>` to list variables in detail, or `bios-recovery <file>` for health check.");
+    return;
+  }
 
   out.header("Region Layout");
   const rows = [["Region", "Offset", "Size", "Type"]];
@@ -2953,14 +3123,22 @@ async function cmdBiosRegions(args: Args) {
 }
 
 async function cmdNvram(args: Args) {
+  const json = wantsJson(args.flags);
   const file = args.positional[0];
-  if (!file) { out.fail("Usage: biospy nvram <file.bin> [--search <name>]"); process.exit(1); }
-  if (!existsSync(file)) { out.fail(`File not found: ${file}`); process.exit(1); }
+  if (!file) {
+    if (json) { agentFail("nvram", "MISSING_ARG", "File path required", undefined, "biospy nvram <file.bin> [--search <name>]"); process.exit(1); }
+    out.fail("Usage: biospy nvram <file.bin> [--search <name>]"); process.exit(1);
+  }
+  if (!existsSync(file)) {
+    if (json) { agentFail("nvram", "FILE_NOT_FOUND", `File not found: ${file}`); process.exit(1); }
+    out.fail(`File not found: ${file}`); process.exit(1);
+  }
 
   const data = await readFile(file);
   const nvram = parseNvramStore(data);
 
   if (!nvram.found) {
+    if (json) { agentOk("nvram", { found: false }, "No NVRAM variable store in this image — might be raw flash or pre-UEFI."); return; }
     out.warn("No NVRAM variable store found in this image");
     return;
   }
@@ -2969,6 +3147,26 @@ async function cmdNvram(args: Args) {
   const searchIdx = args.flags.indexOf("--search");
   if (searchIdx >= 0 && args.flags[searchIdx + 1]) {
     searchFilter = args.flags[searchIdx + 1].toLowerCase();
+  }
+
+  if (json) {
+    const vars = searchFilter
+      ? nvram.variables.filter((v) => v.name.toLowerCase().includes(searchFilter!) || v.guidName.toLowerCase().includes(searchFilter!))
+      : nvram.variables;
+    agentOk("nvram", {
+      file,
+      found: true,
+      format: nvram.format,
+      offset: nvram.offset,
+      totalSize: nvram.totalSize,
+      usedSize: nvram.usedSize,
+      freeSize: nvram.freeSize,
+      deletedCount: nvram.deletedCount,
+      filter: searchFilter ?? null,
+      variables: vars.map((v) => ({ name: v.name, guid: v.guid, guidName: v.guidName, dataSize: v.dataSize, state: v.state })),
+      warnings: nvram.warnings,
+    });
+    return;
   }
 
   out.header("NVRAM Variable Store");
@@ -3272,11 +3470,13 @@ async function cmdHwDiag(args: Args) {
 }
 
 async function cmdVoltageRef(args: Args) {
+  const json = wantsJson(args.flags);
   const searchIdx = args.flags.indexOf("--search");
   const query = searchIdx !== -1 ? args.flags[searchIdx + 1]?.toLowerCase() : undefined;
   const connectorArg = args.positional[0]?.toLowerCase();
 
   const refs = ALL_REFERENCES;
+  const matchedConnectors: typeof refs = [];
 
   for (const ref of refs) {
     if (connectorArg) {
@@ -3294,6 +3494,10 @@ async function cmdVoltageRef(args: Args) {
       if (matchingRails.length === 0) continue;
     }
 
+    matchedConnectors.push({ ...ref, rails: matchingRails });
+
+    if (json) continue;
+
     out.header(`${ref.connector} — ${ref.description}`);
     console.log();
     for (const rail of matchingRails) {
@@ -3303,6 +3507,15 @@ async function cmdVoltageRef(args: Args) {
       out.dim(`    ${rail.notes}`);
     }
     console.log();
+  }
+
+  if (json) {
+    if (matchedConnectors.length === 0) {
+      agentOk("voltage-ref", { connector: connectorArg ?? null, query: query ?? null, count: 0, connectors: [] }, connectorArg ? `No connector matching "${connectorArg}". Available: atx, eps, pcie, board, spi.` : "No matches.");
+      return;
+    }
+    agentOk("voltage-ref", { connector: connectorArg ?? null, query: query ?? null, count: matchedConnectors.length, connectors: matchedConnectors }, "Use returned rail.expected + rail.tolerance to compare against multimeter readings.");
+    return;
   }
 
   if (connectorArg && !refs.some(r => r.connector.toLowerCase().includes(connectorArg) || r.description.toLowerCase().includes(connectorArg))) {
@@ -3501,10 +3714,10 @@ async function main() {
   try {
     switch (args.command) {
       case "status":       await cmdStatus(args); break;
-      case "detect":       await cmdDetect(); break;
+      case "detect":       await cmdDetect(args); break;
       case "identify":
       case "id":           await cmdIdentify(args); break;
-      case "sfdp":         await cmdSFDP(); break;
+      case "sfdp":         await cmdSFDP(args); break;
       case "read":         await cmdRead(args); break;
       case "write":
       case "flash":        await cmdWrite(args); break;

@@ -2860,6 +2860,197 @@ export async function runSelfTest(): Promise<boolean> {
     assert(report.actions.some(a => a.includes("matches reference")), "reports match");
   }));
 
+  // ─── Agent JSON envelope (D2) ───
+  // Subprocess-level: every inspection command must emit {ok, command, data?|error, nextAction?}.
+  console.log("\nAgent JSON Envelope");
+
+  function assertEnvelope(parsed: any, command: string, okExpected: boolean): void {
+    assert(typeof parsed === "object" && parsed !== null, "envelope is object");
+    assertEqual(parsed.ok, okExpected, `ok=${okExpected}`);
+    assertEqual(parsed.command, command, `command field matches`);
+    if (okExpected) {
+      assert(parsed.data !== undefined, "data field present on ok=true");
+    } else {
+      assert(parsed.error !== undefined, "error field present on ok=false");
+      assert(typeof parsed.error.code === "string", "error.code is string");
+      assert(typeof parsed.error.message === "string", "error.message is string");
+    }
+  }
+
+  results.push(await runTest("agent-json: `status --dry-run --json` returns full envelope", async () => {
+    const { stdout, code } = await runCli(["status", "--dry-run", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "status", true);
+    assert(parsed.data.programmer !== undefined, "programmer field");
+    assert(parsed.data.chip !== undefined, "chip field");
+  }));
+
+  results.push(await runTest("agent-json: `detect --json` returns programmers array", async () => {
+    const { stdout, code } = await runCli(["detect", "--json"]);
+    assertEqual(code, 0, "exit 0 (empty result still ok)");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "detect", true);
+    assert(Array.isArray(parsed.data.programmers), "programmers is array");
+    assertEqual(typeof parsed.data.count, "number", "count is number");
+  }));
+
+  results.push(await runTest("agent-json: `wp-status --json` errors cleanly without programmer", async () => {
+    const { stdout, code } = await runCli(["wp-status", "--json"]);
+    assertEqual(code, 1, "exit 1 without programmer");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "wp-status", false);
+    assertEqual(parsed.error.code, "NO_PROGRAMMER", "error code");
+  }));
+
+  results.push(await runTest("agent-json: `sfdp --json` errors cleanly without chip", async () => {
+    const { stdout, code } = await runCli(["sfdp", "--json"]);
+    assertEqual(code, 1, "exit 1 without chip");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "sfdp", false);
+  }));
+
+  results.push(await runTest("agent-json: `post-decode 00 --json` returns matches array", async () => {
+    const { stdout, code } = await runCli(["post-decode", "00", "--json"]);
+    assertEqual(code, 0, "exit 0 on hit");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "post-decode", true);
+    assert(Array.isArray(parsed.data.matches), "matches is array");
+    assert(parsed.data.matches.length > 0, "at least one match");
+    assertEqual(parsed.data.matches[0].code, "00", "first match code");
+  }));
+
+  results.push(await runTest("agent-json: `post-decode notahex --json` returns INVALID_CODE error", async () => {
+    const { stdout, code } = await runCli(["post-decode", "notahex", "--json"]);
+    assertEqual(code, 1, "exit 1");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "post-decode", false);
+    assertEqual(parsed.error.code, "INVALID_CODE", "error code");
+  }));
+
+  results.push(await runTest("agent-json: `failure-db \"no power\" --json` returns patterns", async () => {
+    const { stdout, code } = await runCli(["failure-db", "no power", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "failure-db", true);
+    assertEqual(parsed.data.mode, "search", "mode=search");
+    assert(parsed.data.count > 0, "at least one pattern");
+    assert(Array.isArray(parsed.data.patterns), "patterns array");
+  }));
+
+  results.push(await runTest("agent-json: `failure-db --category power --json` returns category", async () => {
+    const { stdout, code } = await runCli(["failure-db", "--category", "power", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "failure-db", true);
+    assertEqual(parsed.data.mode, "category", "mode=category");
+    assertEqual(parsed.data.category, "power", "category echoed");
+  }));
+
+  results.push(await runTest("agent-json: `voltage-ref atx --json` returns connector data", async () => {
+    const { stdout, code } = await runCli(["voltage-ref", "atx", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "voltage-ref", true);
+    assert(parsed.data.count >= 1, "at least one connector");
+    assert(Array.isArray(parsed.data.connectors[0].rails), "rails array");
+  }));
+
+  // File-based inspection commands need a synthetic image. Reuse the Intel FD mock.
+  const agentImgPath = join(tmpDir, `agent-json-test-${Date.now()}.bin`);
+  await writeFile(agentImgPath, createMockIntelFdImage());
+
+  results.push(await runTest("agent-json: `analyze <img> --json` returns regions + checksum", async () => {
+    const { stdout, code } = await runCli(["analyze", agentImgPath, "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "analyze", true);
+    assert(Array.isArray(parsed.data.regions), "regions array");
+    assertEqual(typeof parsed.data.checksum, "string", "checksum string");
+    assertEqual(parsed.data.sizeBytes, 8 * 1024 * 1024, "8MB");
+  }));
+
+  results.push(await runTest("agent-json: `analyze` missing file --json returns FILE_NOT_FOUND", async () => {
+    const { stdout, code } = await runCli(["analyze", "/nonexistent/path.bin", "--json"]);
+    assertEqual(code, 1, "exit 1");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "analyze", false);
+    assertEqual(parsed.error.code, "FILE_NOT_FOUND", "error code");
+  }));
+
+  results.push(await runTest("agent-json: `bios-regions <img> --json` returns regions + uefiVolumes", async () => {
+    const { stdout, code } = await runCli(["bios-regions", agentImgPath, "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "bios-regions", true);
+    assert(Array.isArray(parsed.data.regions), "regions array");
+    assert(Array.isArray(parsed.data.uefiVolumes), "uefiVolumes array");
+  }));
+
+  results.push(await runTest("agent-json: `nvram <img> --json` returns found:false on non-NVRAM image", async () => {
+    const { stdout, code } = await runCli(["nvram", agentImgPath, "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "nvram", true);
+    assertEqual(parsed.data.found, false, "found=false on synthetic image without real NVRAM");
+  }));
+
+  results.push(await runTest("agent-json: `identify --json` without hardware returns NO_CHIP error", async () => {
+    const { stdout, code } = await runCli(["identify", "--json"]);
+    assertEqual(code, 1, "exit 1 without programmer");
+    const parsed = JSON.parse(stdout);
+    assertEnvelope(parsed, "identify", false);
+    assertEqual(parsed.error.code, "NO_CHIP", "error code");
+  }));
+
+  results.push(await runTest("agent-json: every envelope has nextAction OR error.hint (one of them)", async () => {
+    // Sample 5 commands and assert each carries actionable guidance.
+    const samples = [
+      ["status", "--dry-run", "--json"],
+      ["detect", "--json"],
+      ["voltage-ref", "atx", "--json"],
+      ["failure-db", "--category", "power", "--json"],
+      ["analyze", agentImgPath, "--json"],
+    ];
+    for (const argv of samples) {
+      const { stdout } = await runCli(argv);
+      const parsed = JSON.parse(stdout);
+      const hasNext = typeof parsed.nextAction === "string" && parsed.nextAction.length > 0;
+      const hasHint = parsed.error && typeof parsed.error.hint === "string";
+      assert(hasNext || hasHint, `${argv[0]} carries nextAction or error.hint`);
+    }
+  }));
+
+  results.push(await runTest("agent-json: envelope shape is identical across ok and error responses", async () => {
+    const { stdout: okOut } = await runCli(["voltage-ref", "atx", "--json"]);
+    const { stdout: errOut } = await runCli(["analyze", "/no/such/file", "--json"]);
+    const okParsed = JSON.parse(okOut);
+    const errParsed = JSON.parse(errOut);
+    // Both must have ok + command fields
+    assert("ok" in okParsed && "command" in okParsed, "ok envelope has ok+command");
+    assert("ok" in errParsed && "command" in errParsed, "err envelope has ok+command");
+    // ok=true must not have error; ok=false must not have data
+    assert(!("error" in okParsed), "ok response has no error field");
+    assert(!("data" in errParsed), "error response has no data field");
+  }));
+
+  results.push(await runTest("agent-json: stdout is single-line valid JSON (one envelope per invocation)", async () => {
+    const samples = [
+      ["status", "--dry-run", "--json"],
+      ["detect", "--json"],
+      ["voltage-ref", "atx", "--json"],
+      ["analyze", agentImgPath, "--json"],
+    ];
+    for (const argv of samples) {
+      const { stdout } = await runCli(argv);
+      const lines = stdout.trim().split("\n");
+      assertEqual(lines.length, 1, `${argv[0]} stdout is exactly 1 line`);
+      JSON.parse(lines[0]); // throws on invalid
+    }
+  }));
+
+  try { await unlink(agentImgPath); } catch {}
+
   // ─── Report ───
   console.log();
   console.log("━".repeat(40));
