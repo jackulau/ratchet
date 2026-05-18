@@ -4,16 +4,19 @@
   "description": "Modern BIOS chip programmer and debugger for CH341A/CH347 USB programmers",
   "type": "module",
   "bin": {
-    "biospy": "dist/cli.js"
+    "biospy": "dist/cli.js",
+    "biospy-mcp": "dist/mcp/server.js"
   },
   "scripts": {
-    "build": "tsc && chmod +x dist/cli.js",
+    "build": "tsc && chmod +x dist/cli.js dist/mcp/server.js",
     "dev": "tsc --watch",
     "start": "node dist/cli.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "serialport": "^12.0.0",
-    "usb": "^2.14.0"
+    "usb": "^2.14.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
