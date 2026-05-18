@@ -3476,6 +3476,74 @@ export async function runSelfTest(): Promise<boolean> {
     } finally { c.close(); }
   }));
 
+  // ─── MCP Prompts (goal-3 D3) ───
+  console.log("\nMCP Prompts");
+
+  const REQUIRED_PROMPTS = ["diagnose-bricked-board", "safe-flash-procedure", "analyze-bios-image", "voltage-fault-diagnosis", "recover-corrupt-bios"];
+
+  results.push(await runTest("mcp-prompts: prompts/list returns all 5 canned workflows", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("prompts/list", {});
+      assert(Array.isArray(resp.result?.prompts), "prompts array");
+      const names = new Set(resp.result.prompts.map((p: any) => p.name));
+      for (const r of REQUIRED_PROMPTS) assert(names.has(r), `prompt registered: ${r}`);
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-prompts: get diagnose-bricked-board produces primer text", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("prompts/get", { name: "diagnose-bricked-board", arguments: { symptoms: "no power, no fans" } });
+      const text = resp.result?.messages?.[0]?.content?.text;
+      assert(typeof text === "string" && text.includes("no power, no fans"), "symptom interpolated");
+      assert(text.includes("failure_search"), "primes failure_search");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-prompts: get safe-flash-procedure mentions confirm + force_1_8v", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("prompts/get", { name: "safe-flash-procedure", arguments: { firmware_path: "/tmp/fw.bin", backup_path: "/tmp/bk.bin" } });
+      const text = resp.result.messages[0].content.text;
+      assert(text.includes("confirm:true"), "primes confirm");
+      assert(text.includes("force_1_8v"), "primes voltage gate");
+      assert(text.includes("/tmp/fw.bin"), "firmware path interpolated");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-prompts: get analyze-bios-image primes the analyze workflow", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("prompts/get", { name: "analyze-bios-image", arguments: { path: "/tmp/x.bin" } });
+      const text = resp.result.messages[0].content.text;
+      assert(text.includes("analyze_image"), "primes analyze_image");
+      assert(text.includes("bios_regions"), "primes bios_regions");
+      assert(text.includes("nvram_vars"), "primes nvram_vars");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-prompts: get voltage-fault-diagnosis primes rail-by-rail flow", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("prompts/get", { name: "voltage-fault-diagnosis", arguments: { connector: "atx", symptom: "no +12V" } });
+      const text = resp.result.messages[0].content.text;
+      assert(text.includes("voltage_reference"), "primes voltage_reference");
+      assert(text.includes("atx"), "connector interpolated");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-prompts: get recover-corrupt-bios outlines decision tree", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("prompts/get", { name: "recover-corrupt-bios", arguments: { dump_path: "/tmp/d.bin", reference_path: "/tmp/r.bin" } });
+      const text = resp.result.messages[0].content.text;
+      assert(text.includes("/tmp/d.bin"), "dump path");
+      assert(text.includes("/tmp/r.bin"), "reference path");
+      assert(text.toLowerCase().includes("nvram"), "mentions NVRAM");
+    } finally { c.close(); }
+  }));
+
   // ─── Specialist diagnostic --json (D1 of goal-3) ───
   // 13 commands. Each hit + miss path exercised via subprocess.
   console.log("\nSpecialist Diagnostic JSON");

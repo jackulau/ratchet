@@ -142,6 +142,92 @@ export function buildServer(): McpServer {
     mimeType: "application/json",
   }, async (uri) => jsonResource(uri.toString(), { count: ALL_REFERENCES.length, references: ALL_REFERENCES }));
 
+  // ─── Prompts ───
+  // Canned diagnostic workflows. The agent requests one, fills in args, and gets
+  // back a primed user-message that orients it on the right next steps + tools.
+
+  function promptMsg(text: string): { messages: Array<{ role: "user"; content: { type: "text"; text: string } }> } {
+    return { messages: [{ role: "user", content: { type: "text", text } }] };
+  }
+
+  server.registerPrompt("diagnose-bricked-board", {
+    title: "Diagnose a bricked motherboard (no-boot / no-POST)",
+    description: "Walk through a no-boot diagnosis: power → CPU → display → POST → BIOS recovery. Uses biospy tools.",
+    argsSchema: { symptoms: z.string().describe("Free-text symptoms: 'no power, no fans' or 'fans spin but no display'") },
+  }, ({ symptoms }) => promptMsg(
+    `I have a motherboard that won't boot. Symptoms: ${symptoms ?? "(unspecified)"}.\n\n` +
+    `Drive a structured diagnosis with biospy:\n` +
+    `1. Use the failure_search tool with the symptom string to find matching motherboard failure patterns.\n` +
+    `2. Use power_sequence (via the failure_search results) to identify which stage is failing.\n` +
+    `3. If the board powers on but no display: call gpu-failures (via failure_search with category=display) for video chain issues.\n` +
+    `4. If suspected BIOS corruption: read the chip with read_chip, then analyze_image + bios_regions to inspect.\n` +
+    `5. Recommend the highest-probability cause + the specific multimeter measurements needed to confirm.\n` +
+    `Use voltage_reference to ground expected rail readings. Report findings in a structured form.`,
+  ));
+
+  server.registerPrompt("safe-flash-procedure", {
+    title: "Safe flash procedure checklist",
+    description: "Read-backup → analyze → write → verify checklist before flashing a BIOS.",
+    argsSchema: { firmware_path: z.string().optional(), backup_path: z.string().optional() },
+  }, ({ firmware_path, backup_path }) => promptMsg(
+    `I need to safely flash a BIOS. Firmware: ${firmware_path ?? "(specify path)"}. Backup target: ${backup_path ?? "(specify path)"}.\n\n` +
+    `Run this procedure with biospy tools, stopping on any failure:\n` +
+    `1. detect — confirm CH34x programmer is connected.\n` +
+    `2. identify — read JEDEC ID; confirm chip is in the database and matches expected target.\n` +
+    `3. wp_status — verify write protection state.\n` +
+    `4. read_chip with the backup path — save current chip contents (double_verify:true for safety).\n` +
+    `5. analyze_image on the backup AND the new firmware — compare vendor, version, regions; flag mismatched sizes or vendors.\n` +
+    `6. If checks pass: call write_chip with confirm:true. (And force_1_8v:true ONLY if the chip is 1.8V and a level shifter is fitted.)\n` +
+    `7. verify_chip against the firmware file to confirm successful write.\n` +
+    `Refuse to proceed past any step that fails. Report each step's result.`,
+  ));
+
+  server.registerPrompt("analyze-bios-image", {
+    title: "Deep-analyze a BIOS dump",
+    description: "Parse regions, UEFI volumes, ME, NVRAM. Flag anomalies and recovery options.",
+    argsSchema: { path: z.string().describe("Path to BIOS image file") },
+  }, ({ path }) => promptMsg(
+    `Analyze the BIOS image at "${path}".\n\n` +
+    `Run these biospy tools in order and report findings:\n` +
+    `1. analyze_image — file size, vendor, version, top-level regions.\n` +
+    `2. bios_regions — deep region layout (Intel descriptor, UEFI FVs, ME, NVRAM).\n` +
+    `3. nvram_vars — list UEFI NVRAM variables; flag suspicious counts (e.g. all-deleted store).\n` +
+    `4. If the image looks corrupted or anomalous (blank regions, missing reset vector, garbage UEFI volumes), explain what's wrong and which biospy commands can repair it.\n` +
+    `Cross-reference vendor/version with the chip database (search_chips) if the image embeds JEDEC hints.`,
+  ));
+
+  server.registerPrompt("voltage-fault-diagnosis", {
+    title: "Diagnose a voltage rail fault",
+    description: "Rail-by-rail measurement plan using voltage_reference + failure_search.",
+    argsSchema: { connector: z.string().describe("atx, eps, pcie, board, spi"), symptom: z.string().optional() },
+  }, ({ connector, symptom }) => promptMsg(
+    `A board has a suspected voltage fault on the ${connector} connector. Symptom: ${symptom ?? "(unspecified)"}.\n\n` +
+    `Use biospy tools:\n` +
+    `1. voltage_reference with connector="${connector}" — pull expected voltages + tolerances per pin.\n` +
+    `2. For each rail, request the operator measure with a multimeter and report the reading.\n` +
+    `3. Compare each measurement against expected/tolerance. Flag any out-of-spec rail.\n` +
+    `4. failure_search with the symptom (or "power") for matching motherboard failure patterns related to power rails.\n` +
+    `5. If a specific rail is dead/wrong: suggest the upstream regulator (VRM controller via gpu-diag or laptop-power) and what to probe next.\n` +
+    `Be precise: name pin numbers, expected V, measured V, deviation.`,
+  ));
+
+  server.registerPrompt("recover-corrupt-bios", {
+    title: "Recover a corrupt BIOS image",
+    description: "Decision tree: reference-based repair vs. NVRAM reset vs. full reflash vs. external recovery.",
+    argsSchema: { dump_path: z.string().describe("Path to dumped BIOS image"), reference_path: z.string().optional().describe("Optional known-good reference image") },
+  }, ({ dump_path, reference_path }) => promptMsg(
+    `Recover the (possibly corrupt) BIOS dump at "${dump_path}".${reference_path ? ` Reference image: "${reference_path}".` : ""}\n\n` +
+    `Workflow with biospy:\n` +
+    `1. analyze_image + bios_regions on the dump — identify what's wrong (blank regions, zero descriptor, NVRAM corruption, missing reset vector).\n` +
+    `2. Decide repair path:\n` +
+    `   - If reference provided AND damage is localized → use it with biospy's repair tool (full-repair via CLI) for reference-based byte-merge.\n` +
+    `   - If NVRAM all-deleted but rest intact → NVRAM reset only.\n` +
+    `   - If reset vector zeroed or critical UEFI files missing → recommend external dump from a known-good board.\n` +
+    `   - If chip is physically failing (random reads on second pass) → recommend chip replacement.\n` +
+    `3. Always read backup BEFORE writing recovery image. Use safe-flash-procedure for the actual write.\n` +
+    `Be explicit about which repair path you chose and why.`,
+  ));
+
   // ─── Information tools (read-only, safe) ───
 
   server.registerTool(
