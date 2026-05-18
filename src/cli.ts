@@ -112,6 +112,40 @@ function makeProgress(label: string): ProgressCallback {
   };
 }
 
+// ─── NDJSON streaming helpers ───
+// Emits one JSON object per line on stdout. Used when --ndjson is set on hardware ops.
+
+function ndjsonEmit(obj: Record<string, unknown>): void {
+  process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+function ndjsonStatus(operation: string, message: string, extra?: Record<string, unknown>): void {
+  ndjsonEmit({ type: "status", operation, message, ...(extra ?? {}) });
+}
+
+function ndjsonError(operation: string, code: string, message: string, extra?: Record<string, unknown>): void {
+  ndjsonEmit({ type: "error", operation, code, message, ...(extra ?? {}) });
+}
+
+function ndjsonResult(operation: string, ok: boolean, extra?: Record<string, unknown>): void {
+  ndjsonEmit({ type: "result", operation, ok, ...(extra ?? {}) });
+}
+
+// Throttle progress events so a 16MB read doesn't spew thousands of lines.
+function makeNdjsonProgress(operation: string): ProgressCallback {
+  let lastPct = -1;
+  let lastEmitMs = 0;
+  return (pct: number, bytes: number, total: number, speed?: number, eta?: number) => {
+    const now = Date.now();
+    const floored = Math.floor(pct);
+    if (floored !== lastPct && (now - lastEmitMs >= 50 || pct === 100)) {
+      lastPct = floored;
+      lastEmitMs = now;
+      ndjsonEmit({ type: "progress", operation, percent: floored, bytes, total, rateBytesPerSec: speed ?? null, etaSec: eta ?? null });
+    }
+  };
+}
+
 // ─── Commands ───
 
 async function cmdStatus(args: Args) {
@@ -401,132 +435,147 @@ async function runPreFlightQualityCheck(operation: string): Promise<number> {
 }
 
 async function cmdRead(args: Args) {
+  const ndjson = wantsNdjson(args.flags);
   const outPath = args.positional[0];
-  if (!outPath) { out.fail("Usage: biospy read <output.bin>"); process.exit(1); }
+  if (!outPath) {
+    if (ndjson) { ndjsonError("read", "MISSING_ARG", "Output path required"); ndjsonResult("read", false, { error: "MISSING_ARG" }); process.exit(1); }
+    out.fail("Usage: biospy read <output.bin>");
+    process.exit(1);
+  }
 
   const doubleVerify = args.flags.includes("--double-verify") || args.flags.includes("--safe");
 
-  if (doubleVerify) {
+  if (ndjson) {
+    ndjsonStatus("read", `Reading chip → ${outPath}`, { outPath, doubleVerify });
+  } else if (doubleVerify) {
     out.header(`Reading chip → ${outPath} (double-verify mode)`);
   } else {
     out.header(`Reading chip → ${outPath}`);
   }
 
-  // Pre-flight quality gate
   if (!dryRun && !args.flags.includes("--skip-quality-check")) {
     await runPreFlightQualityCheck("read");
   }
 
   const backend = await pickBackend(args.backend);
-  out.info(`Backend: ${backend.kind}`);
+  if (ndjson) {
+    ndjsonStatus("read", `Backend: ${backend.kind}`, { backend: backend.kind });
+  } else {
+    out.info(`Backend: ${backend.kind}`);
+  }
+
+  const progress = ndjson ? makeNdjsonProgress("read") : makeProgress("Reading");
 
   let result: ReadResult;
-
   if (backend.kind === "ch341a") {
-    if (doubleVerify) {
-      result = await ch341a.readChipDoubleVerify(outPath, makeProgress("Reading"));
-    } else {
-      result = await ch341a.readChip(outPath, makeProgress("Reading"));
-    }
-    out.writeProgress("Reading", 100);
+    result = doubleVerify ? await ch341a.readChipDoubleVerify(outPath, progress) : await ch341a.readChip(outPath, progress);
+    if (!ndjson) out.writeProgress("Reading", 100);
   } else {
-    result = await ch347.readChip(outPath, makeProgress("Reading"));
-    out.writeProgress("Reading", 100);
+    result = await ch347.readChip(outPath, progress);
+    if (!ndjson) out.writeProgress("Reading", 100);
   }
 
   if (!result.success) {
+    if (ndjson) {
+      ndjsonError("read", "READ_FAILED", result.error ?? "read failed");
+      ndjsonResult("read", false, { error: result.error ?? null });
+      process.exit(1);
+    }
     out.fail(`Read failed: ${result.error}`);
     process.exit(1);
+  }
+
+  const data = await readFile(outPath);
+  const blank = data.every((b) => b === 0xff);
+  const allZero = data.every((b) => b === 0x00);
+  const speedBps = result.durationMs > 0 ? result.sizeBytes / (result.durationMs / 1000) : null;
+
+  if (ndjson) {
+    ndjsonResult("read", true, {
+      file: result.filePath,
+      sizeBytes: result.sizeBytes,
+      durationMs: result.durationMs,
+      checksum: result.checksum,
+      rateBytesPerSec: speedBps,
+      warnings: [
+        ...(result.error && result.error.startsWith("Warning:") ? [result.error] : []),
+        ...(data.length === 0 ? ["empty read"] : []),
+        ...(blank ? ["chip read is entirely 0xFF — may be blank or unconnected"] : []),
+        ...(allZero ? ["chip read is entirely 0x00 — connection likely failed"] : []),
+      ],
+    });
+    return;
   }
 
   out.ok(`Read complete in ${out.formatDuration(result.durationMs)}`);
   out.kvLine("File", result.filePath);
   out.kvLine("Size", out.formatBytes(result.sizeBytes));
   out.kvLine("SHA256", result.checksum.substring(0, 16) + "...");
-
-  if (result.durationMs > 0) {
-    const speedBps = result.sizeBytes / (result.durationMs / 1000);
-    out.kvLine("Speed", `${formatSize(speedBps)}/s`);
-  }
-
-  if (result.error && result.error.startsWith("Warning:")) {
-    out.warn(result.error);
-  }
-
-  const data = await readFile(outPath);
-  if (data.length === 0) {
-    console.log();
-    out.warn("Chip read is empty (0 bytes) — something went wrong");
-  } else if (data.every((b) => b === 0xff)) {
-    console.log();
-    out.warn("Chip read is entirely 0xFF — chip may be blank or not connected properly");
-  } else if (data.every((b) => b === 0x00)) {
-    console.log();
-    out.warn("Chip read is entirely 0x00 — connection likely failed");
-  }
+  if (speedBps !== null) out.kvLine("Speed", `${formatSize(speedBps)}/s`);
+  if (result.error && result.error.startsWith("Warning:")) out.warn(result.error);
+  if (data.length === 0) { console.log(); out.warn("Chip read is empty (0 bytes) — something went wrong"); }
+  else if (blank) { console.log(); out.warn("Chip read is entirely 0xFF — chip may be blank or not connected properly"); }
+  else if (allZero) { console.log(); out.warn("Chip read is entirely 0x00 — connection likely failed"); }
   console.log();
 }
 
 async function cmdWrite(args: Args) {
-  const inPath = args.positional[0];
-  if (!inPath) { out.fail("Usage: biospy write <firmware.bin>"); process.exit(1); }
-  if (!existsSync(inPath)) { out.fail(`File not found: ${inPath}`); process.exit(1); }
+  const ndjson = wantsNdjson(args.flags);
+  const failNdjson = (code: string, msg: string, extra?: Record<string, unknown>): never => {
+    ndjsonError("write", code, msg, extra);
+    ndjsonResult("write", false, { error: code });
+    process.exit(1);
+  };
 
-  out.header(`Writing ${inPath} → chip`);
+  const inPath = args.positional[0];
+  if (!inPath) {
+    if (ndjson) failNdjson("MISSING_ARG", "Usage: biospy write <firmware.bin>");
+    out.fail("Usage: biospy write <firmware.bin>"); process.exit(1);
+  }
+  if (!existsSync(inPath)) {
+    if (ndjson) failNdjson("FILE_NOT_FOUND", `File not found: ${inPath}`);
+    out.fail(`File not found: ${inPath}`); process.exit(1);
+  }
+
+  if (ndjson) ndjsonStatus("write", `Writing ${inPath} → chip`, { inPath });
+  else out.header(`Writing ${inPath} → chip`);
 
   let firmware: Buffer = await readFile(inPath);
-  if (firmware.length === 0) { out.fail("File is empty"); process.exit(1); }
+  if (firmware.length === 0) {
+    if (ndjson) failNdjson("EMPTY_FILE", "File is empty");
+    out.fail("File is empty"); process.exit(1);
+  }
 
-  // Detect capsule/header formats and warn user
   const fwInfo = await analyzer.extractFirmware(inPath);
   if (fwInfo.strippedBytes > 0 && !args.flags.includes("--raw")) {
-    out.warn(`Detected ${fwInfo.format} — file has ${formatSize(fwInfo.strippedBytes)} header`);
-    out.info(`Auto-stripping header. Raw firmware: ${formatSize(fwInfo.data.length)}`);
+    if (ndjson) ndjsonStatus("write", `Auto-stripping ${fwInfo.format} header`, { strippedBytes: fwInfo.strippedBytes, format: fwInfo.format, warnings: fwInfo.warnings });
+    else {
+      out.warn(`Detected ${fwInfo.format} — file has ${formatSize(fwInfo.strippedBytes)} header`);
+      out.info(`Auto-stripping header. Raw firmware: ${formatSize(fwInfo.data.length)}`);
+      for (const w of fwInfo.warnings) out.warn(w);
+    }
     firmware = Buffer.from(fwInfo.data);
-    for (const w of fwInfo.warnings) out.warn(w);
   }
 
   if (firmware.every((b) => b === 0xff)) {
+    if (ndjson) failNdjson("BLANK_FIRMWARE", "Firmware is entirely 0xFF (blank). Use `erase` instead.");
     out.fail("Firmware is entirely 0xFF (blank). This would erase all BIOS data.");
     out.dim("If intentional, use 'biospy erase' instead.");
     process.exit(1);
   }
   if (firmware.every((b) => b === 0x00)) {
+    if (ndjson) failNdjson("ZERO_FIRMWARE", "Firmware is entirely 0x00 — likely corrupted or a failed read.");
     out.fail("Firmware is entirely 0x00 — likely corrupted or a failed read.");
     process.exit(1);
   }
 
-  // Pre-write quality gate (replaces old --skip-test connection check)
   if (!dryRun && !args.flags.includes("--skip-quality-check") && !args.flags.includes("--skip-test")) {
     await runPreFlightQualityCheck("write");
   }
 
   const chip = await identifyAny();
-  if (chip) {
-    out.info(`Chip: ${chip.vendorName} ${chip.name} (${chip.sizeHuman})`);
-
-    if (firmware.length > chip.sizeBytes) {
-      out.fail(`File (${out.formatBytes(firmware.length)}) exceeds chip capacity (${chip.sizeHuman})`);
-      process.exit(1);
-    }
-
-    if (firmware.length < chip.sizeBytes) {
-      const pad = chip.sizeBytes - firmware.length;
-      out.info(`File is ${out.formatBytes(firmware.length)}, chip is ${chip.sizeHuman} — ${formatSize(pad)} will remain 0xFF`);
-    }
-
-    const voltage = getChipVoltage(chip.jedecId);
-    if (voltage && voltage < 2.0 && !args.flags.includes("--force-1.8v")) {
-      out.fail(`${chip.name} is a 1.8V chip. Stock CH341A outputs 3.3V.`);
-      out.fail("This WILL damage the chip without a voltage adapter.");
-      out.dim("If you have a 1.8V adapter, re-run with --force-1.8v");
-      process.exit(1);
-    }
-
-    if (needs4ByteAddressing(chip.jedecId)) {
-      out.info("4-byte addressing mode will be used (chip >16MB)");
-    }
-  } else {
+  if (!chip) {
+    if (ndjson) failNdjson("NO_CHIP", "No chip detected — cannot write", { hint: "Check programmer, SOIC clip/ZIF socket, or run `reset` if interrupted." });
     out.fail("No chip detected — cannot write");
     out.dim("1. Check programmer is connected (biospy detect)");
     out.dim("2. Check SOIC clip/ZIF socket connection (biospy test-connection)");
@@ -534,21 +583,50 @@ async function cmdWrite(args: Args) {
     process.exit(1);
   }
 
+  if (firmware.length > chip.sizeBytes) {
+    if (ndjson) failNdjson("FILE_TOO_LARGE", `File (${firmware.length}) exceeds chip capacity (${chip.sizeBytes})`, { fileSize: firmware.length, chipSize: chip.sizeBytes });
+    out.fail(`File (${out.formatBytes(firmware.length)}) exceeds chip capacity (${chip.sizeHuman})`);
+    process.exit(1);
+  }
+
+  const voltage = getChipVoltage(chip.jedecId);
+  if (voltage && voltage < 2.0 && !args.flags.includes("--force-1.8v")) {
+    if (ndjson) failNdjson("VOLTAGE_GATE", `${chip.name} is a 1.8V chip. Stock CH341A outputs 3.3V — would damage chip.`, { voltage, hint: "If you have a 1.8V adapter, re-run with --force-1.8v" });
+    out.fail(`${chip.name} is a 1.8V chip. Stock CH341A outputs 3.3V.`);
+    out.fail("This WILL damage the chip without a voltage adapter.");
+    out.dim("If you have a 1.8V adapter, re-run with --force-1.8v");
+    process.exit(1);
+  }
+
+  if (ndjson) ndjsonStatus("write", `Chip: ${chip.vendorName} ${chip.name} (${chip.sizeHuman})`, { chip: { vendor: chip.vendorName, name: chip.name, sizeBytes: chip.sizeBytes, jedecId: chip.jedecId, voltage: voltage ?? null, needs4ByteAddr: needs4ByteAddressing(chip.jedecId) } });
+  else {
+    out.info(`Chip: ${chip.vendorName} ${chip.name} (${chip.sizeHuman})`);
+    if (firmware.length < chip.sizeBytes) {
+      const pad = chip.sizeBytes - firmware.length;
+      out.info(`File is ${out.formatBytes(firmware.length)}, chip is ${chip.sizeHuman} — ${formatSize(pad)} will remain 0xFF`);
+    }
+    if (needs4ByteAddressing(chip.jedecId)) out.info("4-byte addressing mode will be used (chip >16MB)");
+  }
+
   const noBackup = args.flags.includes("--no-backup");
   const noVerify = args.flags.includes("--no-verify");
 
   const backend = await pickBackend(args.backend);
-  out.info(`Backend: ${backend.kind}`);
-  if (!noBackup) out.info("Auto-backup before write...");
-  else out.warn("Backup skipped (--no-backup)");
+  if (ndjson) ndjsonStatus("write", `Backend: ${backend.kind}`, { backend: backend.kind, noBackup, noVerify });
+  else {
+    out.info(`Backend: ${backend.kind}`);
+    if (!noBackup) out.info("Auto-backup before write...");
+    else out.warn("Backup skipped (--no-backup)");
+  }
 
   const sigHandler = () => {
-    out.warn("\n⚠ SIGINT ignored — write in progress. Interrupting now WILL brick your chip.");
-    out.warn("  Wait for write to finish or accept the risk of a corrupted chip.");
+    if (!ndjson) {
+      out.warn("\n⚠ SIGINT ignored — write in progress. Interrupting now WILL brick your chip.");
+      out.warn("  Wait for write to finish or accept the risk of a corrupted chip.");
+    }
   };
   process.on("SIGINT", sigHandler);
 
-  // If header was stripped, write extracted firmware to temp file for backend
   let writePath = inPath;
   let tmpWritePath: string | null = null;
   if (fwInfo.strippedBytes > 0 && !args.flags.includes("--raw")) {
@@ -557,15 +635,16 @@ async function cmdWrite(args: Args) {
     writePath = tmpWritePath;
   }
 
+  const progress = ndjson ? makeNdjsonProgress("write") : makeProgress("Writing");
+
   let result;
   try {
     if (backend.kind === "ch341a") {
-      result = await ch341a.writeChip(writePath, makeProgress("Writing"), { skipBackup: noBackup, skipVerify: noVerify });
-      out.writeProgress("Writing", 100);
+      result = await ch341a.writeChip(writePath, progress, { skipBackup: noBackup, skipVerify: noVerify });
     } else {
-      result = await ch347.writeChip(writePath, makeProgress("Writing"), { skipBackup: noBackup, skipVerify: noVerify });
-      out.writeProgress("Writing", 100);
+      result = await ch347.writeChip(writePath, progress, { skipBackup: noBackup, skipVerify: noVerify });
     }
+    if (!ndjson) out.writeProgress("Writing", 100);
   } finally {
     if (tmpWritePath) try { await unlink(tmpWritePath); } catch {}
   }
@@ -573,40 +652,56 @@ async function cmdWrite(args: Args) {
   process.removeListener("SIGINT", sigHandler);
 
   if (!result.success) {
+    if (ndjson) {
+      ndjsonError("write", "WRITE_FAILED", result.error ?? "write failed", { backupPath: result.backupPath ?? null });
+      ndjsonResult("write", false, { error: result.error ?? null, backupPath: result.backupPath ?? null });
+      process.exit(1);
+    }
     out.fail(`Write failed: ${result.error}`);
     if (result.backupPath) out.info(`Backup saved at: ${result.backupPath}`);
     process.exit(1);
+  }
+
+  const speedBps = result.durationMs > 0 ? firmware.length / (result.durationMs / 1000) : null;
+
+  if (ndjson) {
+    ndjsonResult("write", true, {
+      durationMs: result.durationMs,
+      backupPath: result.backupPath ?? null,
+      verified: noVerify ? null : result.verified,
+      bytesWritten: firmware.length,
+      rateBytesPerSec: speedBps,
+    });
+    return;
   }
 
   out.ok(`Write complete in ${out.formatDuration(result.durationMs)}`);
   if (result.backupPath) out.kvLine("Backup", result.backupPath);
   if (!noVerify) out.kvLine("Verified", result.verified ? "yes" : "NO — run 'biospy verify' manually");
   else out.dim("Verification skipped (--no-verify)");
-
-  if (result.durationMs > 0) {
-    const speedBps = firmware.length / (result.durationMs / 1000);
-    out.kvLine("Speed", `${formatSize(speedBps)}/s`);
-  }
+  if (speedBps !== null) out.kvLine("Speed", `${formatSize(speedBps)}/s`);
   console.log();
 }
 
 async function cmdBlankCheck(args: Args) {
-  out.header("Blank check — reading chip...");
+  const ndjson = wantsNdjson(args.flags);
+  if (ndjson) ndjsonStatus("blank-check", "Reading chip for blank check...");
+  else out.header("Blank check — reading chip...");
+
   const backend = await pickBackend(args.backend);
-  out.info(`Backend: ${backend.kind}`);
+  if (ndjson) ndjsonStatus("blank-check", `Backend: ${backend.kind}`, { backend: backend.kind });
+  else out.info(`Backend: ${backend.kind}`);
 
   const tmpPath = join(tmpdir(), `bios_blankcheck_${Date.now()}.bin`);
   try {
+    const progress = ndjson ? makeNdjsonProgress("blank-check") : makeProgress("Reading");
     let result: ReadResult;
-    if (backend.kind === "ch341a") {
-      result = await ch341a.readChip(tmpPath, makeProgress("Reading"));
-      out.writeProgress("Reading", 100);
-    } else {
-      result = await ch347.readChip(tmpPath, makeProgress("Reading"));
-      out.writeProgress("Reading", 100);
-    }
+    if (backend.kind === "ch341a") result = await ch341a.readChip(tmpPath, progress);
+    else result = await ch347.readChip(tmpPath, progress);
+    if (!ndjson) out.writeProgress("Reading", 100);
 
     if (!result.success) {
+      if (ndjson) { ndjsonError("blank-check", "READ_FAILED", result.error ?? "read failed"); ndjsonResult("blank-check", false, { error: result.error ?? null }); process.exit(1); }
       out.fail(`Read failed: ${result.error}`);
       process.exit(1);
     }
@@ -619,6 +714,17 @@ async function cmdBlankCheck(args: Args) {
         nonBlank++;
         if (firstNonBlank === -1) firstNonBlank = i;
       }
+    }
+
+    if (ndjson) {
+      ndjsonResult("blank-check", true, {
+        blank: nonBlank === 0,
+        sizeBytes: data.length,
+        nonBlankBytes: nonBlank,
+        firstNonBlankOffset: firstNonBlank >= 0 ? firstNonBlank : null,
+        nonBlankPercent: data.length > 0 ? nonBlank / data.length : 0,
+      });
+      return;
     }
 
     if (nonBlank === 0) {
@@ -676,17 +782,26 @@ async function cmdWPStatus(args: Args) {
 
 async function cmdErase(args: Args) {
   if (!args.flags.includes("--confirm")) {
+    if (wantsNdjson(args.flags)) {
+      ndjsonError("erase", "MISSING_CONFIRM", "Erase is destructive — re-run with --confirm");
+      ndjsonResult("erase", false, { error: "MISSING_CONFIRM" });
+      process.exit(1);
+    }
     out.fail("Erase is destructive and irreversible.");
     out.dim("Re-run with --confirm to proceed.");
     process.exit(1);
   }
 
-  out.header("Erasing chip...");
+  const ndjson = wantsNdjson(args.flags);
+  if (ndjson) ndjsonStatus("erase", "Erasing chip...");
+  else out.header("Erasing chip...");
+
   const backend = await pickBackend(args.backend);
-  out.info(`Backend: ${backend.kind}`);
+  if (ndjson) ndjsonStatus("erase", `Backend: ${backend.kind}`, { backend: backend.kind });
+  else out.info(`Backend: ${backend.kind}`);
 
   const sigHandler = () => {
-    out.warn("\n⚠ SIGINT ignored — erase in progress. Wait for completion.");
+    if (!ndjson) out.warn("\n⚠ SIGINT ignored — erase in progress. Wait for completion.");
   };
   process.on("SIGINT", sigHandler);
 
@@ -697,8 +812,14 @@ async function cmdErase(args: Args) {
   process.removeListener("SIGINT", sigHandler);
 
   if (result.success) {
+    if (ndjson) { ndjsonResult("erase", true, { durationMs: result.durationMs }); return; }
     out.ok(`Erased in ${out.formatDuration(result.durationMs)}`);
   } else {
+    if (ndjson) {
+      ndjsonError("erase", "ERASE_FAILED", result.error ?? "erase failed");
+      ndjsonResult("erase", false, { error: result.error ?? null });
+      process.exit(1);
+    }
     out.fail(`Erase failed: ${result.error}`);
     process.exit(1);
   }
@@ -706,59 +827,85 @@ async function cmdErase(args: Args) {
 }
 
 async function cmdRegionErase(args: Args) {
+  const ndjson = wantsNdjson(args.flags);
+  const fail = (code: string, msg: string): never => {
+    if (ndjson) {
+      ndjsonError("region-erase", code, msg);
+      ndjsonResult("region-erase", false, { error: code });
+      process.exit(1);
+    }
+    out.fail(msg);
+    process.exit(1);
+  };
+
   const startStr = args.positional[0];
   const lenStr = args.positional[1];
   if (!startStr || !lenStr) {
-    out.fail("Usage: biospy region-erase <start_addr> <length>");
-    out.dim("Addresses: decimal or 0x hex");
-    process.exit(1);
+    if (!ndjson) out.dim("Addresses: decimal or 0x hex");
+    fail("MISSING_ARG", "Usage: biospy region-erase <start_addr> <length>");
   }
-  if (!args.flags.includes("--confirm")) {
-    out.fail("Region erase is destructive. Re-run with --confirm.");
-    process.exit(1);
-  }
+  if (!args.flags.includes("--confirm")) fail("MISSING_CONFIRM", "Region erase is destructive. Re-run with --confirm.");
 
   const startAddr = startStr.startsWith("0x") ? parseInt(startStr, 16) : parseInt(startStr);
   const length = lenStr.startsWith("0x") ? parseInt(lenStr, 16) : parseInt(lenStr);
+  if (isNaN(startAddr) || isNaN(length)) fail("INVALID_ARG", "Invalid address or length");
 
-  if (isNaN(startAddr) || isNaN(length)) {
-    out.fail("Invalid address or length");
-    process.exit(1);
-  }
-
-  out.header(`Region erase: 0x${startAddr.toString(16)} — ${formatSize(length)}`);
+  if (ndjson) ndjsonStatus("region-erase", `Region erase: 0x${startAddr.toString(16)} — ${formatSize(length)}`, { startAddr, length });
+  else out.header(`Region erase: 0x${startAddr.toString(16)} — ${formatSize(length)}`);
 
   const backend = await pickBackend(args.backend);
-  out.info(`Backend: ${backend.kind}`);
+  if (ndjson) ndjsonStatus("region-erase", `Backend: ${backend.kind}`, { backend: backend.kind });
+  else out.info(`Backend: ${backend.kind}`);
 
   let result;
-  if (backend.kind === "ch341a") {
-    result = await ch341a.regionErase(startAddr, length);
-  } else {
-    result = await ch347.regionErase(startAddr, length);
-  }
+  if (backend.kind === "ch341a") result = await ch341a.regionErase(startAddr, length);
+  else result = await ch347.regionErase(startAddr, length);
 
-  if (result.success) {
-    out.ok(`Region erased in ${out.formatDuration(result.durationMs)}`);
-  } else {
+  if (!result.success) {
+    if (ndjson) {
+      ndjsonError("region-erase", "ERASE_FAILED", result.error ?? "erase failed");
+      ndjsonResult("region-erase", false, { error: result.error ?? null });
+      process.exit(1);
+    }
     out.fail(`Erase failed: ${result.error}`);
     process.exit(1);
   }
+  if (ndjson) { ndjsonResult("region-erase", true, { durationMs: result.durationMs, startAddr, length }); return; }
+  out.ok(`Region erased in ${out.formatDuration(result.durationMs)}`);
   console.log();
 }
 
 async function cmdVerify(args: Args) {
+  const ndjson = wantsNdjson(args.flags);
   const filePath = args.positional[0];
-  if (!filePath) { out.fail("Usage: biospy verify <firmware.bin>"); process.exit(1); }
-  if (!existsSync(filePath)) { out.fail(`File not found: ${filePath}`); process.exit(1); }
+  if (!filePath) {
+    if (ndjson) { ndjsonError("verify", "MISSING_ARG", "Usage: biospy verify <firmware.bin>"); ndjsonResult("verify", false, { error: "MISSING_ARG" }); process.exit(1); }
+    out.fail("Usage: biospy verify <firmware.bin>"); process.exit(1);
+  }
+  if (!existsSync(filePath)) {
+    if (ndjson) { ndjsonError("verify", "FILE_NOT_FOUND", `File not found: ${filePath}`); ndjsonResult("verify", false, { error: "FILE_NOT_FOUND" }); process.exit(1); }
+    out.fail(`File not found: ${filePath}`); process.exit(1);
+  }
 
-  out.header(`Verifying chip against ${filePath}`);
+  if (ndjson) ndjsonStatus("verify", `Verifying chip against ${filePath}`, { filePath });
+  else out.header(`Verifying chip against ${filePath}`);
   const backend = await pickBackend(args.backend);
-  out.info(`Backend: ${backend.kind}`);
+  if (ndjson) ndjsonStatus("verify", `Backend: ${backend.kind}`, { backend: backend.kind });
+  else out.info(`Backend: ${backend.kind}`);
 
   let result;
   if (backend.kind === "ch341a") result = await ch341a.verifyChip(filePath);
   else result = await ch347.verifyChip(filePath);
+
+  if (ndjson) {
+    if (result.matches) {
+      ndjsonResult("verify", true, { matches: true, durationMs: result.durationMs, fileChecksum: result.fileChecksum, chipChecksum: result.chipChecksum });
+      return;
+    }
+    ndjsonError("verify", "MISMATCH", result.error ?? "chip does not match file");
+    ndjsonResult("verify", false, { matches: false, durationMs: result.durationMs, fileChecksum: result.fileChecksum ?? null, chipChecksum: result.chipChecksum ?? null, error: result.error ?? null });
+    process.exit(1);
+  }
 
   if (result.matches) {
     out.ok(`Match confirmed in ${out.formatDuration(result.durationMs)}`);

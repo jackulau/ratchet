@@ -3051,6 +3051,116 @@ export async function runSelfTest(): Promise<boolean> {
 
   try { await unlink(agentImgPath); } catch {}
 
+  // ─── NDJSON streaming (D3) ───
+  console.log("\nNDJSON Streaming");
+
+  // Parse NDJSON output into typed event list. Each line must be valid JSON.
+  function parseNdjsonStream(stdout: string): Array<{ type: string; [k: string]: unknown }> {
+    const lines = stdout.split("\n").filter((l) => l.trim().length > 0);
+    return lines.map((l) => {
+      try { return JSON.parse(l); }
+      catch (e) { throw new Error(`Invalid JSON line: ${l.substring(0, 80)}`); }
+    });
+  }
+
+  const ndjsonReadPath = join(tmpDir, `ndjson-read-${Date.now()}.bin`);
+
+  results.push(await runTest("ndjson: `read --dry-run --ndjson` emits status, progress, result events", async () => {
+    const { stdout, code } = await runCli(["read", ndjsonReadPath, "--dry-run", "--ndjson"]);
+    assertEqual(code, 0, "exit 0");
+    const events = parseNdjsonStream(stdout);
+    const types = new Set(events.map((e) => e.type));
+    assert(types.has("status"), "status events present");
+    assert(types.has("progress"), "progress events present");
+    assert(types.has("result"), "result event present");
+    const result = events.find((e) => e.type === "result")!;
+    assertEqual(result.ok, true, "result.ok=true");
+    assertEqual((result as any).operation, "read", "result.operation=read");
+    assert(typeof (result as any).sizeBytes === "number", "result.sizeBytes present");
+    assert(typeof (result as any).checksum === "string", "result.checksum present");
+  }));
+
+  results.push(await runTest("ndjson: `read` missing arg emits error+result events on stdout", async () => {
+    const { stdout, code } = await runCli(["read", "--ndjson"]);
+    assertEqual(code, 1, "exit 1");
+    const events = parseNdjsonStream(stdout);
+    assert(events.some((e) => e.type === "error" && (e as any).code === "MISSING_ARG"), "MISSING_ARG error");
+    const result = events.find((e) => e.type === "result")!;
+    assertEqual(result.ok, false, "result.ok=false");
+  }));
+
+  results.push(await runTest("ndjson: `write --dry-run --ndjson` emits chip info status + final result with bytesWritten", async () => {
+    const fwPath = join(tmpDir, `ndjson-write-${Date.now()}.bin`);
+    // Non-blank, non-zero firmware so write isn't refused
+    const fw = Buffer.alloc(64, 0x55);
+    await writeFile(fwPath, fw);
+    try {
+      const { stdout, code } = await runCli(["write", fwPath, "--dry-run", "--ndjson"]);
+      assertEqual(code, 0, "exit 0");
+      const events = parseNdjsonStream(stdout);
+      const result = events.find((e) => e.type === "result")!;
+      assertEqual(result.ok, true, "result.ok=true");
+      assertEqual((result as any).bytesWritten, fw.length, "bytesWritten matches");
+      assert(events.some((e) => e.type === "status" && (e as any).chip !== undefined), "chip info status event present");
+    } finally { try { await unlink(fwPath); } catch {} }
+  }));
+
+  results.push(await runTest("ndjson: `erase --confirm --dry-run --ndjson` succeeds with result event", async () => {
+    const { stdout, code } = await runCli(["erase", "--confirm", "--dry-run", "--ndjson"]);
+    assertEqual(code, 0, "exit 0");
+    const events = parseNdjsonStream(stdout);
+    const result = events.find((e) => e.type === "result")!;
+    assertEqual(result.ok, true, "result.ok=true");
+    assertEqual((result as any).operation, "erase", "operation=erase");
+  }));
+
+  results.push(await runTest("ndjson: `erase` WITHOUT --confirm emits MISSING_CONFIRM error", async () => {
+    const { stdout, code } = await runCli(["erase", "--dry-run", "--ndjson"]);
+    assertEqual(code, 1, "exit 1");
+    const events = parseNdjsonStream(stdout);
+    assert(events.some((e) => e.type === "error" && (e as any).code === "MISSING_CONFIRM"), "MISSING_CONFIRM error present");
+    const result = events.find((e) => e.type === "result")!;
+    assertEqual(result.ok, false, "result.ok=false");
+  }));
+
+  results.push(await runTest("ndjson: `blank-check --dry-run --ndjson` reports blank=true on mock", async () => {
+    const { stdout, code } = await runCli(["blank-check", "--dry-run", "--ndjson"]);
+    assertEqual(code, 0, "exit 0");
+    const events = parseNdjsonStream(stdout);
+    const result = events.find((e) => e.type === "result")!;
+    assertEqual(result.ok, true, "ok=true");
+    assertEqual((result as any).blank, true, "mock chip is blank");
+    assertEqual((result as any).nonBlankBytes, 0, "no non-blank bytes");
+  }));
+
+  results.push(await runTest("ndjson: `region-erase --confirm` succeeds with start/length echo", async () => {
+    const { stdout, code } = await runCli(["region-erase", "0x0", "0x1000", "--confirm", "--dry-run", "--ndjson"]);
+    assertEqual(code, 0, "exit 0");
+    const events = parseNdjsonStream(stdout);
+    const result = events.find((e) => e.type === "result")!;
+    assertEqual(result.ok, true, "ok=true");
+    assertEqual((result as any).startAddr, 0, "startAddr echoed");
+    assertEqual((result as any).length, 0x1000, "length echoed");
+  }));
+
+  results.push(await runTest("ndjson: progress events are throttled (≤ 102 progress events for 8MB read)", async () => {
+    const { stdout } = await runCli(["read", ndjsonReadPath, "--dry-run", "--ndjson"]);
+    const events = parseNdjsonStream(stdout);
+    const progressCount = events.filter((e) => e.type === "progress").length;
+    // Throttler emits at most 1 per percent (100) + final 100% = 101 max; allow slack for timing.
+    assert(progressCount <= 102, `progress event count: ${progressCount} ≤ 102`);
+    assert(progressCount >= 1, `at least 1 progress event: ${progressCount}`);
+  }));
+
+  results.push(await runTest("ndjson: every line in stream parses as valid JSON", async () => {
+    const { stdout } = await runCli(["write", ndjsonReadPath, "--dry-run", "--ndjson"]);
+    const lines = stdout.split("\n").filter((l) => l.trim().length > 0);
+    assert(lines.length > 0, "at least one event line");
+    for (const line of lines) JSON.parse(line); // throws on bad JSON
+  }));
+
+  try { await unlink(ndjsonReadPath); } catch {}
+
   // ─── Report ───
   console.log();
   console.log("━".repeat(40));
