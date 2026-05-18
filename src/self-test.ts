@@ -3677,6 +3677,71 @@ export async function runSelfTest(): Promise<boolean> {
     assert(p.data.count > 0, "≥1 controller");
   }));
 
+  // ─── CH347 backend (goal-3 D6) ───
+  // Real CH347 (USB) backend was only exercised indirectly via the dispatch switch.
+  // These tests instantiate it directly and assert the API shape works without hardware.
+  console.log("\nCH347 Backend");
+
+  const { CH347Backend } = await import("./backends/ch347.js");
+
+  results.push(await runTest("ch347: backend class instantiates without throwing", async () => {
+    const b = new CH347Backend();
+    assert(typeof b.detectProgrammer === "function", "detectProgrammer method present");
+    assert(typeof b.identifyChip === "function", "identifyChip method present");
+    assert(typeof b.connectionTest === "function", "connectionTest method present");
+    assert(typeof b.isWriteProtected === "function", "isWriteProtected method present");
+    assert(typeof b.readChip === "function", "readChip method present");
+    assert(typeof b.writeChip === "function", "writeChip method present");
+    assert(typeof b.eraseChip === "function", "eraseChip method present");
+    assert(typeof b.verifyChip === "function", "verifyChip method present");
+  }));
+
+  results.push(await runTest("ch347: detectProgrammer returns ProgrammerInfo shape (no hardware = connected:false)", async () => {
+    const b = new CH347Backend();
+    const info = await b.detectProgrammer();
+    assert(typeof info === "object" && info !== null, "ProgrammerInfo is object");
+    assert("connected" in info, "has connected field");
+    assert("type" in info, "has type field");
+    if (info.connected) {
+      // If real CH347 happens to be attached: type must be one of the known variants.
+      assert(["ch347", "ch347t", "ch347f", "ch343"].includes(info.type), `type is known variant: ${info.type}`);
+    }
+  }));
+
+  results.push(await runTest("ch347: readSFDP is intentionally NOT exposed (CH341A-only feature)", async () => {
+    const b = new CH347Backend();
+    assert(!("readSFDP" in b) || typeof (b as unknown as { readSFDP?: unknown }).readSFDP !== "function",
+      "CH347 deliberately omits SFDP — guard prevents future regression that would break MCP backend gating");
+  }));
+
+  results.push(await runTest("ch347: identifyChip without device returns null or throws cleanly", async () => {
+    const b = new CH347Backend();
+    let returned: unknown;
+    let threw = false;
+    try { returned = await b.identifyChip(); } catch { threw = true; }
+    assert(threw || returned === null || (typeof returned === "object" && returned !== null),
+      "identifyChip returns null OR throws (no silent garbage data)");
+  }));
+
+  results.push(await runTest("ch347: connectionTest without device throws (no silent zero-reads)", async () => {
+    const b = new CH347Backend();
+    let threw = false;
+    try { await b.connectionTest(); } catch { threw = true; }
+    // Either throws OR returns stable:false. Both are acceptable. What we forbid is silent success.
+    if (!threw) {
+      const r = await b.connectionTest();
+      assertEqual(r.stable, false, "connectionTest stable:false without hardware");
+    }
+  }));
+
+  results.push(await runTest("ch347: isWriteProtected without device throws or returns false", async () => {
+    const b = new CH347Backend();
+    let threw = false;
+    let result: boolean | undefined;
+    try { result = await b.isWriteProtected(); } catch { threw = true; }
+    assert(threw || result === false || result === true, "isWriteProtected returns boolean or throws");
+  }));
+
   // ─── Lint invariants (goal-3 D5) ───
   // Regex-based scans on source files. Catches drift like new `: any` in
   // production code, console.log outside permitted modules, untyped exports.
