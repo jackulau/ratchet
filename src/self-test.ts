@@ -3161,6 +3161,247 @@ export async function runSelfTest(): Promise<boolean> {
 
   try { await unlink(ndjsonReadPath); } catch {}
 
+  // ─── MCP Server Integration (D5) ───
+  // Spawn dist/mcp/server.js as a subprocess and drive it via JSON-RPC over stdio.
+  // We use BIOSPY_FORCE_MOCK=1 so hw tools resolve against MockBackend and tests stay deterministic.
+  console.log("\nMCP Server Integration");
+
+  type JsonRpc = { jsonrpc: "2.0"; id?: number | string; method?: string; params?: unknown; result?: any; error?: any };
+
+  // Minimal MCP client: spawn, do init handshake, expose request/notify.
+  // The server might emit responses out-of-order across many requests; we key by id.
+  async function mcpClient(): Promise<{
+    request: (method: string, params?: unknown) => Promise<JsonRpc>;
+    notify: (method: string, params?: unknown) => void;
+    close: () => void;
+  }> {
+    const { spawn } = await import("node:child_process");
+    const proc = spawn(process.execPath, [join(process.cwd(), "dist", "mcp", "server.js")], {
+      env: { ...process.env, BIOSPY_FORCE_MOCK: "1" },
+    });
+    let buf = "";
+    let nextId = 1;
+    const pending = new Map<number | string, (resp: JsonRpc) => void>();
+    proc.stdout.on("data", (d: Buffer) => {
+      buf += d.toString();
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line) as JsonRpc;
+          if (msg.id !== undefined && pending.has(msg.id)) {
+            const resolve = pending.get(msg.id)!;
+            pending.delete(msg.id);
+            resolve(msg);
+          }
+        } catch {}
+      }
+    });
+    // Silence stderr so test output stays tidy
+    proc.stderr.on("data", () => {});
+
+    function request(method: string, params?: unknown): Promise<JsonRpc> {
+      const id = nextId++;
+      const payload: JsonRpc = { jsonrpc: "2.0", id, method, params };
+      return new Promise((resolve, reject) => {
+        pending.set(id, resolve);
+        proc.stdin.write(JSON.stringify(payload) + "\n");
+        setTimeout(() => {
+          if (pending.has(id)) {
+            pending.delete(id);
+            reject(new Error(`MCP request timeout: ${method}`));
+          }
+        }, 5000);
+      });
+    }
+    function notify(method: string, params?: unknown): void {
+      proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
+    }
+    function close(): void { try { proc.stdin.end(); proc.kill(); } catch {} }
+
+    // Init handshake
+    const init = await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "self-test", version: "0.0.1" } });
+    if (!init.result) throw new Error("MCP initialize failed: " + JSON.stringify(init));
+    notify("notifications/initialized", {});
+
+    return { request, notify, close };
+  }
+
+  // Parse the text-content envelope returned by every biospy-mcp tool.
+  function parseToolEnvelope(callResult: any): any {
+    const text = callResult?.content?.[0]?.text;
+    if (typeof text !== "string") throw new Error("tool returned no text content");
+    return JSON.parse(text);
+  }
+
+  const mcpImgPath = join(tmpDir, `mcp-test-${Date.now()}.bin`);
+  await writeFile(mcpImgPath, createMockIntelFdImage());
+
+  results.push(await runTest("mcp: server starts and completes JSON-RPC initialize handshake", async () => {
+    const c = await mcpClient();
+    c.close();
+  }));
+
+  results.push(await runTest("mcp: tools/list returns ≥17 tools including detect/identify/write_chip/erase_chip", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/list", {});
+      assert(Array.isArray(resp.result?.tools), "tools array");
+      const names = new Set(resp.result.tools.map((t: any) => t.name));
+      assert(resp.result.tools.length >= 17, `expected ≥17 tools, got ${resp.result.tools.length}`);
+      const required = ["detect", "identify", "sfdp", "wp_status", "read_chip", "write_chip", "erase_chip", "region_erase", "verify_chip", "blank_check", "analyze_image", "bios_regions", "nvram_vars", "search_chips", "chip_info", "post_decode", "failure_search", "voltage_reference"];
+      for (const r of required) assert(names.has(r), `tool registered: ${r}`);
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: search_chips returns matches for W25Q64JV", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "search_chips", arguments: { query: "W25Q64JV" } });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, true, "ok=true");
+      assert(env.data.matches.length > 0, "at least one match");
+      assertEqual(env.data.matches[0].name, "W25Q64JV", "first match");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: chip_info by JEDEC returns full chip + recommendations", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "chip_info", arguments: { query: "ef4017" } });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, true, "ok=true");
+      assertEqual(env.data.chip.name, "W25Q64JV", "name");
+      assert(env.data.recommendations !== null, "recommendations present");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: chip_info miss returns ok:false envelope", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "chip_info", arguments: { query: "notarealchip0000" } });
+      assertEqual(resp.result?.isError, true, "isError=true on miss");
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, false, "ok=false");
+      assertEqual(env.error.code, "NOT_FOUND", "error.code=NOT_FOUND");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: post_decode 4F returns matches array", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "post_decode", arguments: { code: "4F" } });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, true, "ok=true");
+      assert(Array.isArray(env.data.matches), "matches array");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: post_decode invalid input returns INVALID_CODE error envelope", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "post_decode", arguments: { code: "notahex" } });
+      assertEqual(resp.result?.isError, true, "isError=true");
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.error.code, "INVALID_CODE", "error.code");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: voltage_reference atx returns connector data", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "voltage_reference", arguments: { connector: "atx" } });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, true, "ok=true");
+      assert(env.data.count >= 1, "≥1 connector");
+      assert(Array.isArray(env.data.connectors[0].rails), "rails array");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: analyze_image works on synthetic Intel FD image", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "analyze_image", arguments: { path: mcpImgPath } });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, true, "ok=true");
+      assert(Array.isArray(env.data.regions), "regions array");
+      assertEqual(env.data.sizeBytes, 8 * 1024 * 1024, "8MB");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: analyze_image missing file returns FILE_NOT_FOUND", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "analyze_image", arguments: { path: "/nonexistent/x.bin" } });
+      assertEqual(resp.result?.isError, true, "isError=true");
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.error.code, "FILE_NOT_FOUND", "error.code");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: write_chip WITHOUT confirm:true returns MISSING_CONFIRM (does NOT throw)", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "write_chip", arguments: { path: mcpImgPath, confirm: false } });
+      assertEqual(resp.result?.isError, true, "isError=true");
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, false, "ok=false");
+      assertEqual(env.error.code, "MISSING_CONFIRM", "MISSING_CONFIRM");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: erase_chip WITHOUT confirm:true returns MISSING_CONFIRM", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "erase_chip", arguments: { confirm: false } });
+      assertEqual(resp.result?.isError, true, "isError=true");
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.error.code, "MISSING_CONFIRM", "MISSING_CONFIRM");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: erase_chip WITH confirm:true succeeds in mock mode", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "erase_chip", arguments: { confirm: true } });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, true, "ok=true");
+      assertEqual(env.data.backend, "mock", "mock backend");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: detect returns mock programmer when BIOSPY_FORCE_MOCK=1", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "detect", arguments: {} });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, true, "ok=true");
+      assertEqual(env.data.mock, true, "mock flag");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: identify returns chip data through mock backend", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "identify", arguments: {} });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.ok, true, "ok=true");
+      assertEqual(env.data.backend, "mock", "mock backend");
+      assert(typeof env.data.jedecId === "string", "jedecId present");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp: server shuts down cleanly on stdin EOF", async () => {
+    const c = await mcpClient();
+    c.close();
+    // If close throws or hangs, the runTest timeout kicks in.
+    await new Promise((r) => setTimeout(r, 100));
+  }));
+
+  try { await unlink(mcpImgPath); } catch {}
+
   // ─── Report ───
   console.log();
   console.log("━".repeat(40));
