@@ -11,6 +11,14 @@ import { join } from "node:path";
 const CH341A_VID = 0x1a86;
 const CH341A_PID = 0x5512;
 const CH347_PID = 0x55db;
+// Additional CH34x family product IDs spotted on real hardware/clones.
+// Order matters in detection — most specific (CH347) checked before generic CH341A.
+const CH347T_PID = 0x55dc;   // CH347T variant (USB-HS)
+const CH347F_PID = 0x55de;   // CH347F variant (4-port composite)
+const CH341B_PID = 0x5523;   // Some CH341B clones expose this PID
+const CH343_PID  = 0x55d3;   // CH343 UART-only (still report as detected for signal access)
+// Aliased / cloned-device VIDs occasionally seen in the wild
+const QINHENG_VID_ALT = 0x4348; // Some early QinHeng samples
 
 const CH341A_CMD_SPI_STREAM = 0xa8;
 const CH341A_CMD_UIO_STREAM = 0xab;
@@ -63,6 +71,27 @@ const SPI_SR_BP0  = 0x04;
 const SPI_SR_BP1  = 0x08;
 const SPI_SR_BP2  = 0x10;
 const SPI_SR_BP3  = 0x20;
+// SR1 bit 7 = SRP0 (Status Register Protect, vendor-defined; lockable when WP# asserted)
+const SPI_SR_SRP0 = 0x80;
+// SR2 bit 6 = CMP (Complement Protect — inverts BP region meaning, Winbond/GD25 family)
+const SPI_SR2_CMP = 0x40;
+// SR2 bit 0 = SRP1 (paired with SRP0 → permanent OTP-style protection)
+const SPI_SR2_SRP1 = 0x01;
+// SR2 bit 1 = QE (Quad-Enable) — must be set before QPI / Quad-SPI mode
+const SPI_SR2_QE   = 0x02;
+
+// AAI (Auto-Address Increment) byte-program — SST25VF chips
+const SPI_CMD_AAI_WORD = 0xad; // word program
+const SPI_CMD_AAI_BYTE = 0xaf; // byte program (older SST)
+
+// OTP / Security Register access (Winbond, GD25, Macronix)
+const SPI_CMD_ERASE_SECURITY    = 0x44; // erase OTP/security region
+const SPI_CMD_PROGRAM_SECURITY  = 0x42; // program OTP/security region
+const SPI_CMD_READ_SECURITY     = 0x48; // read OTP/security region
+
+// QPI mode entry/exit (quad-SPI peripheral mode)
+const SPI_CMD_ENTER_QPI = 0x38;
+const SPI_CMD_EXIT_QPI  = 0xff;
 const SPI_SR_SRP  = 0x80;
 
 const USB_EP_OUT = 0x02;
@@ -108,34 +137,46 @@ export class CH341ABackend {
   private usbErrorCount = 0;
 
   async detectProgrammer(): Promise<ProgrammerInfo> {
-    const ch341a = findByIds(CH341A_VID, CH341A_PID);
-    if (ch341a) {
-      const conn = this.getConnectionInfo(ch341a);
-      return {
-        type: "ch341a",
-        connected: true,
-        vendorId: CH341A_VID.toString(16),
-        productId: CH341A_PID.toString(16),
-        description: "CH341A USB SPI Programmer",
-        ...conn,
-      };
-    }
+    // Detection order: most-capable first (CH347 family) so the higher-speed
+    // backend wins when both classes are present on the bus.
+    const variants: Array<{ vid: number; pid: number; type: ProgrammerInfo["type"]; description: string }> = [
+      { vid: CH341A_VID, pid: CH347F_PID,  type: "ch347",  description: "CH347F USB-HS SPI/I2C/JTAG Programmer (4-port)" },
+      { vid: CH341A_VID, pid: CH347T_PID,  type: "ch347",  description: "CH347T USB-HS SPI/I2C Programmer" },
+      { vid: CH341A_VID, pid: CH347_PID,   type: "ch347",  description: "CH347 USB SPI/I2C/JTAG Programmer" },
+      { vid: CH341A_VID, pid: CH343_PID,   type: "ch343",  description: "CH343 USB UART Bridge (serial-debug only — no SPI)" },
+      { vid: CH341A_VID, pid: CH341A_PID,  type: "ch341a", description: "CH341A USB SPI Programmer" },
+      { vid: CH341A_VID, pid: CH341B_PID,  type: "ch341a", description: "CH341B/clone USB SPI Programmer" },
+      { vid: QINHENG_VID_ALT, pid: CH341A_PID, type: "ch341a", description: "CH341A USB SPI Programmer (legacy QinHeng VID)" },
+    ];
 
-    const ch347 = findByIds(CH341A_VID, CH347_PID);
-    if (ch347) {
-      const conn = this.getConnectionInfo(ch347);
-      return {
-        type: "ch347",
-        connected: true,
-        vendorId: CH341A_VID.toString(16),
-        productId: CH347_PID.toString(16),
-        description: "CH347 USB SPI/I2C/JTAG Programmer",
-        ...conn,
-      };
+    for (const v of variants) {
+      const dev = findByIds(v.vid, v.pid);
+      if (dev) {
+        const conn = this.getConnectionInfo(dev);
+        return {
+          type: v.type,
+          connected: true,
+          vendorId: v.vid.toString(16),
+          productId: v.pid.toString(16),
+          description: v.description,
+          ...conn,
+        };
+      }
     }
 
     return { type: "unknown", connected: false, description: "No CH34x programmer detected" };
   }
+
+  /** Exported VID/PID table for self-tests and diagnostics. */
+  static readonly KNOWN_VARIANTS = [
+    { vid: 0x1a86, pid: 0x5512, name: "CH341A" },
+    { vid: 0x1a86, pid: 0x5523, name: "CH341B/clone" },
+    { vid: 0x1a86, pid: 0x55db, name: "CH347" },
+    { vid: 0x1a86, pid: 0x55dc, name: "CH347T" },
+    { vid: 0x1a86, pid: 0x55de, name: "CH347F" },
+    { vid: 0x1a86, pid: 0x55d3, name: "CH343 (UART)" },
+    { vid: 0x4348, pid: 0x5512, name: "CH341A (legacy QinHeng VID)" },
+  ] as const;
 
   async connectionTest(): Promise<{ stable: boolean; reads: number; matches: number; jedecId: string; error?: string; timings: number[]; statusRegister: number | null }> {
     await this.open();
@@ -543,19 +584,52 @@ export class CH341ABackend {
     if (id.manufacturer === 0 || id.manufacturer === 0xff) return null;
 
     const dbEntry = lookupChipByJedecId(id.raw);
-    const sizeBytes = dbEntry?.sizeBytes || (id.capacity <= 30 ? (1 << id.capacity) : 2 ** id.capacity);
+    if (dbEntry) {
+      return {
+        name: dbEntry.name,
+        vendorName: dbEntry.vendor,
+        jedecId: id.raw,
+        sizeBytes: dbEntry.sizeBytes,
+        sizeHuman: formatSize(dbEntry.sizeBytes),
+        type: "spi",
+        pageSize: dbEntry.pageSize,
+        sectorSize: dbEntry.sectorSize,
+        blockSize: dbEntry.blockSize,
+        voltage: dbEntry.voltage,
+      };
+    }
 
+    // Unknown chip — try SFDP universal fallback before falling back to capacity-byte estimation.
+    try {
+      const sfdp = await this.readSFDPInternal();
+      if (sfdp) {
+        return {
+          name: `Unknown ${id.raw} (via SFDP)`,
+          vendorName: `0x${id.manufacturer.toString(16)}`,
+          jedecId: id.raw,
+          sizeBytes: sfdp.densityBytes,
+          sizeHuman: formatSize(sfdp.densityBytes),
+          type: "spi",
+          pageSize: sfdp.pageSize,
+          sectorSize: sfdp.sectorSize4KB ? 4096 : 65536,
+          blockSize: sfdp.blockSize64KB ? 65536 : (sfdp.blockSize32KB ? 32768 : 65536),
+        };
+      }
+    } catch {
+      // SFDP unavailable — fall through to capacity-byte estimate.
+    }
+
+    const sizeBytes = id.capacity <= 30 ? (1 << id.capacity) : 2 ** id.capacity;
     return {
-      name: dbEntry?.name || `Unknown (${id.raw})`,
-      vendorName: dbEntry?.vendor || `0x${id.manufacturer.toString(16)}`,
+      name: `Unknown (${id.raw})`,
+      vendorName: `0x${id.manufacturer.toString(16)}`,
       jedecId: id.raw,
       sizeBytes,
       sizeHuman: formatSize(sizeBytes),
       type: "spi",
-      pageSize: dbEntry?.pageSize || 256,
-      sectorSize: dbEntry?.sectorSize || 4096,
-      blockSize: dbEntry?.blockSize || 65536,
-      voltage: dbEntry?.voltage,
+      pageSize: 256,
+      sectorSize: 4096,
+      blockSize: 65536,
     };
   }
 
@@ -1131,6 +1205,121 @@ export class CH341ABackend {
     } finally {
       await this.close();
     }
+  }
+
+  // --- Status register / block protection analysis ---
+  // Reports the full block-protection state for diagnostic + parity tooling.
+  // No side effects — safe to call before/after operations.
+  async readBlockProtectionState(): Promise<{
+    sr1: number;
+    sr2: number;
+    sr3: number;
+    bp0: boolean;
+    bp1: boolean;
+    bp2: boolean;
+    bp3: boolean;
+    srp0: boolean;
+    srp1: boolean;
+    cmp: boolean;
+    quadEnable: boolean;
+    anyProtected: boolean;
+    permanentlyLocked: boolean;
+  }> {
+    await this.open();
+    try {
+      const sr1 = await this.readStatusRegister();
+      let sr2 = 0;
+      let sr3 = 0;
+      try { sr2 = await this.readStatusRegister2(); } catch {}
+      try { sr3 = await this.readStatusRegister3(); } catch {}
+      const bp0 = !!(sr1 & SPI_SR_BP0);
+      const bp1 = !!(sr1 & SPI_SR_BP1);
+      const bp2 = !!(sr1 & SPI_SR_BP2);
+      const bp3 = !!(sr1 & SPI_SR_BP3);
+      const srp0 = !!(sr1 & SPI_SR_SRP0);
+      const srp1 = !!(sr2 & SPI_SR2_SRP1);
+      const cmp  = !!(sr2 & SPI_SR2_CMP);
+      const quadEnable = !!(sr2 & SPI_SR2_QE);
+      const anyProtected = bp0 || bp1 || bp2 || bp3;
+      // SRP0=1 + SRP1=1 = "Power Supply Lock-Down" or OTP — cannot be cleared via WRSR.
+      const permanentlyLocked = srp0 && srp1;
+      return { sr1, sr2, sr3, bp0, bp1, bp2, bp3, srp0, srp1, cmp, quadEnable, anyProtected, permanentlyLocked };
+    } finally {
+      await this.close();
+    }
+  }
+
+  // --- AAI (Auto-Address Increment) byte/word program — SST25VF family ---
+  async aaiWordProgram(address: number, data: Buffer): Promise<void> {
+    if (data.length % 2 !== 0) {
+      throw new Error("AAI word program requires even byte count");
+    }
+    await this.open();
+    try {
+      await this.spiCommand([SPI_CMD_WREN]);
+      // First AAI command: opcode + 3-byte address + first word
+      let offset = 0;
+      await this.spiCommand([
+        SPI_CMD_AAI_WORD,
+        (address >> 16) & 0xff,
+        (address >> 8) & 0xff,
+        address & 0xff,
+        data[0], data[1],
+      ]);
+      offset += 2;
+      await this.waitForReady();
+      // Subsequent AAI commands: opcode + next word (address auto-increments)
+      while (offset < data.length) {
+        await this.spiCommand([SPI_CMD_AAI_WORD, data[offset], data[offset + 1]]);
+        offset += 2;
+        await this.waitForReady();
+      }
+      await this.spiCommand([SPI_CMD_WRDI]);
+    } finally {
+      await this.close();
+    }
+  }
+
+  // --- OTP / Security Register access (vendor-extension; reads only) ---
+  async readSecurityRegister(register: 1 | 2 | 3, length = 256): Promise<Buffer> {
+    if (length > 256) throw new Error("Security register read length must be ≤256 bytes");
+    await this.open();
+    try {
+      const baseAddr = register * 0x1000; // Winbond convention: 0x1000/0x2000/0x3000
+      const rx = await this.spiCommand([
+        SPI_CMD_READ_SECURITY,
+        (baseAddr >> 16) & 0xff,
+        (baseAddr >> 8) & 0xff,
+        baseAddr & 0xff,
+        0x00, // dummy byte
+        ...new Array(length).fill(0),
+      ]);
+      return Buffer.from(rx.subarray(5, 5 + length));
+    } finally {
+      await this.close();
+    }
+  }
+
+  // --- QPI (Quad-Peripheral-Interface) mode toggle. Most chips ignore if QE unset. ---
+  async enterQpiMode(): Promise<void> {
+    await this.open();
+    try { await this.spiCommand([SPI_CMD_ENTER_QPI]); }
+    finally { await this.close(); }
+  }
+  async exitQpiMode(): Promise<void> {
+    await this.open();
+    try { await this.spiCommand([SPI_CMD_EXIT_QPI]); }
+    finally { await this.close(); }
+  }
+
+  // Used by AAI loop — busy-poll the WIP bit.
+  private async waitForReady(): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < 5000) {
+      const rx = await this.spiCommand([SPI_CMD_RDSR, 0]);
+      if (!(rx[1] & SPI_SR_WIP)) return;
+    }
+    throw new Error("Timeout waiting for WIP clear");
   }
 
   // --- Internal read used within already-open sessions ---

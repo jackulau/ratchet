@@ -1,13 +1,13 @@
 {
   "name": "biospy",
-  "version": "0.6.0",
+  "version": "1.1.0",
   "description": "Modern BIOS chip programmer and debugger for CH341A/CH347 USB programmers",
   "type": "module",
   "bin": {
     "biospy": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && chmod +x dist/cli.js",
     "dev": "tsc --watch",
     "start": "node dist/cli.js"
   },

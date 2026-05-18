@@ -1,0 +1,305 @@
+export type PostStandard = "ami" | "award" | "phoenix" | "uefi";
+
+export interface PostCode {
+  code: string;
+  standard: PostStandard;
+  phase: string;
+  description: string;
+  causes: string[];
+}
+
+export const POST_CODES: PostCode[] = [
+  // ═══════════════════════════════════════════════
+  // AMI BIOS POST Codes (Aptio V / AMIBIOS8)
+  // ═══════════════════════════════════════════════
+
+  // Early init (SEC/PEI phase)
+  { code: "00", standard: "ami", phase: "SEC", description: "Not used", causes: ["Board not receiving power", "Dead CPU", "Shorted component near VRM"] },
+  { code: "01", standard: "ami", phase: "SEC", description: "Microcode loading", causes: ["Unsupported CPU", "Corrupt BIOS SEC region", "CPU not seated properly"] },
+  { code: "02", standard: "ami", phase: "SEC", description: "AP initialization before microcode", causes: ["Multi-core init failure", "CPU defect"] },
+  { code: "03", standard: "ami", phase: "SEC", description: "System agent initialization", causes: ["Chipset failure", "Bad CPU-to-PCH connection"] },
+  { code: "04", standard: "ami", phase: "SEC", description: "PCH initialization", causes: ["PCH failure", "Bad solder joints on PCH"] },
+  { code: "05", standard: "ami", phase: "SEC", description: "OEM SEC initialization code", causes: ["Vendor-specific early init failure"] },
+  { code: "06", standard: "ami", phase: "SEC", description: "Microcode not found", causes: ["BIOS doesn't support this CPU generation", "Corrupt BIOS image"] },
+  { code: "07", standard: "ami", phase: "SEC", description: "Microcode update failed", causes: ["Incompatible microcode", "Flash corruption in SEC region"] },
+  { code: "08", standard: "ami", phase: "PEI", description: "PEI core started", causes: [] },
+  { code: "09", standard: "ami", phase: "PEI", description: "Pre-memory NB initialization started", causes: ["Northbridge/System Agent init failure"] },
+  { code: "0A", standard: "ami", phase: "PEI", description: "Pre-memory NB initialization (SPD read)", causes: ["Can't read RAM SPD", "Bad RAM slot", "RAM not seated"] },
+  { code: "0B", standard: "ami", phase: "PEI", description: "Pre-memory NB initialization (memory presence detection)", causes: ["No RAM detected", "RAM incompatible"] },
+  { code: "0C", standard: "ami", phase: "PEI", description: "Pre-memory NB initialization (timing)", causes: ["Memory timing error", "Unstable RAM"] },
+  { code: "0D", standard: "ami", phase: "PEI", description: "Pre-memory NB initialization (end)", causes: [] },
+  { code: "0E", standard: "ami", phase: "PEI", description: "Pre-memory SB initialization", causes: ["Southbridge/PCH early init failure"] },
+  { code: "10", standard: "ami", phase: "PEI", description: "PEI core: boot mode determined", causes: [] },
+  { code: "13", standard: "ami", phase: "PEI", description: "Pre-memory CPU POST started", causes: [] },
+  { code: "14", standard: "ami", phase: "PEI", description: "Pre-memory CPU initialization", causes: [] },
+  { code: "15", standard: "ami", phase: "PEI", description: "Pre-memory system agent init", causes: ["Intel SA failure", "Uncore configuration error"] },
+  { code: "19", standard: "ami", phase: "PEI", description: "Pre-memory SB initialization started", causes: [] },
+  // Memory init
+  { code: "21", standard: "ami", phase: "MEM_INIT", description: "Memory initialization — SPD data read", causes: ["Corrupt SPD EEPROM", "Dirty RAM contacts", "Bad DIMM slot"] },
+  { code: "22", standard: "ami", phase: "MEM_INIT", description: "Memory initialization — presence detect", causes: ["RAM not detected", "Wrong RAM type", "Dead DIMM slot"] },
+  { code: "23", standard: "ami", phase: "MEM_INIT", description: "Memory initialization — timing programming", causes: ["XMP profile incompatible", "Memory timing too aggressive"] },
+  { code: "24", standard: "ami", phase: "MEM_INIT", description: "Memory initialization — configuring memory", causes: ["Channel config error", "Mismatched DIMMs"] },
+  { code: "25", standard: "ami", phase: "MEM_INIT", description: "Memory initialization — testing memory", causes: ["Defective RAM", "Bad memory controller in CPU"] },
+  { code: "26", standard: "ami", phase: "MEM_INIT", description: "Memory initialization — error detected", causes: ["Faulty DIMM", "Bad DIMM slot traces", "Memory controller failure"] },
+  { code: "27", standard: "ami", phase: "MEM_INIT", description: "Memory initialization complete — success", causes: [] },
+  { code: "28", standard: "ami", phase: "MEM_INIT", description: "Memory installed", causes: [] },
+  { code: "29", standard: "ami", phase: "MEM_INIT", description: "Unspecified memory initialization error", causes: ["Try one DIMM at a time", "Reset CMOS", "Update BIOS"] },
+  // DXE phase
+  { code: "30", standard: "ami", phase: "DXE", description: "Reserved for ASL (ACPI)", causes: [] },
+  { code: "31", standard: "ami", phase: "DXE", description: "DXE Core loading and initialization", causes: ["Corrupt DXE region in BIOS"] },
+  { code: "32", standard: "ami", phase: "DXE", description: "CPU DXE initialization", causes: ["CPU post-mem init failure"] },
+  { code: "33", standard: "ami", phase: "DXE", description: "CPU DXE SMM initialization", causes: ["SMM setup failure", "BIOS SMM region corrupt"] },
+  { code: "34", standard: "ami", phase: "DXE", description: "CPU DXE AP initialization", causes: ["Application Processor init error"] },
+  { code: "35", standard: "ami", phase: "DXE", description: "NB DXE initialization", causes: ["System Agent DXE driver failure"] },
+  { code: "36", standard: "ami", phase: "DXE", description: "NB DXE SMM initialization", causes: [] },
+  { code: "37", standard: "ami", phase: "DXE", description: "SB DXE initialization", causes: ["PCH DXE driver failure"] },
+  { code: "38", standard: "ami", phase: "DXE", description: "SB DXE SMM initialization", causes: [] },
+  { code: "39", standard: "ami", phase: "DXE", description: "SB DXE devices initialization", causes: ["SATA/USB/LAN controller init failure"] },
+  { code: "3A", standard: "ami", phase: "DXE", description: "DXE OEM initialization", causes: [] },
+  { code: "40", standard: "ami", phase: "DXE", description: "DXE BDS started", causes: [] },
+  { code: "41", standard: "ami", phase: "DXE", description: "DXE BDS connect drivers", causes: ["Driver connection failure"] },
+  { code: "42", standard: "ami", phase: "DXE", description: "DXE BDS PCI Bus enumeration", causes: ["PCI bus enumeration failure", "Bad PCIe slot", "GPU not seated"] },
+  { code: "43", standard: "ami", phase: "DXE", description: "DXE BDS Full PCI enumeration", causes: [] },
+  { code: "47", standard: "ami", phase: "DXE", description: "DXE BDS Console output connect", causes: ["No display device found", "GPU init failure"] },
+  { code: "49", standard: "ami", phase: "DXE", description: "DXE BDS Console input connect", causes: ["Keyboard controller init failure"] },
+  { code: "4B", standard: "ami", phase: "DXE", description: "DXE BDS prepare to boot", causes: [] },
+  { code: "4F", standard: "ami", phase: "DXE", description: "DXE BDS — ready to boot event", causes: [] },
+  { code: "50", standard: "ami", phase: "DXE", description: "DXE runtime: PCI resources assigned", causes: [] },
+  { code: "51", standard: "ami", phase: "DXE", description: "Console output connect (GOP)", causes: ["GPU initialization failure", "No display output"] },
+  { code: "60", standard: "ami", phase: "DXE", description: "DXE ACPI init", causes: [] },
+  { code: "61", standard: "ami", phase: "DXE", description: "NVRAM cleanup", causes: ["NVRAM corruption", "CMOS battery dead"] },
+  { code: "62", standard: "ami", phase: "DXE", description: "NVRAM install", causes: [] },
+  // Boot
+  { code: "90", standard: "ami", phase: "BOOT", description: "Boot device selection", causes: ["No bootable device", "SSD/HDD not detected"] },
+  { code: "91", standard: "ami", phase: "BOOT", description: "OS boot started — leaving DXE", causes: [] },
+  { code: "92", standard: "ami", phase: "BOOT", description: "PCI bus hot plug", causes: [] },
+  { code: "94", standard: "ami", phase: "BOOT", description: "USB hot plug", causes: [] },
+  { code: "A0", standard: "ami", phase: "BOOT", description: "IDE/SATA initialization", causes: ["SATA controller failure", "Drive not connected"] },
+  { code: "A2", standard: "ami", phase: "BOOT", description: "IDE/SATA detect", causes: ["SATA cable bad", "Drive dead"] },
+  { code: "A4", standard: "ami", phase: "BOOT", description: "SCSI detect", causes: [] },
+  { code: "A8", standard: "ami", phase: "BOOT", description: "Password verify", causes: ["BIOS password lock"] },
+  { code: "AA", standard: "ami", phase: "BOOT", description: "System is idle awaiting user input (BIOS setup)", causes: [] },
+  { code: "AB", standard: "ami", phase: "BOOT", description: "Setup entered", causes: [] },
+  { code: "B0", standard: "ami", phase: "BOOT", description: "Runtime set virtual address map begin", causes: [] },
+  { code: "B2", standard: "ami", phase: "BOOT", description: "Legacy option ROM init", causes: ["Bad expansion card ROM"] },
+  { code: "B4", standard: "ami", phase: "BOOT", description: "USB option ROM init", causes: [] },
+  // Error codes
+  { code: "D0", standard: "ami", phase: "ERROR", description: "CPU initialization error", causes: ["CPU dead", "CPU not seated", "Bent pins", "VRM failure"] },
+  { code: "D1", standard: "ami", phase: "ERROR", description: "NB initialization error", causes: ["System Agent/IMC failure", "CPU or chipset defective"] },
+  { code: "D2", standard: "ami", phase: "ERROR", description: "SB initialization error", causes: ["PCH failure", "Bad PCH solder balls"] },
+  { code: "D3", standard: "ami", phase: "ERROR", description: "Some of the protocols are not available", causes: ["BIOS corruption in DXE volume"] },
+  { code: "D4", standard: "ami", phase: "ERROR", description: "PCI resource allocation error", causes: ["Too many PCI devices", "Bad PCIe riser/slot"] },
+  { code: "D5", standard: "ami", phase: "ERROR", description: "No space for legacy option ROMs", causes: ["Too many option ROM devices"] },
+  { code: "D6", standard: "ami", phase: "ERROR", description: "No console output device found", causes: ["GPU dead", "No GPU installed", "GPU not seated properly"] },
+  { code: "D7", standard: "ami", phase: "ERROR", description: "No console input device found", causes: ["Keyboard controller dead", "USB controller failure"] },
+  { code: "E8", standard: "ami", phase: "ERROR", description: "S3 resume failed", causes: ["S3 resume data corrupt", "Hardware changed since last sleep"] },
+  { code: "E9", standard: "ami", phase: "ERROR", description: "S3 resume PPI not found", causes: ["BIOS S3 support broken"] },
+  { code: "EA", standard: "ami", phase: "ERROR", description: "S3 resume boot script error", causes: [] },
+  { code: "EB", standard: "ami", phase: "ERROR", description: "S3 OS wake call error", causes: [] },
+
+  // ═══════════════════════════════════════════════
+  // Award BIOS POST Codes
+  // ═══════════════════════════════════════════════
+  { code: "C0", standard: "award", phase: "EARLY", description: "Turn off OEM specific cache, shadow", causes: [] },
+  { code: "C1", standard: "award", phase: "EARLY", description: "Auto-size DRAM — detect DRAM size", causes: ["RAM not detected", "Bad RAM module"] },
+  { code: "C3", standard: "award", phase: "EARLY", description: "Test DRAM R/W", causes: ["Defective RAM", "Bad RAM slot", "Dirty contacts"] },
+  { code: "C5", standard: "award", phase: "EARLY", description: "Copy BIOS to shadow RAM", causes: ["Shadow RAM failure", "Address line fault"] },
+  { code: "01", standard: "award", phase: "INIT", description: "Processor test 1 — register test", causes: ["CPU failure", "Bad CPU socket"] },
+  { code: "02", standard: "award", phase: "INIT", description: "Processor test 2 — check bus frequency", causes: ["Wrong FSB setting", "CPU clock failure"] },
+  { code: "03", standard: "award", phase: "INIT", description: "Initialize chips", causes: ["Chipset init failure", "Bad chipset solder joints"] },
+  { code: "04", standard: "award", phase: "INIT", description: "Test memory refresh toggle", causes: ["Memory refresh circuit failure", "Bad RAM"] },
+  { code: "05", standard: "award", phase: "INIT", description: "Blank video, initialize keyboard", causes: ["Keyboard controller dead", "PS/2 port failure"] },
+  { code: "06", standard: "award", phase: "INIT", description: "Reserved", causes: [] },
+  { code: "07", standard: "award", phase: "INIT", description: "Test CMOS interface and battery status", causes: ["Dead CMOS battery", "RTC failure", "CMOS chip failure"] },
+  { code: "08", standard: "award", phase: "INIT", description: "Set up low memory — early chipset init", causes: [] },
+  { code: "09", standard: "award", phase: "INIT", description: "Set up interrupt vectors", causes: ["Interrupt controller failure"] },
+  { code: "0A", standard: "award", phase: "INIT", description: "Test CMOS RAM checksum", causes: ["CMOS battery dead", "CMOS chip corrupt", "Replace battery and clear CMOS"] },
+  { code: "0B", standard: "award", phase: "INIT", description: "Initialize video interface", causes: ["GPU not detected", "Bad AGP/PCIe slot", "GPU dead"] },
+  { code: "0C", standard: "award", phase: "INIT", description: "Video BIOS test", causes: ["GPU BIOS corrupt", "Bad GPU VRAM"] },
+  { code: "0D", standard: "award", phase: "INIT", description: "Test video memory", causes: ["Defective GPU VRAM"] },
+  { code: "0E", standard: "award", phase: "INIT", description: "Test video memory R/W", causes: ["GPU VRAM failure"] },
+  { code: "0F", standard: "award", phase: "INIT", description: "Test DMA controller 0", causes: ["DMA controller failure on chipset"] },
+  { code: "10", standard: "award", phase: "INIT", description: "Test DMA controller 1", causes: ["DMA controller failure"] },
+  { code: "11", standard: "award", phase: "INIT", description: "Test DMA page registers", causes: ["DMA page register failure"] },
+  { code: "14", standard: "award", phase: "INIT", description: "Test timer counter 2", causes: ["Timer failure on chipset"] },
+  { code: "15", standard: "award", phase: "INIT", description: "Test 8259 interrupt mask bits for channel 1", causes: ["Interrupt controller 1 failure"] },
+  { code: "16", standard: "award", phase: "INIT", description: "Test 8259 interrupt mask bits for channel 2", causes: ["Interrupt controller 2 failure"] },
+  { code: "19", standard: "award", phase: "INIT", description: "Test 8259 functionality", causes: ["PIC failure on chipset"] },
+  { code: "1A", standard: "award", phase: "MEM", description: "Test memory — first 64K", causes: ["First 64KB RAM failure", "Address line A0-A15 fault"] },
+  { code: "1E", standard: "award", phase: "MEM", description: "Size memory — determine DRAM size", causes: ["RAM sizing failure", "SPD read error"] },
+  { code: "20", standard: "award", phase: "MEM", description: "Test memory — address lines", causes: ["Address line fault", "Bad RAM traces on board"] },
+  { code: "21", standard: "award", phase: "MEM", description: "Test memory — parity", causes: ["Parity error", "Bad RAM"] },
+  { code: "22", standard: "award", phase: "MEM", description: "Test memory — pattern", causes: ["Defective RAM chip(s)"] },
+  { code: "30", standard: "award", phase: "DEVICE", description: "Test base 64K of memory", causes: ["Base memory failure"] },
+  { code: "31", standard: "award", phase: "DEVICE", description: "Test memory above 1MB", causes: ["Extended memory failure", "Bad upper RAM"] },
+  { code: "32", standard: "award", phase: "DEVICE", description: "Test memory parity", causes: ["Parity RAM error"] },
+  { code: "39", standard: "award", phase: "DEVICE", description: "Test RTC time registers", causes: ["RTC failure", "Dead CMOS battery"] },
+  { code: "3C", standard: "award", phase: "DEVICE", description: "Detect and initialize serial ports", causes: ["Serial port failure"] },
+  { code: "3D", standard: "award", phase: "DEVICE", description: "Detect and initialize parallel ports", causes: ["Parallel port failure"] },
+  { code: "41", standard: "award", phase: "DEVICE", description: "Detect floppy drive and controller", causes: ["Floppy controller error"] },
+  { code: "42", standard: "award", phase: "DEVICE", description: "Detect hard drive and controller", causes: ["IDE/SATA controller failure", "Drive cable bad"] },
+  { code: "45", standard: "award", phase: "DEVICE", description: "Detect coprocessor", causes: ["FPU/math coprocessor test failure"] },
+  { code: "4E", standard: "award", phase: "DEVICE", description: "Mfg POST loop or display messages", causes: [] },
+  { code: "4F", standard: "award", phase: "DEVICE", description: "Security password check", causes: ["BIOS password set"] },
+  { code: "50", standard: "award", phase: "BOOT", description: "Write CMOS — finalize settings", causes: [] },
+  { code: "51", standard: "award", phase: "BOOT", description: "Enable parity checking", causes: [] },
+  { code: "52", standard: "award", phase: "BOOT", description: "Initialize option ROMs", causes: ["Bad expansion card ROM"] },
+  { code: "53", standard: "award", phase: "BOOT", description: "Initialize time value", causes: [] },
+  { code: "60", standard: "award", phase: "BOOT", description: "Setup virus protection (boot sector)", causes: [] },
+  { code: "63", standard: "award", phase: "BOOT", description: "Set boot device", causes: ["No bootable device"] },
+  { code: "FF", standard: "award", phase: "BOOT", description: "Boot attempt (INT 19h) — handing off to OS", causes: [] },
+
+  // ═══════════════════════════════════════════════
+  // Phoenix BIOS POST Codes (beep-code aligned)
+  // ═══════════════════════════════════════════════
+  { code: "02", standard: "phoenix", phase: "EARLY", description: "Verify real mode", causes: ["CPU failure"] },
+  { code: "03", standard: "phoenix", phase: "EARLY", description: "Disable NMI", causes: ["NMI controller failure"] },
+  { code: "04", standard: "phoenix", phase: "EARLY", description: "Get CPU type", causes: ["CPU detection failure"] },
+  { code: "06", standard: "phoenix", phase: "EARLY", description: "Initialize system hardware", causes: ["Early chipset init failure"] },
+  { code: "07", standard: "phoenix", phase: "EARLY", description: "Disable shadow and execute code from ROM", causes: [] },
+  { code: "08", standard: "phoenix", phase: "EARLY", description: "Initialize chipset with initial POST values", causes: ["Chipset configuration failure"] },
+  { code: "09", standard: "phoenix", phase: "EARLY", description: "Set IN POST flag", causes: [] },
+  { code: "0A", standard: "phoenix", phase: "EARLY", description: "Initialize CPU registers", causes: ["CPU register init failure"] },
+  { code: "0B", standard: "phoenix", phase: "EARLY", description: "Enable CPU cache", causes: ["CPU cache failure"] },
+  { code: "0C", standard: "phoenix", phase: "EARLY", description: "Initialize caches to initial POST values", causes: [] },
+  { code: "0E", standard: "phoenix", phase: "EARLY", description: "Initialize I/O component", causes: ["Super I/O chip failure"] },
+  { code: "0F", standard: "phoenix", phase: "EARLY", description: "Initialize the local bus IDE", causes: [] },
+  { code: "10", standard: "phoenix", phase: "EARLY", description: "Initialize power management", causes: ["ACPI/APM init failure"] },
+  { code: "11", standard: "phoenix", phase: "EARLY", description: "Load BIOS from ROM to RAM", causes: ["ROM read error", "BIOS chip failure"] },
+  { code: "12", standard: "phoenix", phase: "EARLY", description: "Initialize CMOS/RTC", causes: ["RTC failure", "CMOS battery dead"] },
+  { code: "13", standard: "phoenix", phase: "EARLY", description: "Initialize DMA controller", causes: ["DMA controller failure"] },
+  { code: "14", standard: "phoenix", phase: "EARLY", description: "Restore ACPI to power-on state", causes: [] },
+  { code: "16", standard: "phoenix", phase: "EARLY", description: "Detect keyboard/mouse", causes: ["Keyboard controller failure", "PS/2 port issue"] },
+  { code: "18", standard: "phoenix", phase: "EARLY", description: "Initialize video controller", causes: ["GPU not found", "GPU dead", "Bad PCIe slot"] },
+  { code: "1A", standard: "phoenix", phase: "MEM", description: "Early memory detection", causes: ["No RAM detected"] },
+  { code: "1C", standard: "phoenix", phase: "MEM", description: "Early shadow RAM", causes: [] },
+  { code: "24", standard: "phoenix", phase: "MEM", description: "Test first 64K RAM", causes: ["Base memory failure"] },
+  { code: "28", standard: "phoenix", phase: "MEM", description: "Test low 256K of system memory", causes: ["RAM failure in first 256K"] },
+  { code: "2C", standard: "phoenix", phase: "MEM", description: "Initialize BIOS ROM data area", causes: [] },
+  { code: "30", standard: "phoenix", phase: "MEM", description: "RAM test — DRAM pattern", causes: ["Defective DRAM modules"] },
+  { code: "33", standard: "phoenix", phase: "MEM", description: "Test system memory", causes: ["System memory test failed", "Bad RAM stick"] },
+  { code: "36", standard: "phoenix", phase: "PCI", description: "PCI bus initialization", causes: ["PCI bus failure", "Bad PCI/PCIe card"] },
+  { code: "38", standard: "phoenix", phase: "PCI", description: "Initialize PCI buses and devices", causes: [] },
+  { code: "3A", standard: "phoenix", phase: "PCI", description: "Initialize option ROMs", causes: ["Bad expansion card ROM"] },
+  { code: "3C", standard: "phoenix", phase: "PCI", description: "Detect and initialize serial/parallel ports", causes: [] },
+  { code: "40", standard: "phoenix", phase: "DEVICE", description: "Initialize hard drive controller", causes: ["IDE/SATA controller failure"] },
+  { code: "42", standard: "phoenix", phase: "DEVICE", description: "Detect hard drive", causes: ["HDD/SSD not detected", "SATA cable issue"] },
+  { code: "44", standard: "phoenix", phase: "DEVICE", description: "Initialize floppy drive controller", causes: [] },
+  { code: "46", standard: "phoenix", phase: "DEVICE", description: "Detect floppy drives", causes: [] },
+  { code: "4C", standard: "phoenix", phase: "DEVICE", description: "Display CPU/chipset setup screen", causes: [] },
+  { code: "4E", standard: "phoenix", phase: "DEVICE", description: "Display security/password options", causes: [] },
+  { code: "58", standard: "phoenix", phase: "DEVICE", description: "Test keyboard", causes: ["Keyboard not detected", "Keyboard controller failure"] },
+  { code: "5A", standard: "phoenix", phase: "DEVICE", description: "Set key click if enabled", causes: [] },
+  { code: "5C", standard: "phoenix", phase: "DEVICE", description: "Enable USB devices", causes: ["USB controller init failure"] },
+  { code: "60", standard: "phoenix", phase: "BOOT", description: "Set up boot devices", causes: ["Boot device enumeration failure"] },
+  { code: "62", standard: "phoenix", phase: "BOOT", description: "Test coprocessor if present", causes: [] },
+  { code: "64", standard: "phoenix", phase: "BOOT", description: "Enable NMI and setup timer", causes: [] },
+  { code: "66", standard: "phoenix", phase: "BOOT", description: "Ready for boot — call INT 19h", causes: [] },
+  { code: "FF", standard: "phoenix", phase: "BOOT", description: "System booted successfully", causes: [] },
+
+  // ═══════════════════════════════════════════════
+  // UEFI POST Codes (PI Spec progress codes)
+  // ═══════════════════════════════════════════════
+
+  // SEC phase
+  { code: "01", standard: "uefi", phase: "SEC", description: "SEC started — reset vector", causes: ["BIOS flash corrupt at reset vector"] },
+  { code: "02", standard: "uefi", phase: "SEC", description: "Pre-memory initialization started (CAR mode)", causes: ["Cache-as-RAM init failure", "CPU microcode issue"] },
+  { code: "03", standard: "uefi", phase: "SEC", description: "Pre-memory initialization (CPU early init)", causes: ["CPU init failure", "Incompatible CPU"] },
+  { code: "04", standard: "uefi", phase: "SEC", description: "Pre-memory initialization (chipset early init)", causes: ["PCH/chipset early init failure"] },
+  { code: "05", standard: "uefi", phase: "SEC", description: "Pre-memory initialization (board-specific)", causes: ["Board-specific firmware failure"] },
+  { code: "06", standard: "uefi", phase: "SEC", description: "CPU microcode loading", causes: ["Microcode not found for CPU", "Corrupt BIOS"] },
+
+  // PEI phase
+  { code: "10", standard: "uefi", phase: "PEI", description: "PEI Core entry point", causes: [] },
+  { code: "11", standard: "uefi", phase: "PEI", description: "PEI Core: PEIM dispatch", causes: ["BIOS PEI volume corrupt"] },
+  { code: "13", standard: "uefi", phase: "PEI", description: "Memory initialization started (MRC entry)", causes: ["Memory Reference Code init"] },
+  { code: "14", standard: "uefi", phase: "PEI", description: "Memory detection — SPD read", causes: ["Can't read DIMM SPD", "No RAM installed"] },
+  { code: "15", standard: "uefi", phase: "PEI", description: "Memory training started", causes: ["Memory training failure", "Incompatible RAM"] },
+  { code: "16", standard: "uefi", phase: "PEI", description: "Memory training — write leveling", causes: ["Write leveling failure", "Bad DIMM"] },
+  { code: "17", standard: "uefi", phase: "PEI", description: "Memory training — read leveling", causes: ["Read leveling failure", "Signal integrity issue"] },
+  { code: "18", standard: "uefi", phase: "PEI", description: "Memory training — command training", causes: ["Command/address training failure"] },
+  { code: "19", standard: "uefi", phase: "PEI", description: "Memory training complete", causes: [] },
+  { code: "1A", standard: "uefi", phase: "PEI", description: "Memory installed and tested", causes: [] },
+  { code: "1B", standard: "uefi", phase: "PEI", description: "MRC done — memory available", causes: [] },
+  { code: "20", standard: "uefi", phase: "PEI", description: "PCH initialization", causes: ["PCH init failure"] },
+  { code: "21", standard: "uefi", phase: "PEI", description: "PCH: USB initialization", causes: ["USB controller failure"] },
+  { code: "22", standard: "uefi", phase: "PEI", description: "PCH: SATA initialization", causes: ["SATA controller failure"] },
+  { code: "23", standard: "uefi", phase: "PEI", description: "PCH: ME (Management Engine) init", causes: ["Intel ME initialization failure", "ME firmware corrupt"] },
+  { code: "24", standard: "uefi", phase: "PEI", description: "CPU post-memory initialization", causes: [] },
+  { code: "25", standard: "uefi", phase: "PEI", description: "System Agent post-memory init", causes: [] },
+
+  // DXE phase
+  { code: "30", standard: "uefi", phase: "DXE", description: "DXE Core started", causes: [] },
+  { code: "31", standard: "uefi", phase: "DXE", description: "DXE Core: connect drivers", causes: ["DXE driver load failure"] },
+  { code: "32", standard: "uefi", phase: "DXE", description: "PCI host bridge init", causes: ["PCI bus init failure"] },
+  { code: "33", standard: "uefi", phase: "DXE", description: "PCI bus enumeration", causes: ["PCI device enumeration failure", "Bad PCIe card"] },
+  { code: "34", standard: "uefi", phase: "DXE", description: "PCI resource allocation", causes: ["PCI resource allocation failure", "Out of PCI address space"] },
+  { code: "35", standard: "uefi", phase: "DXE", description: "Console output initialized (GOP)", causes: ["GPU driver failure", "No display output"] },
+  { code: "36", standard: "uefi", phase: "DXE", description: "Console input initialized (keyboard)", causes: ["Keyboard controller failure"] },
+  { code: "37", standard: "uefi", phase: "DXE", description: "ACPI table installation", causes: ["ACPI table corrupt or missing"] },
+  { code: "38", standard: "uefi", phase: "DXE", description: "USB initialization", causes: ["USB controller failure"] },
+  { code: "39", standard: "uefi", phase: "DXE", description: "SATA/NVMe initialization", causes: ["Storage controller failure"] },
+  { code: "3A", standard: "uefi", phase: "DXE", description: "Network initialization", causes: ["NIC/LAN controller failure"] },
+  { code: "3B", standard: "uefi", phase: "DXE", description: "NVRAM initialization", causes: ["NVRAM corrupt", "CMOS battery dead"] },
+  { code: "3C", standard: "uefi", phase: "DXE", description: "BDS (Boot Device Selection) started", causes: [] },
+  { code: "3D", standard: "uefi", phase: "DXE", description: "BDS: connect boot devices", causes: ["Boot device connection failure"] },
+  { code: "3E", standard: "uefi", phase: "DXE", description: "BDS: load boot option", causes: ["Boot loader not found", "OS missing"] },
+
+  // Boot phase
+  { code: "40", standard: "uefi", phase: "BOOT", description: "OS hand-off — ExitBootServices called", causes: [] },
+  { code: "41", standard: "uefi", phase: "BOOT", description: "Runtime services set virtual address map", causes: [] },
+  { code: "42", standard: "uefi", phase: "BOOT", description: "OS loader running", causes: [] },
+
+  // Error codes (PI Spec)
+  { code: "50", standard: "uefi", phase: "ERROR", description: "Memory not installed", causes: ["No RAM detected", "All DIMMs dead", "CPU memory controller failure"] },
+  { code: "51", standard: "uefi", phase: "ERROR", description: "Memory not configured/compatible", causes: ["Incompatible RAM", "Mixed RAM types", "Wrong DDR generation"] },
+  { code: "52", standard: "uefi", phase: "ERROR", description: "Memory not usable", causes: ["All RAM failed testing", "Defective DIMMs"] },
+  { code: "53", standard: "uefi", phase: "ERROR", description: "Other memory error", causes: ["Unspecified memory error", "Try one DIMM at a time"] },
+  { code: "54", standard: "uefi", phase: "ERROR", description: "Memory test failed", causes: ["Defective DIMM(s)", "Bad DIMM slot"] },
+  { code: "55", standard: "uefi", phase: "ERROR", description: "Memory not installed — no SPD detected", causes: ["RAM not seated", "Dead DIMM slot", "Broken SPD EEPROM"] },
+  { code: "56", standard: "uefi", phase: "ERROR", description: "Incompatible memory speed", causes: ["RAM speed not supported by CPU/board"] },
+  { code: "5A", standard: "uefi", phase: "ERROR", description: "No console output device found", causes: ["No GPU installed", "GPU dead", "Bad PCIe x16 slot"] },
+  { code: "5B", standard: "uefi", phase: "ERROR", description: "No console input device found", causes: ["No keyboard detected", "USB controller failure"] },
+  { code: "5C", standard: "uefi", phase: "ERROR", description: "No boot device available", causes: ["No bootable drive", "SATA/NVMe not detected", "Boot order wrong"] },
+  { code: "5D", standard: "uefi", phase: "ERROR", description: "Boot option failed", causes: ["OS boot loader corrupt", "Disk failure"] },
+  { code: "B0", standard: "uefi", phase: "ERROR", description: "Recovery condition triggered", causes: ["Firmware update failed", "BIOS corruption detected"] },
+  { code: "B2", standard: "uefi", phase: "ERROR", description: "Recovery firmware loaded", causes: [] },
+];
+
+const PHASE_DESCRIPTIONS: Record<string, string> = {
+  "SEC": "Security Phase — first code executed from flash. CPU cache-as-RAM mode, no main memory yet.",
+  "PEI": "Pre-EFI Initialization — memory training, chipset config. Board is waking up but has no display.",
+  "MEM_INIT": "Memory Initialization — DRAM detection, timing configuration, and testing.",
+  "DXE": "Driver Execution Environment — PCI enumeration, device drivers, console output, ACPI.",
+  "BDS": "Boot Device Selection — finding and loading the OS boot loader.",
+  "BOOT": "Boot Phase — OS hand-off, option ROMs, boot device preparation.",
+  "EARLY": "Early initialization — CPU and chipset basic setup before memory.",
+  "INIT": "System initialization — testing core hardware components.",
+  "MEM": "Memory testing — RAM detection, sizing, and pattern verification.",
+  "PCI": "PCI initialization — bus enumeration and device setup.",
+  "DEVICE": "Device initialization — storage, keyboard, USB, and peripheral setup.",
+  "ERROR": "Error condition — something failed. Check causes.",
+};
+
+export function getPhaseDescription(phase: string): string {
+  return PHASE_DESCRIPTIONS[phase.toUpperCase()] || `POST phase: ${phase}`;
+}
+
+export function lookupPostCode(code: string, standard?: PostStandard): PostCode[] {
+  const normalized = code.replace(/^0x/i, "").toUpperCase().padStart(2, "0");
+  return POST_CODES.filter(
+    (p) =>
+      p.code.toUpperCase() === normalized &&
+      (!standard || p.standard === standard),
+  );
+}
+
+export function searchPostCodes(query: string): PostCode[] {
+  const q = query.toLowerCase();
+  return POST_CODES.filter(
+    (p) =>
+      p.description.toLowerCase().includes(q) ||
+      p.phase.toLowerCase().includes(q) ||
+      p.causes.some((c) => c.toLowerCase().includes(q)),
+  );
+}

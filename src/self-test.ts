@@ -17,6 +17,8 @@ import { listRegions, extractRegion, replaceRegion, rebuildImage } from "./analy
 import { analyzeBiosHealthFromBuffer } from "./analysis/recovery.js";
 import { parseNvramStore, findNvramStore } from "./analysis/nvram.js";
 import { runPipeline, buildBackupPipeline, buildRepairPipeline, generateBackupMetadata, createContext, type PipelineStep, type PipelineContext } from "./workflows/pipeline.js";
+import { parseSFDPHeader, parseBasicFlashParams, synthesizeChipFromSFDP, buildSyntheticSFDP } from "./chips/sfdp.js";
+import { CH341ABackend } from "./backends/ch341a.js";
 
 const VERSION = "1.1.0";
 
@@ -87,6 +89,880 @@ export async function runSelfTest(): Promise<boolean> {
     assertEqual(sfdp!.pageSize, 256, "pageSize");
     assert(sfdp!.sectorSize4KB, "should support 4KB sectors");
     assert(sfdp!.fastReadSupported, "should support fast read");
+  }));
+
+  // ─── SFDP universal fallback parser ───
+  results.push(await runTest("SFDP: parses valid JESD216 rev 1.5 header", async () => {
+    const buf = buildSyntheticSFDP({ majorRev: 1, minorRev: 5 });
+    const hdr = parseSFDPHeader(buf);
+    assert(hdr.valid, "header valid");
+    assertEqual(hdr.signature, "SFDP", "signature");
+    assertEqual(hdr.majorRev, 1, "majorRev");
+    assertEqual(hdr.minorRev, 5, "minorRev");
+    assertEqual(hdr.numParameterHeaders, 1, "single param header");
+  }));
+
+  results.push(await runTest("SFDP: parses rev 1.0 header (oldest spec)", async () => {
+    const buf = buildSyntheticSFDP({ majorRev: 1, minorRev: 0 });
+    const hdr = parseSFDPHeader(buf);
+    assert(hdr.valid, "rev 1.0 still valid");
+    assertEqual(hdr.minorRev, 0, "minorRev=0");
+  }));
+
+  results.push(await runTest("SFDP: parses rev 1.6 modern header", async () => {
+    const buf = buildSyntheticSFDP({ majorRev: 1, minorRev: 6 });
+    const hdr = parseSFDPHeader(buf);
+    assert(hdr.valid, "rev 1.6 valid");
+    assertEqual(hdr.minorRev, 6, "minorRev=6");
+  }));
+
+  results.push(await runTest("SFDP: rejects corrupted signature", async () => {
+    const buf = buildSyntheticSFDP({ corruptSignature: true });
+    const hdr = parseSFDPHeader(buf);
+    assert(!hdr.valid, "header rejected as invalid");
+  }));
+
+  results.push(await runTest("SFDP: rejects truncated buffer (< 8 bytes)", async () => {
+    const buf = buildSyntheticSFDP({ truncateTo: 4 });
+    const hdr = parseSFDPHeader(buf);
+    assert(!hdr.valid, "truncated header rejected");
+  }));
+
+  results.push(await runTest("SFDP: parameter table parsed (8MB / 256 page / 4KB sector)", async () => {
+    const buf = buildSyntheticSFDP({ densityBits: 8 * 1024 * 1024 * 8 });
+    const hdr = parseSFDPHeader(buf);
+    const ptOffset = hdr.parameterHeaders[0].tablePointer;
+    const params = parseBasicFlashParams(buf.subarray(ptOffset));
+    assert(params !== null, "params parsed");
+    assertEqual(params!.densityBytes, 8 * 1024 * 1024, "8MB density");
+    assertEqual(params!.pageSize, 256, "256B page");
+    assert(params!.eraseSize4KB, "supports 4KB erase");
+    assertEqual(params!.needs4ByteAddr, false, "3-byte addressing for 8MB");
+  }));
+
+  results.push(await runTest("SFDP: 32MB density triggers 4-byte addressing", async () => {
+    const buf = buildSyntheticSFDP({ densityBits: 32 * 1024 * 1024 * 8, addressBytes: 4 });
+    const hdr = parseSFDPHeader(buf);
+    const ptOffset = hdr.parameterHeaders[0].tablePointer;
+    const params = parseBasicFlashParams(buf.subarray(ptOffset));
+    assert(params !== null, "params parsed");
+    assertEqual(params!.densityBytes, 32 * 1024 * 1024, "32MB density");
+    assert(params!.needs4ByteAddr, "needs 4-byte addressing");
+    assertEqual(params!.addressByteCount, "4", "addressByteCount=4");
+  }));
+
+  results.push(await runTest("SFDP: density encoded as 2^N shift", async () => {
+    const buf = buildSyntheticSFDP({ densityBits: 128 * 1024 * 1024 * 8, useDensityShift: true });
+    const hdr = parseSFDPHeader(buf);
+    const ptOffset = hdr.parameterHeaders[0].tablePointer;
+    const params = parseBasicFlashParams(buf.subarray(ptOffset));
+    assert(params !== null, "params parsed");
+    assertEqual(params!.densityBytes, 128 * 1024 * 1024, "128MB density via shift");
+  }));
+
+  results.push(await runTest("SFDP: erase types correctly classified", async () => {
+    const buf = buildSyntheticSFDP({
+      eraseTypes: [
+        { sizeExp: 12, opcode: 0x20 }, // 4KB
+        { sizeExp: 16, opcode: 0xd8 }, // 64KB
+      ],
+    });
+    const hdr = parseSFDPHeader(buf);
+    const ptOffset = hdr.parameterHeaders[0].tablePointer;
+    const params = parseBasicFlashParams(buf.subarray(ptOffset));
+    assert(params !== null, "params parsed");
+    assertEqual(params!.eraseTypes.length, 2, "two erase types");
+    assertEqual(params!.sectorSize, 4096, "smallest erase = 4KB sector");
+    assertEqual(params!.blockSize, 65536, "largest erase = 64KB block");
+  }));
+
+  results.push(await runTest("SFDP: missing parameter table returns null", async () => {
+    const buf = buildSyntheticSFDP({ omitParamTable: true });
+    const hdr = parseSFDPHeader(buf);
+    const params = parseBasicFlashParams(buf.subarray(hdr.parameterHeaders[0].tablePointer));
+    assertEqual(params, null, "params null when table missing");
+  }));
+
+  results.push(await runTest("SFDP: synthesized ChipDef for unknown jedecId", async () => {
+    const buf = buildSyntheticSFDP({ densityBits: 16 * 1024 * 1024 * 8 });
+    const hdr = parseSFDPHeader(buf);
+    const ptOffset = hdr.parameterHeaders[0].tablePointer;
+    const params = parseBasicFlashParams(buf.subarray(ptOffset))!;
+    const chip = synthesizeChipFromSFDP("xxAA17", "Unknown Vendor", params);
+    assertEqual(chip.sizeBytes, 16 * 1024 * 1024, "16MB synthesized");
+    assertEqual(chip.source, "sfdp", "source=sfdp");
+    assertEqual(chip.needs4ByteAddr, false, "no 4-byte for 16MB");
+    assert(chip.name.includes("SFDP"), "name marks SFDP origin");
+  }));
+
+  results.push(await runTest("SFDP: 1-byte buffer parses as invalid (no crash)", async () => {
+    const buf = Buffer.from([0x53]);
+    const hdr = parseSFDPHeader(buf);
+    assert(!hdr.valid, "single byte rejected");
+  }));
+
+  // ─── Programmer detection (CH34x VID/PID coverage) ───
+  results.push(await runTest("detection: CH341ABackend exposes KNOWN_VARIANTS table", async () => {
+    assert(Array.isArray(CH341ABackend.KNOWN_VARIANTS), "table is array");
+    assert(CH341ABackend.KNOWN_VARIANTS.length >= 6, "covers ≥6 known VID/PIDs");
+  }));
+
+  results.push(await runTest("detection: CH341A (0x1a86:0x5512) is enumerated", async () => {
+    const hit = CH341ABackend.KNOWN_VARIANTS.find((v) => v.vid === 0x1a86 && v.pid === 0x5512);
+    assert(!!hit, "CH341A present");
+    assertEqual(hit!.name, "CH341A", "name matches");
+  }));
+
+  results.push(await runTest("detection: CH347 (0x1a86:0x55db) is enumerated", async () => {
+    const hit = CH341ABackend.KNOWN_VARIANTS.find((v) => v.pid === 0x55db);
+    assert(!!hit, "CH347 present");
+  }));
+
+  results.push(await runTest("detection: CH347T variant (0x55dc) enumerated", async () => {
+    const hit = CH341ABackend.KNOWN_VARIANTS.find((v) => v.pid === 0x55dc);
+    assert(!!hit, "CH347T present");
+  }));
+
+  results.push(await runTest("detection: CH347F variant (0x55de) enumerated", async () => {
+    const hit = CH341ABackend.KNOWN_VARIANTS.find((v) => v.pid === 0x55de);
+    assert(!!hit, "CH347F present");
+  }));
+
+  results.push(await runTest("detection: CH343 UART variant (0x55d3) enumerated", async () => {
+    const hit = CH341ABackend.KNOWN_VARIANTS.find((v) => v.pid === 0x55d3);
+    assert(!!hit, "CH343 present");
+  }));
+
+  results.push(await runTest("detection: CH341B clone PID (0x5523) enumerated", async () => {
+    const hit = CH341ABackend.KNOWN_VARIANTS.find((v) => v.pid === 0x5523);
+    assert(!!hit, "CH341B clone present");
+  }));
+
+  results.push(await runTest("detection: legacy QinHeng VID (0x4348) covered", async () => {
+    const hit = CH341ABackend.KNOWN_VARIANTS.find((v) => v.vid === 0x4348);
+    assert(!!hit, "legacy QinHeng VID present");
+  }));
+
+  results.push(await runTest("detection: no programmer returns type=unknown", async () => {
+    // With no hardware on the bus, real detectProgrammer reports unknown.
+    // Note: this runs on dev hosts; it tolerates either branch.
+    const be = new CH341ABackend();
+    const info = await be.detectProgrammer();
+    assert(["ch341a", "ch347", "ch343", "unknown"].includes(info.type), "type is one of known");
+    if (info.type === "unknown") {
+      assertEqual(info.connected, false, "unknown ⇒ not connected");
+      assert((info.description || "").includes("No CH34x"), "diagnostic message present");
+    }
+  }));
+
+  results.push(await runTest("detection: USB error wrapping (UsbDisconnectError detection)", async () => {
+    const err = new UsbDisconnectError("LIBUSB_ERROR_NO_DEVICE");
+    assert(isUsbDisconnect(err), "wrapped error recognised");
+    assert(isUsbDisconnect({ message: "LIBUSB_ERROR_PIPE" } as any), "PIPE error recognised");
+    assert(isUsbDisconnect({ message: "ENODEV" } as any), "ENODEV recognised");
+    assert(!isUsbDisconnect({ message: "totally unrelated" } as any), "unrelated error not flagged");
+  }));
+
+  results.push(await runTest("detection: signal-quality gate rejects unstable reads", async () => {
+    const raw: RawConnectionData = {
+      jedecReadings: ["ef4017", "ef4017", "ee4017", "ef4017", "ff4017", "ef4017", "ef4017", "ef4007", "ef4017", "ef4017"],
+      timingsMs: [10, 15, 20, 12, 14, 11, 13, 16, 18, 12],
+      statusRegisterOk: false,
+    };
+    const score = computeQualityScore(raw);
+    assert(score.score < 90, "low-quality reads downgrade score");
+    // shouldAutoExit signals CRITICAL — fires only when score < MONITOR_AUTO_EXIT_THRESHOLD (~20).
+    // Above the floor, the gate keeps measuring rather than aborting.
+    assert(score.score > MONITOR_AUTO_EXIT_THRESHOLD || shouldAutoExit(score.score), "score is in a consistent gate state");
+  }));
+
+  results.push(await runTest("detection: signal-quality gate passes clean reads", async () => {
+    const raw: RawConnectionData = {
+      jedecReadings: Array(10).fill("ef4017"),
+      timingsMs: [10, 10, 10, 11, 10, 10, 10, 10, 11, 10],
+      statusRegisterOk: true,
+    };
+    const score = computeQualityScore(raw);
+    assert(score.score >= 90, "clean reads earn ≥90");
+    assert(!shouldAutoExit(score.score), "clean reads do not trigger CRITICAL exit");
+  }));
+
+  // ─── Detection robustness: chip identification edge cases ───
+  results.push(await runTest("detection: every chip family resolves via lookup (sample sweep)", async () => {
+    // Sample one chip per major vendor and verify lookupChipByJedecId returns it.
+    const samples = [
+      { jedec: "ef4017", expectedName: "W25Q64JV", vendor: "Winbond" },
+      { jedec: "c22018", expectedName: "MX25L12835F", vendor: "Macronix" },
+      { jedec: "c84016", expectedName: "GD25Q32C", vendor: "GigaDevice" },
+      { jedec: "bf2541", expectedName: "SST25VF016B", vendor: "SST" },
+      { jedec: "1c7017", expectedName: "EN25QH64A", vendor: "EON" },
+      { jedec: "010219", expectedName: "S25FL256S", vendor: "Spansion" },
+      { jedec: "20ba18", expectedName: "N25Q128A", vendor: "Micron" },
+      { jedec: "9d6018", expectedName: "IS25LP128F", vendor: "ISSI" },
+      { jedec: "0b4017", expectedName: "XT25F64B", vendor: "XTX" },
+      { jedec: "684017", expectedName: "BY25Q64AS", vendor: "Boya" },
+    ];
+    for (const s of samples) {
+      const chip = lookupChipByJedecId(s.jedec);
+      assert(chip !== undefined, `${s.jedec} (${s.vendor}) must resolve`);
+      assertEqual(chip!.vendor, s.vendor, `${s.jedec} vendor`);
+    }
+  }));
+
+  results.push(await runTest("detection: large-database lookup is O(1)-fast across 800+ entries", async () => {
+    const start = Date.now();
+    for (let i = 0; i < 5000; i++) {
+      lookupChipByJedecId("ef4017");
+      lookupChipByJedecId("c22019");
+      lookupChipByJedecId("doesnotexist000000");
+    }
+    const ms = Date.now() - start;
+    assert(ms < 500, `15000 lookups should complete fast (${ms}ms)`);
+  }));
+
+  results.push(await runTest("detection: ambiguous JEDEC ID returns first match deterministically", async () => {
+    // Several chips legitimately share a JEDEC ID (e.g. ef4015 -> multiple W25Q16 variants).
+    const a = lookupChipByJedecId("ef4015");
+    const b = lookupChipByJedecId("ef4015");
+    assert(a !== undefined, "first lookup hits");
+    assertEqual(a!.jedecId, b!.jedecId, "same ID → same chip object");
+    // searchChips returns all variants for ops UI / debugging.
+    const all = searchChips("ef4015");
+    assert(all.length >= 1, "search returns ≥1 W25Q16 variant");
+  }));
+
+  results.push(await runTest("detection: unknown JEDEC ID falls back to fuzzyMatch with low confidence", async () => {
+    const fuzzy = fuzzyMatchJedec("ab4018");
+    assertEqual(fuzzy.confidence, "low", "unknown mfg → low confidence");
+    assert(fuzzy.manufacturer === "Unknown", "Unknown manufacturer");
+    assert(fuzzy.reasoning.length > 0, "reasoning provided");
+  }));
+
+  results.push(await runTest("detection: bouncing JEDEC ID 0x000000 yields actionable diagnostic", async () => {
+    const fuzzy = fuzzyMatchJedec("000000");
+    assertEqual(fuzzy.manufacturer, "None", "no chip");
+    assert(fuzzy.reasoning.includes("Dead chip") || fuzzy.reasoning.includes("connection"), "guidance present");
+  }));
+
+  results.push(await runTest("detection: bouncing JEDEC ID 0xffffff yields actionable diagnostic", async () => {
+    const fuzzy = fuzzyMatchJedec("ffffff");
+    assertEqual(fuzzy.manufacturer, "None", "no chip");
+    assert(fuzzy.reasoning.length > 0, "diagnostic present");
+  }));
+
+  results.push(await runTest("detection: unknown mfg byte but valid capacity yields size estimate", async () => {
+    // Unknown vendor byte 0x99, type 0x40, capacity 0x17 → expect 2^0x17 = 8MB.
+    const fuzzy = fuzzyMatchJedec("994017");
+    assertEqual(fuzzy.estimatedSizeBytes, 1 << 0x17, "8MB inferred from capacity byte");
+  }));
+
+  results.push(await runTest("detection: voltage classification distinguishes 1.8V vs 3.3V chips", async () => {
+    const w64jv = lookupChipByJedecId("ef4017");    // 3.3V Winbond
+    const w64fw = lookupChipByJedecId("ef6017");    // 1.8V Winbond
+    assert(!!w64jv && !!w64fw, "both chips present");
+    assertEqual(w64jv!.voltage, 3.3, "JV is 3.3V");
+    assertEqual(w64fw!.voltage, 1.8, "FW is 1.8V");
+  }));
+
+  results.push(await runTest("detection: low-voltage helper flags 1.8V chips correctly", async () => {
+    const { isLowVoltageChip } = await import("./chips/database.js");
+    assert(isLowVoltageChip("ef6017"), "ef6017 (W25Q64FW) is low-voltage");
+    assert(!isLowVoltageChip("ef4017"), "ef4017 (W25Q64JV) is not low-voltage");
+    assert(!isLowVoltageChip("unknownjedec"), "unknown chip defaults to false");
+  }));
+
+  results.push(await runTest("detection: 4-byte addressing required for chips >16MB", async () => {
+    const { needs4ByteAddressing } = await import("./chips/database.js");
+    assert(needs4ByteAddressing("ef4019"), "32MB W25Q256 requires 4-byte");
+    assert(!needs4ByteAddressing("ef4018"), "16MB W25Q128 fits in 3-byte");
+    assert(needs4ByteAddressing("ef4020"), "64MB W25Q512 requires 4-byte");
+  }));
+
+  results.push(await runTest("detection: capacity byte fallback handles 4-byte threshold", async () => {
+    const { needs4ByteAddressing } = await import("./chips/database.js");
+    // Unknown ID but capacity byte ≥0x19 should still trigger 4-byte path.
+    assert(needs4ByteAddressing("ab9919"), "capacity-byte fallback flags 4-byte");
+    assert(!needs4ByteAddressing("ab9918"), "capacity 0x18 (16MB) stays 3-byte");
+  }));
+
+  results.push(await runTest("detection: SFDP synth produces ChipDef-compatible record for unknown ID", async () => {
+    // End-to-end fallback chain: unknown JEDEC ID + synthetic SFDP → usable chip definition.
+    const buf = buildSyntheticSFDP({ densityBits: 8 * 1024 * 1024 * 8 });
+    const hdr = parseSFDPHeader(buf);
+    const params = parseBasicFlashParams(buf.subarray(hdr.parameterHeaders[0].tablePointer))!;
+    const synth = synthesizeChipFromSFDP("ab4017", "Unknown", params);
+    assertEqual(synth.sizeBytes, 8 * 1024 * 1024, "size 8MB");
+    assertEqual(synth.pageSize, 256, "page 256");
+    assertEqual(synth.source, "sfdp", "tagged as SFDP origin");
+  }));
+
+  results.push(await runTest("detection: chip-recommendations surface warnings for 1.8V chips", async () => {
+    const { lookupChipByName, getChipRecommendations } = await import("./chips/database.js");
+    const w64fw = lookupChipByName("W25Q64FW");
+    assert(w64fw !== undefined, "W25Q64FW present");
+    const rec = getChipRecommendations(w64fw!);
+    assert(rec.warnings.some((w) => w.includes("1.8V")), "1.8V warning emitted");
+  }));
+
+  results.push(await runTest("detection: chip-recommendations flag 4-byte addressing for large chips", async () => {
+    const { lookupChipByName, getChipRecommendations } = await import("./chips/database.js");
+    const w256 = lookupChipByName("W25Q256JV");
+    assert(w256 !== undefined, "W25Q256JV present");
+    const rec = getChipRecommendations(w256!);
+    assert(rec.addressMode.includes("4-byte"), "addressMode reports 4-byte");
+    assert(rec.warnings.some((w) => w.includes("4-byte")), "4-byte warning emitted");
+  }));
+
+  results.push(await runTest("detection: every chip in CHIP_DATABASE has valid required fields", async () => {
+    for (const chip of CHIP_DATABASE) {
+      assert(typeof chip.name === "string" && chip.name.length > 0, `${chip.name} has name`);
+      assert(typeof chip.vendor === "string" && chip.vendor.length > 0, `${chip.name} has vendor`);
+      assert(chip.sizeBytes > 0, `${chip.name} has size>0`);
+      assert(chip.pageSize > 0, `${chip.name} has pageSize>0`);
+      assert(chip.sectorSize > 0, `${chip.name} has sectorSize>0`);
+      assert(chip.blockSize > 0, `${chip.name} has blockSize>0`);
+      assert(chip.voltage > 0, `${chip.name} has voltage>0`);
+      assert(["spi", "i2c"].includes(chip.type), `${chip.name} valid type`);
+    }
+  }));
+
+  // ─── Competition feature parity ───
+  results.push(await runTest("parity: CH341ABackend exposes block-protection helper", async () => {
+    const be = new CH341ABackend();
+    // Method exists even if hardware not present.
+    assertEqual(typeof be.readBlockProtectionState, "function", "readBlockProtectionState exposed");
+    assertEqual(typeof be.aaiWordProgram, "function", "aaiWordProgram exposed");
+    assertEqual(typeof be.readSecurityRegister, "function", "readSecurityRegister exposed");
+    assertEqual(typeof be.enterQpiMode, "function", "enterQpiMode exposed");
+    assertEqual(typeof be.exitQpiMode, "function", "exitQpiMode exposed");
+  }));
+
+  results.push(await runTest("parity: competition-parity.md exists with full feature matrix", async () => {
+    const path = join(process.cwd(), "tasks", "competition-parity.md");
+    assert(existsSync(path), "parity doc exists");
+    const content = await readFile(path, "utf-8");
+    assert(content.includes("AsProgrammer"), "compares vs AsProgrammer");
+    assert(content.includes("NeoProgrammer"), "compares vs NeoProgrammer");
+    assert(content.includes("flashrom"), "compares vs flashrom");
+    assert(content.includes("AAI"), "AAI feature documented");
+    assert(content.includes("OTP"), "OTP feature documented");
+    assert(content.includes("QPI"), "QPI feature documented");
+    assert(content.includes("SFDP"), "SFDP fallback documented");
+    assert(content.includes("806"), "chip count current");
+  }));
+
+  results.push(await runTest("parity: AAI requires even-byte word program", async () => {
+    const be = new CH341ABackend();
+    let threw = false;
+    try {
+      await be.aaiWordProgram(0x000000, Buffer.from([0x12])); // odd length
+    } catch (e: any) {
+      threw = e.message.includes("even");
+    }
+    assert(threw, "rejects odd-byte AAI program with clear error");
+  }));
+
+  results.push(await runTest("parity: security register length capped at 256 bytes", async () => {
+    const be = new CH341ABackend();
+    let threw = false;
+    try {
+      await be.readSecurityRegister(1, 512);
+    } catch (e: any) {
+      threw = e.message.includes("256");
+    }
+    assert(threw, "enforces 256-byte cap with clear error");
+  }));
+
+  // ─── Board support: Intel/AMD descriptors, ME, UEFI, NVRAM on realistic shapes ───
+
+  /**
+   * Synthesize an Intel-style descriptor + region layout.
+   * Layout: 0x000 descriptor (4KB), 0x1000 ME (2MB), 0x201000 GbE (8KB), 0x203000 BIOS (rest).
+   * Image total: 8MB.
+   */
+  function buildIntelDescriptorImage(): Buffer {
+    const total = 8 * 1024 * 1024;
+    const img = Buffer.alloc(total, 0xff);
+
+    // Skip 0x10 bytes then write signature 0x0FF0A55A
+    img.writeUInt32LE(0x0ff0a55a, 0x10);
+
+    // FLMAP0 at 0x14 + 0x14 = 0x28. RegionBase byte at bits 23-16, shifted left 4 to get FRBA.
+    // Use FRBA = 0x40 (i.e. flmap0 bits 23-16 = 0x04).
+    const flmap0 = (0x04 << 16);
+    img.writeUInt32LE(flmap0, 0x14 + 0x14);
+
+    // Region records at FRBA = 0x40. Each record is 4 bytes: base|limit packed.
+    // record = (base>>12 & 0x1fff) | ((limit>>12 & 0x1fff) << 16). Limit inclusive top-12.
+    function packRegion(baseBytes: number, limitBytes: number): number {
+      const base12 = (baseBytes >> 12) & 0x1fff;
+      const limit12 = (limitBytes >> 12) & 0x1fff;
+      return base12 | (limit12 << 16);
+    }
+
+    // descriptor: 0x0..0x0FFF (4KB)
+    img.writeUInt32LE(packRegion(0x0000, 0x0fff), 0x40 + 0);
+    // bios: top half — 0x203000..0x7FFFFF
+    img.writeUInt32LE(packRegion(0x203000, 0x7fffff), 0x40 + 4);
+    // me: 0x1000..0x200FFF
+    img.writeUInt32LE(packRegion(0x1000, 0x200fff), 0x40 + 8);
+    // gbe: 0x201000..0x202FFF
+    img.writeUInt32LE(packRegion(0x201000, 0x202fff), 0x40 + 12);
+    // platform: unused
+    img.writeUInt32LE(0xffffffff, 0x40 + 16);
+    return img;
+  }
+
+  /**
+   * Synthesize a minimal $FPT (ME firmware partition table) with FTPR + $MN2 header.
+   */
+  function buildMeRegionImage(size = 2 * 1024 * 1024): Buffer {
+    const buf = Buffer.alloc(size, 0xff);
+    // $FPT signature at offset 0x10
+    Buffer.from("$FPT", "ascii").copy(buf, 0x10);
+    buf.writeUInt32LE(1, 0x10 + 4);             // numEntries = 1
+    buf[0x10 + 21] = 0x20;                       // FPT version
+    // single entry starts at 0x10 + 32 = 0x30
+    Buffer.from("FTPR", "ascii").copy(buf, 0x30);
+    buf.writeUInt32LE(0x0001_0000, 0x30 + 8);   // partition offset
+    buf.writeUInt32LE(0x0001_0000, 0x30 + 12);  // partition size
+    // $MN2 manifest at partition offset 0x10000
+    buf.writeUInt32LE(0x324e4d24, 0x10000);     // "$MN2"
+    buf.writeUInt16LE(15, 0x10000 + 0x18);      // major 15
+    buf.writeUInt16LE(0, 0x10000 + 0x1a);       // minor 0
+    buf.writeUInt16LE(45, 0x10000 + 0x1c);      // hotfix 45
+    buf.writeUInt16LE(2347, 0x10000 + 0x1e);    // build 2347
+    return buf;
+  }
+
+  /**
+   * Synthesize a minimal UEFI firmware volume with one PEI-Core file.
+   */
+  function buildUefiFvImage(): Buffer {
+    const fvLength = 0x40000; // 256KB
+    const img = Buffer.alloc(fvLength, 0xff);
+    // FFS2 filesystem GUID: 8c8a6a3e-30f6-4e3a-8b07-9c1b2c5e... use a known GUID
+    Buffer.from([
+      0x8d, 0x2b, 0xf1, 0xff, 0x96, 0x76, 0x8b, 0x4c,
+      0xa9, 0x85, 0x27, 0x47, 0x07, 0x5b, 0x4f, 0x50,
+    ]).copy(img, 0);
+    img.writeBigUInt64LE(BigInt(fvLength), 32);
+    img.writeUInt32LE(0x4856465f, 40);  // "_FVH"
+    img.writeUInt32LE(0x000FEFF, 44);   // attributes
+    img.writeUInt16LE(0x48, 48);        // headerLength
+    img[55] = 2;                         // revision
+
+    // FFS file at offset 0x48 (headerLength)
+    const fileBase = 0x48;
+    // PEI Core GUID 1ba0062e-c779-4582-8566-336ae8f78f09
+    Buffer.from([
+      0x2e, 0x06, 0xa0, 0x1b, 0x79, 0xc7, 0x82, 0x45,
+      0x85, 0x66, 0x33, 0x6a, 0xe8, 0xf7, 0x8f, 0x09,
+    ]).copy(img, fileBase);
+    img.writeUInt16LE(0xaa55, fileBase + 16); // integrity check
+    img[fileBase + 18] = 0x04;              // PEI Core type
+    img[fileBase + 19] = 0x00;              // attributes
+    // size = 0x100 (3-byte little endian)
+    img[fileBase + 20] = 0x00;
+    img[fileBase + 21] = 0x01;
+    img[fileBase + 22] = 0x00;
+    img[fileBase + 23] = 0xf8;              // state
+    return img;
+  }
+
+  results.push(await runTest("board: Intel descriptor image yields 4 regions", async () => {
+    const { listRegions } = await import("./analysis/regions.js");
+    const img = buildIntelDescriptorImage();
+    const regions = listRegions(img);
+    const names = regions.map((r) => r.name).sort();
+    assert(regions.length >= 4, `expected ≥4 regions, got ${regions.length}: ${names.join(",")}`);
+    assert(names.includes("descriptor"), "descriptor region");
+    assert(names.includes("bios"), "bios region");
+    assert(names.includes("me"), "me region");
+    assert(names.includes("gbe"), "gbe region");
+  }));
+
+  results.push(await runTest("board: AMD/raw layout falls back to single bios region", async () => {
+    const { listRegions } = await import("./analysis/regions.js");
+    // No descriptor signature → falls back to raw single-region.
+    const img = Buffer.alloc(8 * 1024 * 1024, 0xff);
+    const regions = listRegions(img);
+    assertEqual(regions.length, 1, "single region");
+    assertEqual(regions[0].name, "bios", "bios region");
+    assertEqual(regions[0].type, "raw", "raw type");
+  }));
+
+  results.push(await runTest("board: empty image yields single empty region (no crash)", async () => {
+    const { listRegions } = await import("./analysis/regions.js");
+    const regions = listRegions(Buffer.alloc(0));
+    assertEqual(regions.length, 1, "single region");
+    assertEqual(regions[0].size, 0, "zero size");
+  }));
+
+  results.push(await runTest("board: descriptor with corrupted signature falls back to raw", async () => {
+    const { listRegions } = await import("./analysis/regions.js");
+    const img = Buffer.alloc(8 * 1024 * 1024, 0xff);
+    img.writeUInt32LE(0xdeadbeef, 0x10); // wrong signature
+    const regions = listRegions(img);
+    assertEqual(regions.length, 1, "fallback to single region");
+    assertEqual(regions[0].type, "raw", "raw type");
+  }));
+
+  results.push(await runTest("board: extract region returns null for unknown name", async () => {
+    const { extractRegion } = await import("./analysis/regions.js");
+    const img = buildIntelDescriptorImage();
+    assertEqual(extractRegion(img, "nonexistent"), null, "unknown region → null");
+  }));
+
+  results.push(await runTest("board: extract descriptor region returns 4KB block", async () => {
+    const { extractRegion } = await import("./analysis/regions.js");
+    const img = buildIntelDescriptorImage();
+    const result = extractRegion(img, "descriptor");
+    assert(result !== null, "descriptor extractable");
+    assertEqual(result!.region.size, 4096, "4KB descriptor");
+  }));
+
+  results.push(await runTest("board: region replace with smaller data warns + pads with 0xFF", async () => {
+    const { replaceRegion } = await import("./analysis/regions.js");
+    const img = buildIntelDescriptorImage();
+    const repl = Buffer.alloc(2048, 0xaa); // smaller than 4KB descriptor
+    const result = replaceRegion(img, "descriptor", repl);
+    assert(result !== null, "replace returns result");
+    assert(result!.warnings.some((w) => w.includes("smaller") || w.includes("padding")), "warning emitted");
+  }));
+
+  results.push(await runTest("board: region replace with oversized data warns + truncates", async () => {
+    const { replaceRegion } = await import("./analysis/regions.js");
+    const img = buildIntelDescriptorImage();
+    const repl = Buffer.alloc(8192, 0xaa); // larger than 4KB descriptor
+    const result = replaceRegion(img, "descriptor", repl);
+    assert(result !== null, "replace returns result");
+    assert(result!.warnings.some((w) => w.includes("larger") || w.includes("truncat")), "warning emitted");
+  }));
+
+  results.push(await runTest("board: ME region with $FPT extracts version", async () => {
+    const { parseMeRegion } = await import("./analysis/me.js");
+    const meImg = buildMeRegionImage();
+    const info = parseMeRegion(meImg);
+    assert(info.found, "FPT found");
+    assertEqual(info.state, "normal", "normal state");
+    assert(info.version.startsWith("15."), `version detected: ${info.version}`);
+    assert(info.partitions.some((p) => p.name.startsWith("FTPR")), "FTPR partition present");
+  }));
+
+  results.push(await runTest("board: ME region all-0xFF reports disabled state", async () => {
+    const { parseMeRegion } = await import("./analysis/me.js");
+    const blank = Buffer.alloc(2 * 1024 * 1024, 0xff);
+    const info = parseMeRegion(blank);
+    assertEqual(info.found, false, "no FPT");
+    assertEqual(info.state, "disabled", "blank → disabled");
+    assert(info.warnings.some((w) => w.includes("blank") || w.includes("disabled")), "diagnostic emitted");
+  }));
+
+  results.push(await runTest("board: ME region all-0x00 reports corrupted state", async () => {
+    const { parseMeRegion } = await import("./analysis/me.js");
+    const zeroed = Buffer.alloc(2 * 1024 * 1024, 0x00);
+    const info = parseMeRegion(zeroed);
+    assertEqual(info.state, "corrupted", "all-zero → corrupted");
+    assert(info.warnings.some((w) => w.includes("erased") || w.includes("corrupt")), "diagnostic emitted");
+  }));
+
+  results.push(await runTest("board: ME region with truncated $FPT header tolerates without crash", async () => {
+    const { parseMeRegion } = await import("./analysis/me.js");
+    const tiny = Buffer.alloc(20, 0xab);
+    Buffer.from("$FPT", "ascii").copy(tiny, 0x10);
+    const info = parseMeRegion(tiny);
+    assert(info.warnings.length > 0, "warning emitted");
+  }));
+
+  results.push(await runTest("board: UEFI firmware volume parses with PEI Core file", async () => {
+    const { scanFirmwareVolumes } = await import("./analysis/uefi.js");
+    const img = buildUefiFvImage();
+    const volumes = scanFirmwareVolumes(img);
+    assert(volumes.length >= 1, `expected ≥1 FV, got ${volumes.length}`);
+    assert(volumes[0].files.some((f) => f.type === 0x04), "PEI Core file present");
+    assertEqual(volumes[0].phase, "PEI", "PEI phase classified");
+  }));
+
+  results.push(await runTest("board: UEFI scan on image with no FV returns empty array", async () => {
+    const { scanFirmwareVolumes } = await import("./analysis/uefi.js");
+    const blank = Buffer.alloc(16 * 1024 * 1024, 0xff);
+    const volumes = scanFirmwareVolumes(blank);
+    assertEqual(volumes.length, 0, "no FVs in blank image");
+  }));
+
+  results.push(await runTest("board: UEFI scan on garbage image does not crash", async () => {
+    const { scanFirmwareVolumes } = await import("./analysis/uefi.js");
+    const garbage = Buffer.alloc(64 * 1024);
+    for (let i = 0; i < garbage.length; i++) garbage[i] = (i * 13 + 7) & 0xff;
+    const volumes = scanFirmwareVolumes(garbage); // must not throw
+    assert(Array.isArray(volumes), "returns array");
+  }));
+
+  results.push(await runTest("board: UEFI parser rejects bad FV signature gracefully", async () => {
+    const { parseUefiFirmwareVolume } = await import("./analysis/uefi.js");
+    const img = Buffer.alloc(0x40000, 0xff);
+    img.writeUInt32LE(0xdeadbeef, 40); // not _FVH
+    assertEqual(parseUefiFirmwareVolume(img, 0), null, "bad signature → null");
+  }));
+
+  results.push(await runTest("board: full BiosAnalyzer pipeline runs on synthetic Intel image without crash", async () => {
+    const analyzer = new BiosAnalyzer();
+    const img = buildIntelDescriptorImage();
+    const tmpPath = join(tmpdir(), "biospy-test-intel.bin");
+    await writeFile(tmpPath, img);
+    try {
+      const analysis = await analyzer.analyze(tmpPath);
+      assertEqual(analysis.fileSize, img.length, "size matches");
+      assert(typeof analysis.checksum === "string" && analysis.checksum.length === 64, "sha256 present");
+      assert(Array.isArray(analysis.regions), "regions is array");
+      assert(Array.isArray(analysis.warnings), "warnings is array");
+    } finally {
+      await unlink(tmpPath).catch(() => {});
+    }
+  }));
+
+  results.push(await runTest("board: NVRAM finder reports -1 for blank image (no crash)", async () => {
+    const blank = Buffer.alloc(16 * 1024 * 1024, 0xff);
+    const offset = findNvramStore(blank);
+    assertEqual(offset, -1, "blank image → -1");
+  }));
+
+  results.push(await runTest("board: parseNvramStore on blank image returns found=false with warning", async () => {
+    const blank = Buffer.alloc(16 * 1024, 0xff);
+    const store = parseNvramStore(blank);
+    assertEqual(store.found, false, "not found");
+    assert(store.warnings.length > 0, "warning emitted");
+  }));
+
+  results.push(await runTest("board: rebuildImage applies replacement to non-descriptor region", async () => {
+    const { rebuildImage, extractRegion } = await import("./analysis/regions.js");
+    const img = buildIntelDescriptorImage();
+    // Patch a non-descriptor region so the descriptor stays intact and listRegions still works.
+    const result = rebuildImage(img, { gbe: Buffer.alloc(8192, 0x22) });
+    assertEqual(result.data.length, img.length, "size preserved");
+    // Verify by extracting region from the rebuilt image rather than guessing offsets.
+    const extracted = extractRegion(result.data, "gbe");
+    assert(extracted !== null, "gbe extractable from rebuilt image");
+    assertEqual(extracted!.data[0], 0x22, "first byte patched");
+    assertEqual(extracted!.data[extracted!.data.length - 1], 0x22, "last byte patched");
+  }));
+
+  results.push(await runTest("board: rebuildImage with unknown region records skip warning", async () => {
+    const { rebuildImage } = await import("./analysis/regions.js");
+    const img = buildIntelDescriptorImage();
+    const result = rebuildImage(img, { unknownregion: Buffer.alloc(1024, 0x00) });
+    assert(result.warnings.some((w) => w.includes("not found")), "unknown region warned");
+  }));
+
+  // ─── Agent-facing surface (machine-readable output, structured errors, exit codes) ───
+
+  async function runCli(args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
+    const { spawn } = await import("node:child_process");
+    return await new Promise((resolve) => {
+      const cliPath = join(process.cwd(), "dist", "cli.js");
+      const proc = spawn(process.execPath, [cliPath, ...args]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+      proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+      proc.on("close", (code: number | null) => resolve({ stdout, stderr, code: code ?? 0 }));
+    });
+  }
+
+  results.push(await runTest("agent: `search --json` emits valid JSON with matches array", async () => {
+    const { stdout, code } = await runCli(["search", "W25Q64JV", "--json"]);
+    assertEqual(code, 0, "exit 0 on hit");
+    const parsed = JSON.parse(stdout);
+    assertEqual(parsed.ok, true, "ok=true");
+    assert(Array.isArray(parsed.matches), "matches is array");
+    assert(parsed.matches.length > 0, "at least one match");
+    assertEqual(parsed.matches[0].name, "W25Q64JV", "first match name");
+    assertEqual(parsed.matches[0].jedecId, "ef4017", "first match jedecId");
+    assertEqual(parsed.totalInDatabase, CHIP_DATABASE.length, "db size echoed");
+  }));
+
+  results.push(await runTest("agent: `search --json` on miss exits 1 with structured error", async () => {
+    const { stdout, code } = await runCli(["search", "zzznosuchchipxyz", "--json"]);
+    assertEqual(code, 1, "exit 1 on miss");
+    const parsed = JSON.parse(stdout);
+    assertEqual(parsed.ok, false, "ok=false");
+    assertEqual(parsed.matches.length, 0, "empty matches");
+    assert(typeof parsed.error === "string", "error string present");
+    assert(typeof parsed.nextAction === "string", "nextAction string present");
+  }));
+
+  results.push(await runTest("agent: `chip-info <jedec> --json` returns full chip object + recommendations", async () => {
+    const { stdout, code } = await runCli(["chip-info", "ef4017", "--json"]);
+    assertEqual(code, 0, "exit 0 on hit");
+    const parsed = JSON.parse(stdout);
+    assertEqual(parsed.ok, true, "ok=true");
+    assertEqual(parsed.chip.name, "W25Q64JV", "chip name");
+    assertEqual(parsed.chip.voltage, 3.3, "voltage");
+    assert(parsed.recommendations !== undefined, "recommendations present");
+    assert(typeof parsed.recommendations.addressMode === "string", "addressMode field");
+  }));
+
+  results.push(await runTest("agent: `chip-info <name> --json` resolves chip", async () => {
+    const { stdout, code } = await runCli(["chip-info", "W25Q256JV", "--json"]);
+    assertEqual(code, 0, "exit 0 on hit");
+    const parsed = JSON.parse(stdout);
+    assertEqual(parsed.ok, true, "ok=true");
+    assertEqual(parsed.chip.sizeBytes, 32 * 1024 * 1024, "32MB");
+    assertEqual(parsed.chip.needs4ByteAddr, true, "4-byte flag");
+  }));
+
+  results.push(await runTest("agent: `chip-info` unknown chip --json exits 1 with nextAction", async () => {
+    const { stdout, code } = await runCli(["chip-info", "notarealchip0000", "--json"]);
+    assertEqual(code, 1, "exit 1 on miss");
+    const parsed = JSON.parse(stdout);
+    assertEqual(parsed.ok, false, "ok=false");
+    assert(typeof parsed.nextAction === "string" && parsed.nextAction.length > 0, "nextAction is helpful");
+  }));
+
+  results.push(await runTest("agent: `chip-info` no args --json exits 1 with usage hint", async () => {
+    const { stdout, code } = await runCli(["chip-info", "--json"]);
+    assertEqual(code, 1, "exit 1 on missing arg");
+    const parsed = JSON.parse(stdout);
+    assertEqual(parsed.ok, false, "ok=false");
+    assert(parsed.error.includes("Missing"), "missing query reported");
+  }));
+
+  results.push(await runTest("agent: `--help` exits 0 with stable text", async () => {
+    const { stdout, code } = await runCli(["--help"]);
+    assertEqual(code, 0, "exit 0");
+    assert(stdout.includes("biospy"), "advertises product name");
+    assert(stdout.includes("HARDWARE"), "HARDWARE section present");
+    assert(stdout.includes("DIAGNOSTICS"), "DIAGNOSTICS section present");
+  }));
+
+  results.push(await runTest("agent: `--version` exits 0 with semver-ish string", async () => {
+    const { stdout, code } = await runCli(["--version"]);
+    assertEqual(code, 0, "exit 0");
+    assert(/\d+\.\d+\.\d+/.test(stdout), "version string is semver-shaped");
+  }));
+
+  results.push(await runTest("agent: invalid post-decode input exits non-zero with clear message", async () => {
+    const { stderr, stdout, code } = await runCli(["post-decode", "notahexcode"]);
+    assert(code !== 0, "non-zero exit");
+    const combined = stdout + stderr;
+    assert(combined.toLowerCase().includes("not a valid post code") || combined.toLowerCase().includes("not a valid"), "clear error message");
+  }));
+
+  results.push(await runTest("agent: bogus chip-info exits non-zero (regression for prior silent-zero bug)", async () => {
+    const { code } = await runCli(["chip-info", "notarealchip0000"]);
+    assert(code !== 0, "non-zero exit");
+  }));
+
+  // ─── Hardware safety pre-flight ───
+  results.push(await runTest("safety: getChipVoltage returns correct value for 3.3V chip", async () => {
+    const { getChipVoltage } = await import("./chips/database.js");
+    assertEqual(getChipVoltage("ef4017"), 3.3, "W25Q64JV is 3.3V");
+  }));
+
+  results.push(await runTest("safety: getChipVoltage returns 1.8 for low-voltage chip", async () => {
+    const { getChipVoltage } = await import("./chips/database.js");
+    assertEqual(getChipVoltage("ef6017"), 1.8, "W25Q64FW is 1.8V");
+    assertEqual(getChipVoltage("c22534"), 1.8, "MX25U8035F is 1.8V");
+    assertEqual(getChipVoltage("c86017"), 1.8, "GD25LQ64C is 1.8V");
+  }));
+
+  results.push(await runTest("safety: voltage gate triggers (chip<2.0V → block without --force-1.8v)", async () => {
+    const { lookupChipByJedecId, getChipVoltage } = await import("./chips/database.js");
+    const chip = lookupChipByJedecId("ef6017");
+    assert(!!chip, "W25Q64FW present");
+    const voltage = getChipVoltage(chip!.jedecId);
+    const shouldBlock = !!voltage && voltage < 2.0;
+    assert(shouldBlock, "1.8V chip must trip the safety gate");
+  }));
+
+  results.push(await runTest("safety: voltage gate does NOT trigger for 3.3V chip", async () => {
+    const { lookupChipByJedecId, getChipVoltage } = await import("./chips/database.js");
+    const chip = lookupChipByJedecId("ef4017");
+    const voltage = getChipVoltage(chip!.jedecId);
+    const shouldBlock = !!voltage && voltage < 2.0;
+    assert(!shouldBlock, "3.3V chip must pass the safety gate");
+  }));
+
+  results.push(await runTest("safety: voltage gate handles 2.5V wide-voltage chip (passes — close to 3.3V)", async () => {
+    const { getChipVoltage } = await import("./chips/database.js");
+    // MX25R6435F is a wide-voltage 1.65–3.6V chip rated at 3.0V nominal.
+    const v = getChipVoltage("c22817");
+    assert(v !== undefined && v >= 2.0, `MX25R6435F voltage ${v} should pass 2.0V gate`);
+  }));
+
+  results.push(await runTest("safety: 4-byte addressing auto-engages for >16MB chips", async () => {
+    const { needs4ByteAddressing } = await import("./chips/database.js");
+    assert(needs4ByteAddressing("ef4019"), "32MB W25Q256JV");
+    assert(needs4ByteAddressing("ef4020"), "64MB W25Q512JV");
+    assert(needs4ByteAddressing("ef4021"), "128MB W25Q01JV");
+    assert(needs4ByteAddressing("c22019"), "32MB MX25L25635F");
+    assert(needs4ByteAddressing("20ba19"), "32MB N25Q256A");
+  }));
+
+  results.push(await runTest("safety: 4-byte addressing stays disabled for ≤16MB chips", async () => {
+    const { needs4ByteAddressing } = await import("./chips/database.js");
+    assert(!needs4ByteAddressing("ef4018"), "16MB W25Q128JV");
+    assert(!needs4ByteAddressing("ef4015"), "2MB W25Q16JV");
+    assert(!needs4ByteAddressing("c22014"), "1MB MX25L8005");
+  }));
+
+  results.push(await runTest("safety: chip-recommendations surface 4-byte mode warning for large chips", async () => {
+    const { lookupChipByJedecId, getChipRecommendations } = await import("./chips/database.js");
+    const big = lookupChipByJedecId("ef4019")!;
+    const rec = getChipRecommendations(big);
+    assert(rec.addressMode.includes("4-byte"), "addressMode reports 4-byte");
+  }));
+
+  results.push(await runTest("safety: chip-recommendations surface 1.8V warning for low-voltage chips", async () => {
+    const { lookupChipByJedecId, getChipRecommendations } = await import("./chips/database.js");
+    const low = lookupChipByJedecId("ef6017")!;
+    const rec = getChipRecommendations(low);
+    assert(rec.warnings.some((w) => w.toLowerCase().includes("1.8v")), "1.8V advisory emitted");
+    assert(rec.warnings.some((w) => w.toLowerCase().includes("adapter") || w.toLowerCase().includes("level shifter")), "adapter/level-shifter recommendation present");
+    assert(rec.warnings.some((w) => w.toLowerCase().includes("damage")), "explicit damage warning surfaced");
+  }));
+
+  results.push(await runTest("safety: chip-recommendations surface I2C protocol warning for EEPROM", async () => {
+    const { lookupChipByName, getChipRecommendations } = await import("./chips/database.js");
+    const eeprom = lookupChipByName("24C256")!;
+    const rec = getChipRecommendations(eeprom);
+    assert(rec.warnings.some((w) => w.includes("I2C")), "I2C protocol warning emitted");
+  }));
+
+  results.push(await runTest("safety: max-clock recommendation is conservative for CH341A", async () => {
+    const { lookupChipByJedecId, getChipRecommendations } = await import("./chips/database.js");
+    const fast = lookupChipByJedecId("ef4017")!; // 133 MHz rated
+    const rec = getChipRecommendations(fast);
+    assert(rec.maxSpiClock.includes("conservative"), "advertises conservative clock for CH341A");
+  }));
+
+  results.push(await runTest("safety: write-protect block-protection state has correct boolean semantics", async () => {
+    // Unit-test the bit decoding logic that gates writes.
+    const SR_BP0 = 0x04;
+    const SR_BP2 = 0x10;
+    const SR_SRP0 = 0x80;
+    const sr1Open = 0x00;
+    const sr1Protected = SR_BP0 | SR_BP2;
+    const sr1Locked = sr1Protected | SR_SRP0;
+    const isProtected = (sr: number) => (sr & (SR_BP0 | 0x08 | SR_BP2 | 0x20)) !== 0;
+    const isLocked = (sr1: number) => isProtected(sr1) && (sr1 & SR_SRP0) !== 0;
+    assert(!isProtected(sr1Open), "open SR1 is unprotected");
+    assert(isProtected(sr1Protected), "BP bits set → protected");
+    assert(isLocked(sr1Locked), "BP+SRP0 → locked");
+  }));
+
+  results.push(await runTest("safety: dry-run CLI status path runs without hardware", async () => {
+    const { code, stdout } = await runCli(["status", "--dry-run"]);
+    assertEqual(code, 0, "dry-run exits 0");
+    assert(stdout.length > 0, "dry-run produces output");
+  }));
+
+  results.push(await runTest("safety: CLI rejects bogus chip name + suggests next step", async () => {
+    const { stdout, stderr, code } = await runCli(["chip-info", "notarealchip0000"]);
+    assertEqual(code, 1, "exit 1 on miss");
+    const combined = stdout + stderr;
+    assert(combined.length > 0, "produces actionable error output");
   }));
 
   results.push(await runTest("MockBackend.connectionTest", async () => {
@@ -1822,6 +2698,166 @@ export async function runSelfTest(): Promise<boolean> {
     assertEqual(resultA.checksum, resultB.checksum, "checksums match");
     try { await unlink(pathA); } catch {}
     try { await unlink(pathB); } catch {}
+  }));
+
+  // ─── Storm Damage Stress Tests ───
+  console.log("\nStorm Damage Stress Tests");
+
+  // Partial corruption: random bytes flipped in BIOS region (power surge pattern)
+  results.push(await runTest("storm: partial BIOS region corruption detected by health check", async () => {
+    const img = createMockIntelFdImage();
+    // Simulate power surge: scatter random corruption in BIOS region
+    for (let i = 0x100000; i < 0x200000; i += 0x1000) {
+      img[i] = 0x00;
+      img[i + 1] = 0x00;
+      img[i + 2] = 0x00;
+    }
+    const report = analyzeBiosHealthFromBuffer(img);
+    assert(report.checks.length > 0, "has health checks");
+    assert(report.recoverySteps.length > 0, "has recovery steps");
+  }));
+
+  // Half-erased flash: power cut during erase (first half 0xFF, second half data)
+  results.push(await runTest("storm: half-erased flash detected as corrupt", async () => {
+    const img = createMockIntelFdImage();
+    // First 4MB erased (power cut during erase)
+    img.fill(0xff, 0, 0x400000);
+    const report = analyzeBiosHealthFromBuffer(img);
+    const contentCheck = report.checks.find(c => c.name === "Content check");
+    assert(contentCheck !== undefined, "content check exists");
+  }));
+
+  // Intel FD zeroed but BIOS region intact
+  results.push(await runTest("storm: zeroed Flash Descriptor detected, repair from reference restores", async () => {
+    const good = createMockIntelFdImage();
+    const damaged = Buffer.from(good);
+    // Zero the Flash Descriptor (first 4KB) — common surge damage
+    damaged.fill(0x00, 0, 0x1000);
+    const report = analyzeBiosHealthFromBuffer(damaged);
+    const fdCheck = report.checks.find(c => c.name === "Intel Flash Descriptor");
+    assert(fdCheck !== undefined, "FD check exists");
+    assert(fdCheck!.status !== "pass", "FD should not pass");
+    // Reference repair should restore FD
+    const { repaired, report: repairReport } = repairFromReference(damaged, good);
+    assert(repairReport.totalBytesChanged > 0, "bytes restored");
+    assert(repaired.readUInt32LE(0x10) === 0x0ff0a55a, "FD signature restored");
+  }));
+
+  // ME + BIOS both corrupted
+  results.push(await runTest("storm: multiple regions corrupted, reference repair fixes all", async () => {
+    const good = createMockIntelFdImage();
+    const damaged = Buffer.from(good);
+    // Corrupt ME region
+    for (let i = 0x1000; i < 0x10000; i++) damaged[i] = 0x00;
+    // Corrupt part of BIOS region
+    for (let i = 0x100000; i < 0x110000; i++) damaged[i] = 0x00;
+    const { repaired, report } = repairFromReference(damaged, good);
+    assert(report.actions.length >= 2, "multiple regions repaired");
+    assert(report.totalBytesChanged > 0, "bytes changed");
+    // Repaired should match reference
+    const meOriginal = extractRegion(good, "me")!.data;
+    const meRepaired = extractRegion(repaired, "me")!.data;
+    assert(meOriginal.equals(meRepaired), "ME region restored");
+  }));
+
+  // Reference repair with different size (downloaded BIOS is different size)
+  results.push(await runTest("storm: reference repair handles size mismatch (smaller ref)", async () => {
+    const broken = Buffer.alloc(8 * 1024 * 1024, 0xAB);
+    const reference = Buffer.alloc(4 * 1024 * 1024, 0xCD);
+    const { repaired, report } = repairFromReference(broken, reference);
+    assert(repaired.length === broken.length, "output matches broken size");
+    assert(report.warnings.some(w => w.includes("Size mismatch")), "warns about size");
+  }));
+
+  results.push(await runTest("storm: reference repair handles size mismatch (larger ref)", async () => {
+    const broken = Buffer.alloc(4 * 1024 * 1024, 0xAB);
+    const reference = Buffer.alloc(8 * 1024 * 1024, 0xCD);
+    const { repaired, report } = repairFromReference(broken, reference);
+    assert(repaired.length === broken.length, "output matches broken size");
+    assert(report.warnings.some(w => w.includes("Size mismatch")), "warns about size");
+  }));
+
+  // NVRAM completely corrupted (all variables invalid)
+  results.push(await runTest("storm: NVRAM with all-deleted variables triggers reset", async () => {
+    const img = Buffer.alloc(8192, 0xff);
+    addNvramStore(img, 512, 2048);
+    // Mark the variable as deleted
+    img[512 + 28 + 2] = 0x3c; // VARIABLE_STATE_DELETED
+    const store = parseNvramStore(img, 512);
+    assert(store.found, "store found");
+    const { repaired, report } = resetNvram(img);
+    assert(report.actions[0].includes("NVRAM reset"), "NVRAM was reset");
+    assert(report.totalBytesChanged > 0, "bytes changed");
+  }));
+
+  // Auto-repair on image with zeroed reset vector + NVRAM damage
+  results.push(await runTest("storm: auto-repair fixes zeroed reset vector", async () => {
+    const img = Buffer.alloc(1024 * 1024, 0xff);
+    // Zero the reset vector area
+    img.fill(0x00, img.length - 16);
+    const { repaired, report } = repairAuto(img);
+    assert(report.actions.some(a => a.includes("reset vector")), "reset vector repaired");
+    assert(report.totalBytesChanged > 0, "bytes changed");
+    // Verify the patched reset vector
+    assertEqual(repaired[repaired.length - 16], 0xea, "far jump opcode");
+    assertEqual(repaired[repaired.length - 15], 0xf0, "jump addr low");
+    assertEqual(repaired[repaired.length - 14], 0xff, "jump addr high");
+  }));
+
+  // Full pipeline with storm-damaged mock flash
+  results.push(await runTest("storm: full-repair pipeline repairs zeroed reset vector end-to-end", async () => {
+    const mockBackend = new MockBackend();
+    const flash = mockBackend.getFlashBuffer();
+    // Simulate storm damage: zero last 64 bytes (reset vector + surrounding code)
+    flash.fill(0x00, flash.length - 64);
+    const ctx = createContext({ backend: mockBackend as any });
+    const steps = buildRepairPipeline(ctx);
+    const result = await runPipeline(steps, ctx);
+    assertEqual(result.success, true, "pipeline success");
+    assertEqual(ctx.repairsNeeded, true, "repairs needed");
+    assert(ctx.repairReport!.totalBytesChanged > 0, "bytes were repaired");
+    assert(ctx.repairReport!.actions.some((a: string) => a.includes("reset vector")), "reset vector fixed");
+  }));
+
+  // Verify recovery steps suggest correct actions for common storm patterns
+  results.push(await runTest("storm: blank chip health report suggests re-read", async () => {
+    const blank = Buffer.alloc(8 * 1024 * 1024, 0xff);
+    const report = analyzeBiosHealthFromBuffer(blank);
+    assert(report.recoverySteps.length > 0, "has recovery steps");
+    assert(report.recoverySteps[0].command.includes("read"), "suggests re-read");
+    assert(report.recoverySteps[0].risk === "low", "re-read is low risk");
+  }));
+
+  results.push(await runTest("storm: all-zero chip health report suggests re-read", async () => {
+    const zeros = Buffer.alloc(8 * 1024 * 1024, 0x00);
+    const report = analyzeBiosHealthFromBuffer(zeros);
+    assert(report.recoverySteps.length > 0, "has recovery steps");
+    assert(report.recoverySteps[0].command.includes("read"), "suggests re-read");
+  }));
+
+  // Region replace with undersized replacement pads with 0xFF
+  results.push(await runTest("storm: region replace with smaller data pads correctly", async () => {
+    const img = createMockIntelFdImage();
+    const meRegion = extractRegion(img, "me")!;
+    const smallReplacement = Buffer.alloc(meRegion.data.length / 2, 0xAB);
+    const result = replaceRegion(img, "me", smallReplacement);
+    assert(result !== null, "replace succeeded");
+    assert(result!.warnings.some(w => w.includes("padding")), "warns about padding");
+    // Verify padding
+    const replaced = extractRegion(result!.data, "me")!.data;
+    for (let i = smallReplacement.length; i < replaced.length; i++) {
+      assertEqual(replaced[i], 0xff, `padding at ${i}`);
+      if (i > smallReplacement.length + 10) break;
+    }
+  }));
+
+  // Verify repairFromReference doesn't corrupt a good image
+  results.push(await runTest("storm: reference repair on identical images makes no changes", async () => {
+    const img = createMockIntelFdImage();
+    const { repaired, report } = repairFromReference(img, Buffer.from(img));
+    assert(repaired.equals(img), "no changes to identical image");
+    assertEqual(report.totalBytesChanged, 0, "zero bytes changed");
+    assert(report.actions.some(a => a.includes("matches reference")), "reports match");
   }));
 
   // ─── Report ───

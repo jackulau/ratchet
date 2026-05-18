@@ -186,7 +186,9 @@ async function cmdDetect() {
 
   if (!ch341aInfo.connected && !ch347Info.connected) {
     out.fail("No CH34x programmer found");
-    out.dim("Supported: CH341A (1a86:5512), CH347 (1a86:55db)");
+    out.dim("Supported: CH341A (1a86:5512), CH341B clone (5523), CH347 (55db),");
+    out.dim("           CH347T (55dc), CH347F (55de), CH343 UART (55d3),");
+    out.dim("           legacy QinHeng VID (4348:5512)");
     out.dim("Check: USB cable connected? Try different port? Dongle/hub issue?");
   }
   console.log();
@@ -1028,7 +1030,16 @@ function displayRecommendations(chip: ChipDef): void {
 
 async function cmdChipInfo(args: Args) {
   const query = args.positional[0];
+  const wantsJson = args.flags.includes("--json");
   if (!query) {
+    if (wantsJson) {
+      process.stdout.write(JSON.stringify({
+        ok: false,
+        error: "Missing query",
+        nextAction: "Pass a JEDEC ID (6 hex chars) or chip name as the argument.",
+      }) + "\n");
+      process.exit(1);
+    }
     out.fail("Usage: biospy chip-info <jedec_id|name>");
     out.dim("  biospy chip-info ef4017     # lookup by JEDEC ID");
     out.dim("  biospy chip-info W25Q64     # lookup by chip name");
@@ -1036,6 +1047,29 @@ async function cmdChipInfo(args: Args) {
   }
 
   const isHex = /^[0-9a-fA-F]{6}$/.test(query);
+
+  // JSON path resolves first so we never print decorative output before serializing.
+  if (wantsJson) {
+    const direct = isHex ? lookupChipByJedecId(query) : lookupChipByName(query);
+    if (direct) {
+      process.stdout.write(JSON.stringify({ ok: true, query, chip: direct, recommendations: getChipRecommendations(direct) }) + "\n");
+      return;
+    }
+    if (isHex) {
+      const fuzzy = fuzzyMatchJedec(query);
+      process.stdout.write(JSON.stringify({ ok: false, query, fuzzy, nextAction: "Re-read JEDEC ID (`biospy identify`) or open an issue with chip details." }) + "\n");
+      process.exit(1);
+    }
+    const partial = searchChips(query);
+    process.stdout.write(JSON.stringify({
+      ok: false,
+      query,
+      partialMatches: partial.slice(0, 20),
+      error: `No chip matching "${query}"`,
+      nextAction: partial.length > 0 ? "Use one of the partialMatches name fields." : "Try `biospy search <prefix>` to list candidates.",
+    }) + "\n");
+    process.exit(1);
+  }
 
   if (isHex) {
     const chip = lookupChipByJedecId(query);
@@ -1081,6 +1115,8 @@ async function cmdChipInfo(args: Args) {
         if (results.length > 20) out.dim(`... and ${results.length - 20} more`);
       } else {
         out.fail(`No chip matching "${query}" in database (${CHIP_DATABASE.length} entries)`);
+        out.dim(`Try: biospy search ${query}  # broader fuzzy search`);
+        process.exit(1);
       }
     }
   }
@@ -1089,11 +1125,47 @@ async function cmdChipInfo(args: Args) {
 
 async function cmdSearch(args: Args) {
   const query = args.positional[0] ?? "";
+  const wantsJson = args.flags.includes("--json");
 
   const results = searchChips(query);
   if (results.length === 0) {
+    if (wantsJson) {
+      process.stdout.write(JSON.stringify({
+        ok: false,
+        query,
+        matches: [],
+        error: `No chips matching "${query}"`,
+        totalInDatabase: CHIP_DATABASE.length,
+        nextAction: "Try a shorter query, JEDEC ID prefix, or vendor name. See `biospy search` to list all chips.",
+      }) + "\n");
+      process.exit(1);
+    }
     out.fail(`No chips matching "${query}" (${CHIP_DATABASE.length} chips in database)`);
     process.exit(1);
+  }
+
+  if (wantsJson) {
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      query,
+      totalInDatabase: CHIP_DATABASE.length,
+      matches: results.map((c) => ({
+        name: c.name,
+        vendor: c.vendor,
+        jedecId: c.jedecId,
+        sizeBytes: c.sizeBytes,
+        type: c.type,
+        pageSize: c.pageSize,
+        sectorSize: c.sectorSize,
+        blockSize: c.blockSize,
+        voltage: c.voltage,
+        voltageMin: c.voltageMin,
+        voltageMax: c.voltageMax,
+        maxClockMhz: c.maxClockMhz,
+        needs4ByteAddr: c.needs4ByteAddr,
+      })),
+    }) + "\n");
+    return;
   }
 
   const label = query ? `${results.length} chip(s) matching "${query}"` : `All ${results.length} chips in database`;
@@ -1569,6 +1641,7 @@ async function cmdPostDecode(args: Args) {
     }
   }
 
+  const isHex = /^(0x)?[0-9a-fA-F]{1,4}$/.test(code);
   const results = lookupPostCode(code, standard);
 
   if (results.length === 0) {
@@ -1587,8 +1660,14 @@ async function cmdPostDecode(args: Args) {
           for (const c of entry.causes.slice(1)) out.dim(c);
         }
       }
+      return;
     }
-    return;
+    if (!isHex) {
+      out.fail(`"${code}" is not a valid POST code (expected 1–4 hex digits, optionally prefixed with 0x)`);
+      process.exit(1);
+    }
+    out.fail(`No information available for POST code 0x${cleaned}`);
+    process.exit(1);
   }
 
   for (const entry of results) {

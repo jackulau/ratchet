@@ -1,6 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import type { BiosAnalysis, BiosRegion, DiffResult } from "../types.js";
+import { scanFirmwareVolumes, type UefiFirmwareVolume } from "./uefi.js";
+import { parseMeRegion, type IntelMeInfo } from "./me.js";
+import { parseNvramStore, type NvramStore } from "./nvram.js";
+import { listRegions, extractRegion, type RegionInfo } from "./regions.js";
+import { analyzeBiosHealth, type BiosHealthReport } from "./recovery.js";
 
 const UEFI_FV_SIGNATURE = Buffer.from([
   0x5f, 0x46, 0x56, 0x48,
@@ -320,6 +325,37 @@ export class BiosAnalyzer {
       sha256: createHash("sha256").update(data).digest("hex"),
       crc32: this.crc32(data),
     };
+  }
+
+  async deepAnalyze(filePath: string): Promise<{
+    basic: BiosAnalysis;
+    firmwareVolumes: UefiFirmwareVolume[];
+    meInfo: IntelMeInfo | null;
+    nvram: NvramStore;
+    regions: RegionInfo[];
+  }> {
+    const data = await readFile(filePath);
+    const basic = await this.analyze(filePath);
+    const firmwareVolumes = scanFirmwareVolumes(data);
+    const regions = listRegions(data);
+    const nvram = parseNvramStore(data);
+
+    let meInfo: IntelMeInfo | null = null;
+    const meExtract = extractRegion(data, "me");
+    if (meExtract) {
+      meInfo = parseMeRegion(meExtract.data, meExtract.region.offset);
+    }
+
+    return { basic, firmwareVolumes, meInfo, nvram, regions };
+  }
+
+  async getRegionMap(filePath: string): Promise<RegionInfo[]> {
+    const data = await readFile(filePath);
+    return listRegions(data);
+  }
+
+  async healthCheck(filePath: string): Promise<BiosHealthReport> {
+    return analyzeBiosHealth(filePath);
   }
 
   private crc32(data: Buffer): string {
