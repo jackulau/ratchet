@@ -53,8 +53,8 @@ export interface PipelineContext {
 export interface PipelineBackend {
   connectionTest(): Promise<{ stable: boolean; reads: number; matches: number; jedecId: string; timings: number[]; statusRegister: number | null }>;
   identifyChip(): Promise<ChipInfo | null>;
-  readChipDoubleVerify(outputPath: string, onProgress?: any): Promise<{ success: boolean; sizeBytes: number; checksum: string; durationMs: number; filePath: string; error?: string }>;
-  writeChip(inputPath: string, onProgress?: any, opts?: any): Promise<{ success: boolean; verified: boolean; durationMs: number; error?: string; backupPath: string | null }>;
+  readChipDoubleVerify(outputPath: string, onProgress?: (pct: number, bytes: number, total: number, speed?: number, eta?: number) => void): Promise<{ success: boolean; sizeBytes: number; checksum: string; durationMs: number; filePath: string; error?: string }>;
+  writeChip(inputPath: string, onProgress?: (pct: number, bytes: number, total: number, speed?: number, eta?: number) => void, opts?: { skipBackup?: boolean; skipVerify?: boolean }): Promise<{ success: boolean; verified: boolean; durationMs: number; error?: string; backupPath: string | null }>;
   verifyChip(filePath: string): Promise<{ matches: boolean; chipChecksum: string; fileChecksum: string; durationMs: number }>;
   isWriteProtected(): Promise<boolean>;
   disableWriteProtection(): Promise<void>;

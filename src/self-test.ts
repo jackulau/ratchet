@@ -3677,6 +3677,90 @@ export async function runSelfTest(): Promise<boolean> {
     assert(p.data.count > 0, "≥1 controller");
   }));
 
+  // ─── Lint invariants (goal-3 D5) ───
+  // Regex-based scans on source files. Catches drift like new `: any` in
+  // production code, console.log outside permitted modules, untyped exports.
+  console.log("\nLint Invariants");
+
+  async function readSrc(rel: string): Promise<string> {
+    return await readFile(join(process.cwd(), "src", rel), "utf-8");
+  }
+
+  results.push(await runTest("lint: no `: any` outside catch in src/agent/envelope.ts", async () => {
+    const txt = await readSrc("agent/envelope.ts");
+    const lines = txt.split("\n").filter((l) => /: any\b/.test(l) && !/catch \(.*: any/.test(l));
+    assertEqual(lines.length, 0, `agent/envelope.ts has ${lines.length} loose any: ${lines.join(" | ")}`);
+  }));
+
+  results.push(await runTest("lint: no `: any` outside catch in src/mcp/server.ts", async () => {
+    const txt = await readSrc("mcp/server.ts");
+    const lines = txt.split("\n").filter((l) => /: any\b/.test(l) && !/catch \(.*: any/.test(l));
+    assertEqual(lines.length, 0, `mcp/server.ts has ${lines.length} loose any: ${lines.join(" | ")}`);
+  }));
+
+  results.push(await runTest("lint: no `: any` in src/analysis/* (production code)", async () => {
+    const { readdir } = await import("node:fs/promises");
+    const files = await readdir(join(process.cwd(), "src", "analysis"));
+    for (const f of files.filter((f) => f.endsWith(".ts"))) {
+      const txt = await readSrc(`analysis/${f}`);
+      const lines = txt.split("\n").filter((l) => /: any\b/.test(l) && !/catch \(.*: any/.test(l));
+      assertEqual(lines.length, 0, `analysis/${f} has loose any: ${lines.slice(0, 3).join(" | ")}`);
+    }
+  }));
+
+  results.push(await runTest("lint: pipeline.ts callbacks are typed (no `onProgress?: any`)", async () => {
+    const txt = await readSrc("workflows/pipeline.ts");
+    assert(!/onProgress\?\s*:\s*any\b/.test(txt), "pipeline onProgress must be typed");
+  }));
+
+  results.push(await runTest("lint: console.log only in permitted modules (cli/self-test/mcp/output/repl)", async () => {
+    const { readdir } = await import("node:fs/promises");
+    const allowed = ["cli.ts", "self-test.ts", "output.ts"];
+    async function* walk(dir: string): AsyncGenerator<string> {
+      const entries = await readdir(join(process.cwd(), dir), { withFileTypes: true });
+      for (const e of entries) {
+        const rel = join(dir, e.name);
+        if (e.isDirectory()) yield* walk(rel);
+        else if (e.name.endsWith(".ts")) yield rel;
+      }
+    }
+    const violations: string[] = [];
+    for await (const file of walk("src")) {
+      const baseName = file.split("/").pop()!;
+      if (allowed.includes(baseName)) continue;
+      if (file.startsWith("src/mcp/")) continue; // mcp server allowed
+      if (file.startsWith("src/repl/")) continue; // REPL is interactive
+      const txt = await readFile(join(process.cwd(), file), "utf-8");
+      if (/\bconsole\.log\b/.test(txt)) {
+        const lines = txt.split("\n").map((l, i) => ({ l, i })).filter((x) => /\bconsole\.log\b/.test(x.l));
+        violations.push(`${file}: ${lines.length} usage(s)`);
+      }
+    }
+    assertEqual(violations.length, 0, `console.log violations: ${violations.join("; ")}`);
+  }));
+
+  results.push(await runTest("lint: agent envelope shape is stable (all fields documented)", async () => {
+    const txt = await readSrc("agent/envelope.ts");
+    for (const field of ["ok:", "command:", "data?:", "error?:", "nextAction?:", "code:", "message:", "hint?:"]) {
+      assert(txt.includes(field), `envelope.ts declares ${field}`);
+    }
+  }));
+
+  results.push(await runTest("lint: MCP server registers ≥18 tools (regression guard)", async () => {
+    const txt = await readSrc("mcp/server.ts");
+    const matches = txt.match(/server\.registerTool\(/g);
+    const count = matches ? matches.length : 0;
+    assert(count >= 18, `expected ≥18 registerTool calls, got ${count}`);
+  }));
+
+  results.push(await runTest("lint: MCP server registers 7 resources + 5 prompts (regression guard)", async () => {
+    const txt = await readSrc("mcp/server.ts");
+    const resCount = (txt.match(/server\.registerResource\(/g) || []).length;
+    const pmtCount = (txt.match(/server\.registerPrompt\(/g) || []).length;
+    assertEqual(resCount, 7, `expected 7 resources, got ${resCount}`);
+    assertEqual(pmtCount, 5, `expected 5 prompts, got ${pmtCount}`);
+  }));
+
   // ─── Safety enforcement audit (D6) ───
   // End-to-end check that destructive operations refuse without the right gates,
   // both via CLI and via MCP. These are the "guardrails that survived in a real run" tests.
