@@ -10,7 +10,10 @@
   "scripts": {
     "build": "tsc && chmod +x dist/cli.js dist/mcp/server.js",
     "dev": "tsc --watch",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "test": "node dist/cli.js --self-test",
+    "smoke": "bash tasks/cli-smoke.sh && bash tasks/mcp-smoke.sh",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
