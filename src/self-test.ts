@@ -3402,6 +3402,80 @@ export async function runSelfTest(): Promise<boolean> {
 
   try { await unlink(mcpImgPath); } catch {}
 
+  // ─── MCP Resources (goal-3 D2) ───
+  console.log("\nMCP Resources");
+
+  results.push(await runTest("mcp-resources: resources/list returns ≥7 entries", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("resources/list", {});
+      assert(Array.isArray(resp.result?.resources), "resources array");
+      assert(resp.result.resources.length >= 7, `expected ≥7 resources, got ${resp.result.resources.length}`);
+      const uris = new Set(resp.result.resources.map((r: any) => r.uri));
+      for (const r of ["biospy://db/chips", "biospy://db/post-codes", "biospy://db/failure-patterns", "biospy://db/laptop-failures", "biospy://db/gpu-failures", "biospy://db/ssd-failures", "biospy://db/voltage-refs"]) {
+        assert(uris.has(r), `resource registered: ${r}`);
+      }
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-resources: read biospy://db/chips returns full chip catalog", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("resources/read", { uri: "biospy://db/chips" });
+      const text = resp.result?.contents?.[0]?.text;
+      assert(typeof text === "string", "text content present");
+      const payload = JSON.parse(text);
+      assert(payload.count > 100, `chip count ≥100: ${payload.count}`);
+      assert(Array.isArray(payload.chips), "chips array");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-resources: read biospy://db/post-codes returns POST catalog", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("resources/read", { uri: "biospy://db/post-codes" });
+      const payload = JSON.parse(resp.result.contents[0].text);
+      assert(payload.count > 0, "≥1 code");
+      assert(Array.isArray(payload.codes), "codes array");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-resources: read biospy://db/failure-patterns returns motherboard patterns", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("resources/read", { uri: "biospy://db/failure-patterns" });
+      const payload = JSON.parse(resp.result.contents[0].text);
+      assert(payload.count > 0, "≥1 pattern");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-resources: read biospy://db/laptop-failures returns laptop catalog", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("resources/read", { uri: "biospy://db/laptop-failures" });
+      const payload = JSON.parse(resp.result.contents[0].text);
+      assert(payload.count >= 60, `expected ≥60 laptop patterns, got ${payload.count}`);
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-resources: read biospy://db/gpu-failures returns GPU catalog", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("resources/read", { uri: "biospy://db/gpu-failures" });
+      const payload = JSON.parse(resp.result.contents[0].text);
+      assert(payload.count >= 40, `expected ≥40 gpu patterns, got ${payload.count}`);
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("mcp-resources: read biospy://db/voltage-refs returns connector tables", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("resources/read", { uri: "biospy://db/voltage-refs" });
+      const payload = JSON.parse(resp.result.contents[0].text);
+      assert(payload.count > 0, "≥1 reference");
+    } finally { c.close(); }
+  }));
+
   // ─── Specialist diagnostic --json (D1 of goal-3) ───
   // 13 commands. Each hit + miss path exercised via subprocess.
   console.log("\nSpecialist Diagnostic JSON");

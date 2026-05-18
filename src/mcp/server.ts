@@ -32,6 +32,8 @@ import {
 import {
   lookupPostCode, searchPostCodes, getPhaseDescription,
   searchFailurePatterns, getPatternsByCategory, ALL_REFERENCES,
+  FAILURE_PATTERNS, LAPTOP_FAILURE_PATTERNS, GPU_FAILURE_PATTERNS,
+  SSD_FAILURE_PATTERNS, POST_CODES,
 } from "../diagnostics/index.js";
 import type { PostStandard } from "../diagnostics/index.js";
 import { readFile } from "node:fs/promises";
@@ -87,8 +89,58 @@ function failContent(command: string, code: string, message: string, hint?: stri
 export function buildServer(): McpServer {
   const server = new McpServer(
     { name: "biospy-mcp", version: VERSION },
-    { capabilities: { tools: {}, logging: {} } },
+    { capabilities: { tools: {}, resources: {}, prompts: {}, logging: {} } },
   );
+
+  // ─── Resources ───
+  // Browseable read-only databases. Each returns a JSON-serialized full catalog
+  // so an agent can grep/filter offline instead of paginating tool calls.
+
+  function jsonResource(uri: string, payload: unknown): { contents: Array<{ uri: string; mimeType: string; text: string }> } {
+    return { contents: [{ uri, mimeType: "application/json", text: JSON.stringify(payload) }] };
+  }
+
+  server.registerResource("chips-db", "biospy://db/chips", {
+    title: "Chip database (806 SPI flash entries)",
+    description: "Full chip catalog with JEDEC IDs, sizes, voltages, addressing modes, page/sector/block geometry.",
+    mimeType: "application/json",
+  }, async (uri) => jsonResource(uri.toString(), { count: CHIP_DATABASE.length, chips: CHIP_DATABASE }));
+
+  server.registerResource("post-codes", "biospy://db/post-codes", {
+    title: "POST code catalog (AMI / Award / Phoenix / UEFI)",
+    description: "Every POST code with phase, description, common causes.",
+    mimeType: "application/json",
+  }, async (uri) => jsonResource(uri.toString(), { count: POST_CODES.length, codes: POST_CODES }));
+
+  server.registerResource("failure-patterns", "biospy://db/failure-patterns", {
+    title: "Motherboard failure pattern catalog",
+    description: "Symptoms → ranked causes → diagnostic steps for power/display/boot/stability/bios/peripheral.",
+    mimeType: "application/json",
+  }, async (uri) => jsonResource(uri.toString(), { count: FAILURE_PATTERNS.length, patterns: FAILURE_PATTERNS }));
+
+  server.registerResource("laptop-failures", "biospy://db/laptop-failures", {
+    title: "Laptop failure pattern catalog (65+ patterns)",
+    description: "Symptoms → causes → diagnostic steps for laptop-specific failures.",
+    mimeType: "application/json",
+  }, async (uri) => jsonResource(uri.toString(), { count: LAPTOP_FAILURE_PATTERNS.length, patterns: LAPTOP_FAILURE_PATTERNS }));
+
+  server.registerResource("gpu-failures", "biospy://db/gpu-failures", {
+    title: "GPU failure pattern catalog (45+ patterns)",
+    description: "Symptoms → causes → diagnostic steps for GPU-specific failures.",
+    mimeType: "application/json",
+  }, async (uri) => jsonResource(uri.toString(), { count: GPU_FAILURE_PATTERNS.length, patterns: GPU_FAILURE_PATTERNS }));
+
+  server.registerResource("ssd-failures", "biospy://db/ssd-failures", {
+    title: "SSD/NVMe failure pattern catalog",
+    description: "Controller-keyed firmware/brick/capacity/recovery patterns.",
+    mimeType: "application/json",
+  }, async (uri) => jsonResource(uri.toString(), { count: SSD_FAILURE_PATTERNS.length, patterns: SSD_FAILURE_PATTERNS }));
+
+  server.registerResource("voltage-refs", "biospy://db/voltage-refs", {
+    title: "Voltage reference tables (ATX, EPS, PCIe, board, SPI)",
+    description: "Expected voltages + tolerances per pin/rail for each connector.",
+    mimeType: "application/json",
+  }, async (uri) => jsonResource(uri.toString(), { count: ALL_REFERENCES.length, references: ALL_REFERENCES }));
 
   // ─── Information tools (read-only, safe) ───
 
