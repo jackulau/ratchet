@@ -3402,6 +3402,139 @@ export async function runSelfTest(): Promise<boolean> {
 
   try { await unlink(mcpImgPath); } catch {}
 
+  // ─── Specialist diagnostic --json (D1 of goal-3) ───
+  // 13 commands. Each hit + miss path exercised via subprocess.
+  console.log("\nSpecialist Diagnostic JSON");
+
+  results.push(await runTest("diag-json: `gpu-diag --json` lists controllers", async () => {
+    const { stdout, code } = await runCli(["gpu-diag", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "gpu-diag", true);
+    assertEqual(p.data.mode, "list", "mode=list");
+    assert(p.data.controllerCount > 0, "≥1 controller");
+  }));
+
+  results.push(await runTest("diag-json: `gpu-diag --vrm <bogus> --json` returns NOT_FOUND", async () => {
+    const { stdout, code } = await runCli(["gpu-diag", "--vrm", "notarealvrmxyz", "--json"]);
+    assertEqual(code, 1, "exit 1");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "gpu-diag", false);
+    assertEqual(p.error.code, "NOT_FOUND", "NOT_FOUND");
+  }));
+
+  results.push(await runTest("diag-json: `gpu-failures --category thermal --json`", async () => {
+    const { stdout, code } = await runCli(["gpu-failures", "--category", "thermal", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "gpu-failures", true);
+    assertEqual(p.data.mode, "category", "mode=category");
+  }));
+
+  results.push(await runTest("diag-json: `laptop-diag --json` lists platforms", async () => {
+    const { stdout, code } = await runCli(["laptop-diag", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "laptop-diag", true);
+    assert(p.data.platformCount > 0, "≥1 platform");
+  }));
+
+  results.push(await runTest("diag-json: `laptop-power skylake --json` returns sequence", async () => {
+    const { stdout, code } = await runCli(["laptop-power", "skylake", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "laptop-power", true);
+    assert(Array.isArray(p.data.powerSequence), "powerSequence is array");
+  }));
+
+  results.push(await runTest("diag-json: `laptop-failures battery --json` returns patterns", async () => {
+    const { stdout, code } = await runCli(["laptop-failures", "battery", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "laptop-failures", true);
+    assert(p.data.count > 0, "≥1 pattern");
+  }));
+
+  results.push(await runTest("diag-json: `storage-diag --json` lists SSD controllers", async () => {
+    const { stdout, code } = await runCli(["storage-diag", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "storage-diag", true);
+    assert(p.data.controllerCount > 0, "≥1 controller");
+  }));
+
+  results.push(await runTest("diag-json: `storage-diag --smart 5 --json`", async () => {
+    const { stdout, code } = await runCli(["storage-diag", "--smart", "5", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "storage-diag", true);
+    assertEqual(p.data.mode, "smart", "mode=smart");
+  }));
+
+  results.push(await runTest("diag-json: `nand-check tlc --json` returns patterns/chips", async () => {
+    const { stdout, code } = await runCli(["nand-check", "tlc", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "nand-check", true);
+    assert(p.data.mode === "chip" || p.data.mode === "diag", "mode is chip or diag");
+  }));
+
+  results.push(await runTest("diag-json: `hdd-pcb --mfr seagate --json`", async () => {
+    const { stdout, code } = await runCli(["hdd-pcb", "--mfr", "seagate", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "hdd-pcb", true);
+    assertEqual(p.data.mode, "mfr", "mode=mfr");
+  }));
+
+  results.push(await runTest("diag-json: `storage-recovery --json` lists workflows", async () => {
+    const { stdout, code } = await runCli(["storage-recovery", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "storage-recovery", true);
+    assert(p.data.count > 0, "≥1 workflow");
+  }));
+
+  results.push(await runTest("diag-json: `router-flash --json` lists layouts", async () => {
+    const { stdout, code } = await runCli(["router-flash", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "router-flash", true);
+    assert(p.data.layoutCount > 0, "≥1 layout");
+  }));
+
+  results.push(await runTest("diag-json: `mcu-info --json` lists MCUs", async () => {
+    const { stdout, code } = await runCli(["mcu-info", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "mcu-info", true);
+    assert(p.data.count > 0, "≥1 MCU");
+  }));
+
+  results.push(await runTest("diag-json: `mcu-info STM32 --json` returns search", async () => {
+    const { stdout, code } = await runCli(["mcu-info", "STM32", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "mcu-info", true);
+    assert(p.data.count > 0, "STM32 in DB");
+  }));
+
+  results.push(await runTest("diag-json: `jtag-ref --json` lists pinouts", async () => {
+    const { stdout, code } = await runCli(["jtag-ref", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "jtag-ref", true);
+    assert(Array.isArray(p.data.pinouts), "pinouts array");
+  }));
+
+  results.push(await runTest("diag-json: `poe-diag --json` lists controllers", async () => {
+    const { stdout, code } = await runCli(["poe-diag", "--json"]);
+    assertEqual(code, 0, "exit 0");
+    const p = JSON.parse(stdout);
+    assertEnvelope(p, "poe-diag", true);
+    assert(p.data.count > 0, "≥1 controller");
+  }));
+
   // ─── Safety enforcement audit (D6) ───
   // End-to-end check that destructive operations refuse without the right gates,
   // both via CLI and via MCP. These are the "guardrails that survived in a real run" tests.

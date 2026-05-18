@@ -2112,14 +2112,17 @@ async function cmdPowerSequence(args: Args) {
 }
 
 async function cmdLaptopDiag(args: Args) {
+  const json = wantsJson(args.flags);
   const brandIdx = args.flags.indexOf("--brand");
   if (brandIdx >= 0) {
     const brandKey = args.flags[brandIdx + 1]?.toLowerCase();
     const guide = brandKey ? LAPTOP_BRAND_GUIDES[brandKey] : undefined;
     if (!guide) {
+      if (json) { agentFail("laptop-diag", "UNKNOWN_BRAND", `Unknown brand "${brandKey}"`, `Available: ${Object.keys(LAPTOP_BRAND_GUIDES).join(", ")}`); process.exit(1); }
       out.fail(`Unknown brand "${brandKey}". Available: ${Object.keys(LAPTOP_BRAND_GUIDES).join(", ")}`);
       process.exit(1);
     }
+    if (json) { agentOk("laptop-diag", { mode: "brand", brand: brandKey, guide }); return; }
     out.header(`${guide.brand} — Repair Guide`);
     console.log();
     out.kvLine("BIOS access", guide.biosAccessKey);
@@ -2143,6 +2146,7 @@ async function cmdLaptopDiag(args: Args) {
   const query = args.positional.join(" ");
 
   if (!query) {
+    if (json) { agentOk("laptop-diag", { mode: "list", platformCount: ALL_LAPTOP_PLATFORMS.length, platforms: ALL_LAPTOP_PLATFORMS, brands: Object.keys(LAPTOP_BRAND_GUIDES) }); return; }
     out.header("Laptop Platform Database");
     console.log();
     out.info("Intel Platforms:");
@@ -2170,9 +2174,12 @@ async function cmdLaptopDiag(args: Args) {
 
   const platform = lookupPlatform(query);
   if (!platform) {
+    if (json) { agentFail("laptop-diag", "NOT_FOUND", `No platform matching "${query}"`, "Try: haswell, broadwell, skylake, raptor lake, zen2, zen4..."); process.exit(1); }
     out.fail(`No platform matching "${query}". Try: haswell, broadwell, skylake, raptor lake, zen2, zen4...`);
     process.exit(1);
   }
+
+  if (json) { agentOk("laptop-diag", { mode: "platform", query, platform }); return; }
 
   out.header(`${platform.name} — ${platform.codename} (${platform.vendor.toUpperCase()} ${platform.generation})`);
   console.log();
@@ -2195,6 +2202,7 @@ async function cmdLaptopDiag(args: Args) {
 }
 
 async function cmdLaptopPower(args: Args) {
+  const json = wantsJson(args.flags);
   const platformQuery = args.positional.join(" ");
 
   const hasSymptoms = args.flags.some(f =>
@@ -2205,6 +2213,7 @@ async function cmdLaptopPower(args: Args) {
   );
 
   if (!platformQuery) {
+    if (json) { agentFail("laptop-power", "MISSING_ARG", "Platform required", undefined, `Platforms: ${ALL_LAPTOP_PLATFORMS.map(p => p.codename).slice(0, 8).join(", ")}...`); process.exit(1); }
     out.header("Laptop Power Rail Analyzer");
     console.log();
     out.dim("Analyzes laptop power-on sequence by platform and symptoms.");
@@ -2232,12 +2241,14 @@ async function cmdLaptopPower(args: Args) {
 
   const platform = lookupPlatform(platformQuery);
   if (!platform) {
+    if (json) { agentFail("laptop-power", "NOT_FOUND", `No platform matching "${platformQuery}"`); process.exit(1); }
     out.fail(`No platform matching "${platformQuery}".`);
     out.dim(`Available: ${ALL_LAPTOP_PLATFORMS.map(p => p.codename).join(", ")}`);
     process.exit(1);
   }
 
   if (!hasSymptoms) {
+    if (json) { agentOk("laptop-power", { mode: "sequence", platform: platform.codename, powerSequence: platform.powerSequence }, "Pass symptom flags for analysis."); return; }
     out.header(`${platform.name} — Power Rail Sequence`);
     console.log();
     for (const stage of platform.powerSequence) {
@@ -2271,6 +2282,8 @@ async function cmdLaptopPower(args: Args) {
   const analysis = analyzeLaptopPower(platform, symptoms);
   const pct = Math.round(analysis.confidence * 100);
 
+  if (json) { agentOk("laptop-power", { mode: "analysis", platform: platform.codename, symptoms, suspectedStage: analysis.suspectedStage, confidence: analysis.confidence, reasoning: analysis.reasoning, nextChecks: analysis.nextChecks }); return; }
+
   out.header(`Laptop Power Analysis — ${platform.name}`);
   console.log();
   out.info(`Suspected failed stage: ${analysis.suspectedStage.name} (${pct}% confidence)`);
@@ -2288,6 +2301,7 @@ async function cmdLaptopPower(args: Args) {
 }
 
 async function cmdLaptopFailures(args: Args) {
+  const json = wantsJson(args.flags);
   let categoryFilter: string | undefined;
   const catIdx = args.flags.indexOf("--category");
   if (catIdx >= 0 && args.flags[catIdx + 1]) {
@@ -2297,9 +2311,11 @@ async function cmdLaptopFailures(args: Args) {
   if (categoryFilter) {
     const patterns = getLaptopPatternsByCategory(categoryFilter);
     if (patterns.length === 0) {
+      if (json) { agentFail("laptop-failures", "UNKNOWN_CATEGORY", `No patterns in category "${categoryFilter}"`, "Valid: power, display, keyboard, audio, network, usb, storage, battery, boot, thermal"); process.exit(1); }
       out.fail(`No patterns in category "${categoryFilter}". Categories: power, display, keyboard, audio, network, usb, storage, battery, boot, thermal`);
       process.exit(1);
     }
+    if (json) { agentOk("laptop-failures", { mode: "category", category: categoryFilter, count: patterns.length, patterns }); return; }
     out.header(`Laptop Failure Patterns — ${categoryFilter.toUpperCase()} (${patterns.length} patterns)`);
     console.log();
     for (const p of patterns) {
@@ -2312,6 +2328,7 @@ async function cmdLaptopFailures(args: Args) {
 
   const query = args.positional.join(" ");
   if (!query) {
+    if (json) { agentFail("laptop-failures", "MISSING_ARG", "Query or category required"); process.exit(1); }
     out.fail("Usage: biospy laptop-failures <symptom> | biospy laptop-failures --category <category>");
     out.dim("Examples:");
     out.dim('  biospy laptop-failures "no power"');
@@ -2324,10 +2341,13 @@ async function cmdLaptopFailures(args: Args) {
 
   const results = searchLaptopFailurePatterns(query);
   if (results.length === 0) {
+    if (json) { agentOk("laptop-failures", { mode: "search", query, count: 0, patterns: [] }, "Try broader terms"); return; }
     out.warn(`No laptop failure patterns match "${query}"`);
     out.dim("Try: power, display, keyboard, audio, network, usb, storage, battery, boot, thermal");
     return;
   }
+
+  if (json) { agentOk("laptop-failures", { mode: "search", query, count: results.length, patterns: results.slice(0, 10) }); return; }
 
   const shown = results.slice(0, 5);
   out.header(`Laptop Failures matching "${query}" (${results.length} found, showing top ${shown.length})`);
@@ -2361,19 +2381,29 @@ async function cmdLaptopFailures(args: Args) {
 }
 
 async function cmdGpuDiag(args: Args) {
+  const json = wantsJson(args.flags);
   const vrmIdx = args.flags.indexOf("--vrm");
   if (vrmIdx >= 0) {
     const vrmQuery = args.flags[vrmIdx + 1];
     if (!vrmQuery) {
+      if (json) { agentFail("gpu-diag", "MISSING_ARG", "VRM query required", undefined, `Use one of: ${VRM_CONTROLLERS.map(c => c.name).slice(0, 5).join(", ")}`); process.exit(1); }
       out.fail("Usage: biospy gpu-diag --vrm <controller-name>");
       out.dim(`Available: ${VRM_CONTROLLERS.map(c => c.name).join(", ")}`);
       process.exit(1);
     }
     const controller = lookupVrmController(vrmQuery);
     if (!controller) {
+      if (json) { agentFail("gpu-diag", "NOT_FOUND", `No VRM controller matching "${vrmQuery}"`, undefined, "Use `biospy gpu-diag` to list controllers."); process.exit(1); }
       out.fail(`No VRM controller matching "${vrmQuery}".`);
       out.dim(`Available: ${VRM_CONTROLLERS.map(c => c.name).join(", ")}`);
       process.exit(1);
+    }
+    const faults = VRM_FAULT_SIGNATURES.filter(f =>
+      f.controller.toLowerCase().includes(controller.name.toLowerCase()) || f.controller === "Any" || f.controller.startsWith("Any")
+    );
+    if (json) {
+      agentOk("gpu-diag", { mode: "vrm", controller, faults: faults.slice(0, 10) });
+      return;
     }
     out.header(`${controller.name} — ${controller.manufacturer}`);
     console.log();
@@ -2386,9 +2416,6 @@ async function cmdGpuDiag(args: Args) {
     out.info("Common GPUs:");
     for (const g of controller.commonGpus) out.dim(`  • ${g}`);
 
-    const faults = VRM_FAULT_SIGNATURES.filter(f =>
-      f.controller.toLowerCase().includes(controller.name.toLowerCase()) || f.controller === "Any" || f.controller.startsWith("Any")
-    );
     console.log();
     out.info(`Related fault signatures (${faults.length}):`);
     for (const f of faults.slice(0, 5)) {
@@ -2401,6 +2428,10 @@ async function cmdGpuDiag(args: Args) {
   const query = args.positional.join(" ");
 
   if (!query) {
+    if (json) {
+      agentOk("gpu-diag", { mode: "list", controllerCount: VRM_CONTROLLERS.length, controllers: VRM_CONTROLLERS, memoryTestPatterns: GPU_MEMORY_TEST_PATTERNS, vramChipCount: VRAM_CHIPS.length });
+      return;
+    }
     out.header("GPU VRM Controller Database");
     console.log();
     const rows = [["Controller", "Manufacturer", "Phases", "Type"]];
@@ -2424,8 +2455,14 @@ async function cmdGpuDiag(args: Args) {
 
   const faults = searchVrmFaults(query);
   if (faults.length === 0) {
+    if (json) { agentOk("gpu-diag", { mode: "search", query, count: 0, faults: [] }, "Try: short, overvoltage, overcurrent, phase, ripple, coil whine"); return; }
     out.warn(`No VRM faults matching "${query}"`);
     out.dim("Try: short, overvoltage, overcurrent, phase, ripple, coil whine");
+    return;
+  }
+
+  if (json) {
+    agentOk("gpu-diag", { mode: "search", query, count: faults.length, faults: faults.slice(0, 10) });
     return;
   }
 
@@ -2471,6 +2508,7 @@ async function cmdVbiosInfo(args: Args) {
 }
 
 async function cmdGpuFailures(args: Args) {
+  const json = wantsJson(args.flags);
   let categoryFilter: string | undefined;
   const catIdx = args.flags.indexOf("--category");
   if (catIdx >= 0 && args.flags[catIdx + 1]) {
@@ -2480,9 +2518,11 @@ async function cmdGpuFailures(args: Args) {
   if (categoryFilter) {
     const patterns = getGpuPatternsByCategory(categoryFilter);
     if (patterns.length === 0) {
+      if (json) { agentFail("gpu-failures", "UNKNOWN_CATEGORY", `No patterns in category "${categoryFilter}"`, "Valid: artifacts, no-display, fan, crash, memory, power, thermal, driver"); process.exit(1); }
       out.fail(`No patterns in category "${categoryFilter}". Categories: artifacts, no-display, fan, crash, memory, power, thermal, driver`);
       process.exit(1);
     }
+    if (json) { agentOk("gpu-failures", { mode: "category", category: categoryFilter, count: patterns.length, patterns }); return; }
     out.header(`GPU Failure Patterns — ${categoryFilter.toUpperCase()} (${patterns.length} patterns)`);
     console.log();
     for (const p of patterns) {
@@ -2495,6 +2535,7 @@ async function cmdGpuFailures(args: Args) {
 
   const query = args.positional.join(" ");
   if (!query) {
+    if (json) { agentFail("gpu-failures", "MISSING_ARG", "Query or category required", undefined, "biospy gpu-failures <symptom> | --category <name>"); process.exit(1); }
     out.fail("Usage: biospy gpu-failures <symptom> | biospy gpu-failures --category <category>");
     out.dim("Examples:");
     out.dim('  biospy gpu-failures "artifacts"');
@@ -2507,10 +2548,13 @@ async function cmdGpuFailures(args: Args) {
 
   const results = searchGpuFailurePatterns(query);
   if (results.length === 0) {
+    if (json) { agentOk("gpu-failures", { mode: "search", query, count: 0, patterns: [] }, "Try broader terms"); return; }
     out.warn(`No GPU failure patterns match "${query}"`);
     out.dim("Try: artifacts, no display, fan, crash, memory, power, thermal, driver");
     return;
   }
+
+  if (json) { agentOk("gpu-failures", { mode: "search", query, count: results.length, patterns: results.slice(0, 10) }); return; }
 
   const shown = results.slice(0, 5);
   out.header(`GPU Failures matching "${query}" (${results.length} found, showing top ${shown.length})`);
@@ -2542,15 +2586,19 @@ async function cmdGpuFailures(args: Args) {
 // ═══ Storage Diagnostics ═══
 
 async function cmdStorageDiag(args: Args) {
+  const json = wantsJson(args.flags);
   const controllerIdx = args.flags.indexOf("--controller");
   if (controllerIdx >= 0) {
     const name = args.flags[controllerIdx + 1];
     const ctrl = lookupSsdController(name);
     if (!ctrl) {
+      if (json) { agentFail("storage-diag", "NOT_FOUND", `SSD controller "${name}" not found`, "Try: SM2259XT, PS5018-E18, 88SS1100, Phoenix, Elpis"); process.exit(1); }
       out.fail(`SSD controller "${name}" not found`);
       out.dim("Try: SM2259XT, PS5018-E18, 88SS1100, Phoenix, Elpis, etc.");
       process.exit(1);
     }
+
+    if (json) { agentOk("storage-diag", { mode: "controller", controller: ctrl }); return; }
 
     out.header(`${ctrl.name} — ${ctrl.manufacturer}`);
     console.log();
@@ -2576,15 +2624,18 @@ async function cmdStorageDiag(args: Args) {
     const attrStr = args.flags[smartIdx + 1];
     const attrId = parseInt(attrStr, 10);
     if (isNaN(attrId)) {
+      if (json) { agentFail("storage-diag", "INVALID_ARG", `Invalid SMART attribute ID: "${attrStr}"`); process.exit(1); }
       out.fail(`Invalid SMART attribute ID: "${attrStr}"`);
       process.exit(1);
     }
     const indicator = interpretSmartAttribute(attrId);
     if (!indicator) {
+      if (json) { agentOk("storage-diag", { mode: "smart", attrId, indicator: null }, "Known attributes: 5, 171, 172, 173, 174, 177, 187, 199, 231, 233"); return; }
       out.warn(`SMART attribute ${attrId} not in database`);
       out.dim("Known attributes: 5, 171, 172, 173, 174, 177, 187, 199, 231, 233");
       return;
     }
+    if (json) { agentOk("storage-diag", { mode: "smart", indicator }); return; }
     out.header(`SMART Attribute ${indicator.smartAttribute}: ${indicator.name}`);
     console.log();
     out.kvLine("Description", indicator.description);
@@ -2599,6 +2650,7 @@ async function cmdStorageDiag(args: Args) {
 
   const query = args.positional.join(" ");
   if (!query) {
+    if (json) { agentOk("storage-diag", { mode: "list", controllerCount: SSD_CONTROLLERS.length, controllers: SSD_CONTROLLERS }); return; }
     out.header("SSD Controller Database");
     console.log();
     out.info(`  ${"Controller".padEnd(16)} ${"Manufacturer".padEnd(30)} ${"Type".padEnd(6)} ${"Ch".padEnd(4)} DRAM`);
@@ -2616,10 +2668,13 @@ async function cmdStorageDiag(args: Args) {
 
   const results = searchSsdFailures(query);
   if (results.length === 0) {
+    if (json) { agentOk("storage-diag", { mode: "search", query, count: 0, failures: [] }, "Try: firmware, brick, capacity, read-only, power loss"); return; }
     out.warn(`No SSD failure patterns match "${query}"`);
     out.dim("Try: firmware, brick, capacity, read-only, power loss, etc.");
     return;
   }
+
+  if (json) { agentOk("storage-diag", { mode: "search", query, count: results.length, failures: results.slice(0, 10) }); return; }
 
   const shown = results.slice(0, 5);
   out.header(`SSD Failures matching "${query}" (${results.length} found, showing top ${shown.length})`);
@@ -2641,6 +2696,7 @@ async function cmdStorageDiag(args: Args) {
 }
 
 async function cmdNandCheck(args: Args) {
+  const json = wantsJson(args.flags);
   let categoryFilter: string | undefined;
   const catIdx = args.flags.indexOf("--category");
   if (catIdx >= 0 && args.flags[catIdx + 1]) {
@@ -2650,9 +2706,11 @@ async function cmdNandCheck(args: Args) {
   if (categoryFilter) {
     const patterns = getNandPatternsByCategory(categoryFilter as any);
     if (patterns.length === 0) {
+      if (json) { agentFail("nand-check", "UNKNOWN_CATEGORY", `No patterns in category "${categoryFilter}"`, "Valid: bad-blocks, read-errors, retention, wear, ecc, controller-nand"); process.exit(1); }
       out.fail(`No patterns in category "${categoryFilter}". Categories: bad-blocks, read-errors, retention, wear, ecc, controller-nand`);
       process.exit(1);
     }
+    if (json) { agentOk("nand-check", { mode: "category", category: categoryFilter, count: patterns.length, patterns }); return; }
     out.header(`NAND Diagnostic Patterns — ${categoryFilter.toUpperCase()} (${patterns.length})`);
     console.log();
     for (const p of patterns) {
@@ -2664,6 +2722,7 @@ async function cmdNandCheck(args: Args) {
 
   const query = args.positional.join(" ");
   if (!query) {
+    if (json) { agentFail("nand-check", "MISSING_ARG", "Query or category required", undefined, "biospy nand-check <symptom> | --category <name>"); process.exit(1); }
     out.header("NAND Flash Diagnostics");
     console.log();
     out.info(`NAND Chips in database: ${NAND_CHIPS.length}`);
@@ -2682,6 +2741,7 @@ async function cmdNandCheck(args: Args) {
 
   const chipResults = lookupNandChip(query);
   if (chipResults.length > 0) {
+    if (json) { agentOk("nand-check", { mode: "chip", query, count: chipResults.length, chips: chipResults.slice(0, 10) }); return; }
     out.header(`NAND Chips matching "${query}" (${chipResults.length})`);
     for (const c of chipResults.slice(0, 5)) {
       console.log();
@@ -2699,10 +2759,13 @@ async function cmdNandCheck(args: Args) {
 
   const results = searchNandDiagPatterns(query);
   if (results.length === 0) {
+    if (json) { agentOk("nand-check", { mode: "diag", query, count: 0, patterns: [] }, "Try broader terms"); return; }
     out.warn(`No NAND diagnostic patterns match "${query}"`);
     out.dim("Try: bad blocks, read errors, retention, wear, ecc, timing");
     return;
   }
+
+  if (json) { agentOk("nand-check", { mode: "diag", query, count: results.length, patterns: results.slice(0, 10) }); return; }
 
   const shown = results.slice(0, 5);
   out.header(`NAND Diagnostics matching "${query}" (${results.length} found, showing top ${shown.length})`);
@@ -2726,14 +2789,17 @@ async function cmdNandCheck(args: Args) {
 }
 
 async function cmdHddPcb(args: Args) {
+  const json = wantsJson(args.flags);
   const mfrIdx = args.flags.indexOf("--mfr");
   if (mfrIdx >= 0) {
     const mfr = args.flags[mfrIdx + 1]?.toLowerCase() as any;
     const procedures = getHddProceduresByManufacturer(mfr);
     if (procedures.length === 0) {
+      if (json) { agentFail("hdd-pcb", "NOT_FOUND", `No procedures for manufacturer "${mfr}"`, "Try: seagate, western-digital, hitachi, toshiba, samsung"); process.exit(1); }
       out.fail(`No procedures for manufacturer "${mfr}". Try: seagate, western-digital, hitachi, toshiba, samsung`);
       process.exit(1);
     }
+    if (json) { agentOk("hdd-pcb", { mode: "mfr", manufacturer: mfr, count: procedures.length, procedures }); return; }
     out.header(`HDD PCB Procedures — ${mfr.toUpperCase()} (${procedures.length})`);
     console.log();
     for (const p of procedures) {
@@ -2745,6 +2811,7 @@ async function cmdHddPcb(args: Args) {
 
   const query = args.positional.join(" ");
   if (!query) {
+    if (json) { agentFail("hdd-pcb", "MISSING_ARG", "Query or --mfr required", undefined, "biospy hdd-pcb <symptom> | --mfr <name>"); process.exit(1); }
     out.header("HDD PCB Repair Database");
     console.log();
     out.info(`PCB chips in database: ${HDD_PCB_CHIPS.length}`);
@@ -2763,6 +2830,7 @@ async function cmdHddPcb(args: Args) {
 
   const chipResults = lookupHddPcbChip(query);
   if (chipResults.length > 0 && !query.includes(" ")) {
+    if (json) { agentOk("hdd-pcb", { mode: "chip", query, count: chipResults.length, chips: chipResults.slice(0, 10) }); return; }
     out.header(`HDD PCB Chips matching "${query}" (${chipResults.length})`);
     for (const c of chipResults.slice(0, 5)) {
       console.log();
@@ -2781,10 +2849,13 @@ async function cmdHddPcb(args: Args) {
   const failResults = searchHddPcbFailures(query);
 
   if (procResults.length === 0 && failResults.length === 0) {
+    if (json) { agentOk("hdd-pcb", { mode: "search", query, procedures: [], failures: [] }, "Try: rom swap, clicking, tvs, seagate f3, firmware, motor"); return; }
     out.warn(`No HDD PCB results match "${query}"`);
     out.dim("Try: rom swap, clicking, tvs, seagate f3, firmware, motor, etc.");
     return;
   }
+
+  if (json) { agentOk("hdd-pcb", { mode: "search", query, procedures: procResults.slice(0, 5), failures: failResults.slice(0, 5) }); return; }
 
   if (failResults.length > 0) {
     const shown = failResults.slice(0, 3);
@@ -2831,9 +2902,11 @@ async function cmdHddPcb(args: Args) {
 }
 
 async function cmdStorageWorkflows(args: Args) {
+  const json = wantsJson(args.flags);
   const query = args.positional.join(" ");
 
   if (!query) {
+    if (json) { agentOk("storage-recovery", { mode: "list", count: listStorageWorkflows().length, workflows: listStorageWorkflows().map(w => ({ id: w.id, name: w.name, category: w.category, difficulty: w.difficulty })) }); return; }
     out.header("Storage Recovery Workflows");
     console.log();
     for (const wf of listStorageWorkflows()) {
@@ -2848,6 +2921,7 @@ async function cmdStorageWorkflows(args: Args) {
 
   const wf = getStorageWorkflow(query);
   if (wf) {
+    if (json) { agentOk("storage-recovery", { mode: "workflow", workflow: wf }); return; }
     out.header(`${wf.name}  [${wf.category}]  Difficulty: ${"★".repeat(wf.difficulty)}${"☆".repeat(5 - wf.difficulty)}`);
     out.dim(`  ${wf.description}`);
     console.log();
@@ -2876,10 +2950,13 @@ async function cmdStorageWorkflows(args: Args) {
 
   const results = searchStorageWorkflows(query);
   if (results.length === 0) {
+    if (json) { agentOk("storage-recovery", { mode: "search", query, count: 0, workflows: [] }, "Try: ssd, hdd, firmware, nand, recovery, clicking"); return; }
     out.warn(`No storage workflows match "${query}"`);
     out.dim("Try: ssd, hdd, firmware, nand, recovery, clicking, etc.");
     return;
   }
+
+  if (json) { agentOk("storage-recovery", { mode: "search", query, count: results.length, workflows: results.slice(0, 10).map(w => ({ id: w.id, name: w.name, description: w.description, category: w.category })) }); return; }
 
   out.header(`Storage Workflows matching "${query}" (${results.length})`);
   for (const wf of results.slice(0, 5)) {
@@ -2895,15 +2972,18 @@ async function cmdStorageWorkflows(args: Args) {
 // ═══ Network & Embedded Diagnostics ═══
 
 async function cmdRouterFlash(args: Args) {
+  const json = wantsJson(args.flags);
   const brandIdx = args.flags.indexOf("--brand");
   if (brandIdx >= 0) {
     const brand = args.flags[brandIdx + 1];
     const layouts = getRouterByBrand(brand);
     const procs = getRecoveryByBrand(brand);
     if (layouts.length === 0 && procs.length === 0) {
+      if (json) { agentFail("router-flash", "NOT_FOUND", `No entries for brand "${brand}"`, "Try: tp-link, netgear, ubiquiti, mikrotik, openwrt, linksys, asus"); process.exit(1); }
       out.fail(`No entries for brand "${brand}". Try: tp-link, netgear, ubiquiti, mikrotik, openwrt, linksys, asus`);
       process.exit(1);
     }
+    if (json) { agentOk("router-flash", { mode: "brand", brand, layouts, procedures: procs }); return; }
     if (layouts.length > 0) {
       out.header(`Router Firmware Layouts — ${brand.toUpperCase()} (${layouts.length})`);
       for (const l of layouts) {
@@ -2933,6 +3013,7 @@ async function cmdRouterFlash(args: Args) {
 
   const query = args.positional.join(" ");
   if (!query) {
+    if (json) { agentOk("router-flash", { mode: "list", layoutCount: ROUTER_FIRMWARE_LAYOUTS.length, procedureCount: ROUTER_RECOVERY_PROCEDURES.length, layouts: ROUTER_FIRMWARE_LAYOUTS }, "Pass <query> or --brand <name>"); return; }
     out.header("Router/Switch Firmware Database");
     console.log();
     out.info(`Firmware layouts: ${ROUTER_FIRMWARE_LAYOUTS.length}`);
@@ -2962,10 +3043,13 @@ async function cmdRouterFlash(args: Args) {
   const procs = searchRouterRecovery(query);
 
   if (layouts.length === 0 && procs.length === 0) {
+    if (json) { agentOk("router-flash", { mode: "search", query, layouts: [], procedures: [] }, "Try: tp-link, netgear, ubiquiti, openwrt, tftp, serial, spi, jtag"); return; }
     out.warn(`No router/firmware results match "${query}"`);
     out.dim("Try: tp-link, netgear, ubiquiti, openwrt, tftp, serial, spi, jtag, etc.");
     return;
   }
+
+  if (json) { agentOk("router-flash", { mode: "search", query, layouts: layouts.slice(0, 5), procedures: procs.slice(0, 5) }); return; }
 
   if (layouts.length > 0) {
     const shown = layouts.slice(0, 3);
@@ -3003,8 +3087,10 @@ async function cmdRouterFlash(args: Args) {
 }
 
 async function cmdMcuInfo(args: Args) {
+  const json = wantsJson(args.flags);
   const query = args.positional.join(" ");
   if (!query) {
+    if (json) { agentOk("mcu-info", { mode: "list", count: MCU_DATABASE.length, mcus: MCU_DATABASE }); return; }
     out.header("MCU Flash Identification Database");
     console.log();
     out.info(`  ${"MCU".padEnd(20)} ${"Family".padEnd(12)} ${"Core".padEnd(20)} ${"Flash".padEnd(10)} ${"Programming"}`);
@@ -3022,10 +3108,13 @@ async function cmdMcuInfo(args: Args) {
 
   const results = lookupMcu(query);
   if (results.length === 0) {
+    if (json) { agentOk("mcu-info", { mode: "search", query, count: 0, mcus: [] }, "Try: STM32, ESP32, ATmega, nRF52, RP2040, PIC"); return; }
     out.warn(`No MCU matches "${query}"`);
     out.dim("Try: STM32, ESP32, ATmega, nRF52, RP2040, PIC, etc.");
     return;
   }
+
+  if (json) { agentOk("mcu-info", { mode: "search", query, count: results.length, mcus: results.slice(0, 10) }); return; }
 
   out.header(`MCUs matching "${query}" (${results.length})`);
   for (const m of results.slice(0, 5)) {
@@ -3046,9 +3135,11 @@ async function cmdMcuInfo(args: Args) {
 }
 
 async function cmdJtagRef(args: Args) {
+  const json = wantsJson(args.flags);
   const query = args.positional.join(" ");
 
   if (!query) {
+    if (json) { agentOk("jtag-ref", { mode: "list", pinouts: listJtagPinouts() }); return; }
     out.header("JTAG/SWD Pinout Reference");
     console.log();
     for (const p of listJtagPinouts()) {
@@ -3062,6 +3153,7 @@ async function cmdJtagRef(args: Args) {
 
   const pinout = getJtagPinout(query);
   if (pinout) {
+    if (json) { agentOk("jtag-ref", { mode: "pinout", pinout }); return; }
     out.header(`${pinout.name}  [${pinout.connector}]`);
     out.kvLine("Voltage", pinout.voltage);
     console.log();
@@ -3082,6 +3174,7 @@ async function cmdJtagRef(args: Args) {
 
   const failures = searchEmbeddedFailures(query);
   if (failures.length > 0) {
+    if (json) { agentOk("jtag-ref", { mode: "failures", query, count: failures.length, failures: failures.slice(0, 10) }); return; }
     const shown = failures.slice(0, 3);
     out.header(`Embedded Failures matching "${query}" (${failures.length})`);
     for (const f of shown) {
@@ -3107,14 +3200,17 @@ async function cmdJtagRef(args: Args) {
     return;
   }
 
+  if (json) { agentFail("jtag-ref", "NOT_FOUND", `No JTAG pinout or embedded failure matches "${query}"`, "Pinouts: arm-20pin, arm-10pin-swd, avr-6pin-isp, mips-ejtag-14pin, esp32-jtag"); process.exit(1); }
   out.warn(`No JTAG pinout or embedded failure matches "${query}"`);
   out.dim("Pinouts: arm-20pin, arm-10pin-swd, avr-6pin-isp, mips-ejtag-14pin, esp32-jtag");
   out.dim("Or search embedded failures: flash corruption, bootloader, protection, etc.");
 }
 
 async function cmdPoeDiag(args: Args) {
+  const json = wantsJson(args.flags);
   const query = args.positional.join(" ");
   if (!query) {
+    if (json) { agentOk("poe-diag", { mode: "list", count: POE_CONTROLLERS.length, controllers: POE_CONTROLLERS }); return; }
     out.header("PoE Controller Database");
     console.log();
     out.info(`  ${"Controller".padEnd(14)} ${"Manufacturer".padEnd(20)} ${"Type".padEnd(6)} ${"Standard".padEnd(12)} ${"Ports".padEnd(6)} Max Power`);
@@ -3131,10 +3227,13 @@ async function cmdPoeDiag(args: Args) {
 
   const results = lookupPoEController(query);
   if (results.length === 0) {
+    if (json) { agentOk("poe-diag", { mode: "search", query, count: 0, controllers: [] }, "Try: TPS23861, LTC4266, LTC4291, TPS2372"); return; }
     out.warn(`No PoE controller matches "${query}"`);
     out.dim("Try: TPS23861, LTC4266, LTC4291, TPS2372, etc.");
     return;
   }
+
+  if (json) { agentOk("poe-diag", { mode: "search", query, count: results.length, controllers: results.slice(0, 10) }); return; }
 
   for (const c of results) {
     console.log();
