@@ -3402,6 +3402,155 @@ export async function runSelfTest(): Promise<boolean> {
 
   try { await unlink(mcpImgPath); } catch {}
 
+  // ─── Safety enforcement audit (D6) ───
+  // End-to-end check that destructive operations refuse without the right gates,
+  // both via CLI and via MCP. These are the "guardrails that survived in a real run" tests.
+  console.log("\nSafety Enforcement");
+
+  results.push(await runTest("safety-enforce: CLI `erase` without --confirm exits non-zero", async () => {
+    const { code } = await runCli(["erase", "--dry-run"]);
+    assert(code !== 0, "non-zero exit");
+  }));
+
+  results.push(await runTest("safety-enforce: CLI `region-erase` without --confirm exits non-zero", async () => {
+    const { code } = await runCli(["region-erase", "0x0", "0x1000", "--dry-run"]);
+    assert(code !== 0, "non-zero exit");
+  }));
+
+  results.push(await runTest("safety-enforce: CLI `region-erase` with --confirm but invalid args fails clearly", async () => {
+    const { stdout, stderr, code } = await runCli(["region-erase", "notanumber", "0x1000", "--confirm", "--dry-run"]);
+    assert(code !== 0, "non-zero exit");
+    const combined = stdout + stderr;
+    assert(combined.toLowerCase().includes("invalid"), "explains invalid arg");
+  }));
+
+  results.push(await runTest("safety-enforce: CLI `write` with blank-firmware (all 0xFF) refuses", async () => {
+    const blankPath = join(tmpDir, `safety-blank-${Date.now()}.bin`);
+    await writeFile(blankPath, Buffer.alloc(64, 0xff));
+    try {
+      const { stdout, stderr, code } = await runCli(["write", blankPath, "--dry-run"]);
+      assert(code !== 0, "non-zero exit");
+      const combined = stdout + stderr;
+      assert(combined.toLowerCase().includes("0xff") || combined.toLowerCase().includes("blank"), "mentions blank firmware");
+    } finally { try { await unlink(blankPath); } catch {} }
+  }));
+
+  results.push(await runTest("safety-enforce: CLI `write` with zero-firmware (all 0x00) refuses", async () => {
+    const zeroPath = join(tmpDir, `safety-zero-${Date.now()}.bin`);
+    await writeFile(zeroPath, Buffer.alloc(64, 0x00));
+    try {
+      const { stdout, stderr, code } = await runCli(["write", zeroPath, "--dry-run"]);
+      assert(code !== 0, "non-zero exit");
+      const combined = stdout + stderr;
+      assert(combined.toLowerCase().includes("0x00") || combined.toLowerCase().includes("corrupted") || combined.toLowerCase().includes("zero"), "mentions zero firmware");
+    } finally { try { await unlink(zeroPath); } catch {} }
+  }));
+
+  results.push(await runTest("safety-enforce: CLI `write` with missing file exits non-zero", async () => {
+    const { code } = await runCli(["write", "/nonexistent/firmware.bin", "--dry-run"]);
+    assert(code !== 0, "non-zero exit");
+  }));
+
+  results.push(await runTest("safety-enforce: CLI `write --ndjson` with blank firmware emits BLANK_FIRMWARE error event", async () => {
+    const blankPath = join(tmpDir, `safety-blank-nd-${Date.now()}.bin`);
+    await writeFile(blankPath, Buffer.alloc(64, 0xff));
+    try {
+      const { stdout, code } = await runCli(["write", blankPath, "--dry-run", "--ndjson"]);
+      assertEqual(code, 1, "exit 1");
+      const events = parseNdjsonStream(stdout);
+      assert(events.some((e) => e.type === "error" && (e as any).code === "BLANK_FIRMWARE"), "BLANK_FIRMWARE error event present");
+    } finally { try { await unlink(blankPath); } catch {} }
+  }));
+
+  results.push(await runTest("safety-enforce: MCP write_chip with confirm:false returns MISSING_CONFIRM (not exception)", async () => {
+    const c = await mcpClient();
+    try {
+      const fwPath = join(tmpDir, `safety-mcp-fw-${Date.now()}.bin`);
+      await writeFile(fwPath, Buffer.alloc(64, 0x42));
+      try {
+        const resp = await c.request("tools/call", { name: "write_chip", arguments: { path: fwPath, confirm: false } });
+        const env = parseToolEnvelope(resp.result);
+        assertEqual(env.ok, false, "ok=false");
+        assertEqual(env.error.code, "MISSING_CONFIRM", "error code");
+      } finally { try { await unlink(fwPath); } catch {} }
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("safety-enforce: MCP write_chip with blank firmware returns BLANK_FIRMWARE", async () => {
+    const c = await mcpClient();
+    try {
+      const blankPath = join(tmpDir, `safety-mcp-blank-${Date.now()}.bin`);
+      await writeFile(blankPath, Buffer.alloc(64, 0xff));
+      try {
+        const resp = await c.request("tools/call", { name: "write_chip", arguments: { path: blankPath, confirm: true } });
+        const env = parseToolEnvelope(resp.result);
+        assertEqual(env.error.code, "BLANK_FIRMWARE", "BLANK_FIRMWARE refused");
+      } finally { try { await unlink(blankPath); } catch {} }
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("safety-enforce: MCP write_chip with zero firmware returns ZERO_FIRMWARE", async () => {
+    const c = await mcpClient();
+    try {
+      const zeroPath = join(tmpDir, `safety-mcp-zero-${Date.now()}.bin`);
+      await writeFile(zeroPath, Buffer.alloc(64, 0x00));
+      try {
+        const resp = await c.request("tools/call", { name: "write_chip", arguments: { path: zeroPath, confirm: true } });
+        const env = parseToolEnvelope(resp.result);
+        assertEqual(env.error.code, "ZERO_FIRMWARE", "ZERO_FIRMWARE refused");
+      } finally { try { await unlink(zeroPath); } catch {} }
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("safety-enforce: MCP write_chip with file > chip size returns FILE_TOO_LARGE", async () => {
+    const c = await mcpClient();
+    try {
+      // 16MB file vs 8MB mock chip
+      const bigPath = join(tmpDir, `safety-mcp-big-${Date.now()}.bin`);
+      await writeFile(bigPath, Buffer.alloc(16 * 1024 * 1024, 0x42));
+      try {
+        const resp = await c.request("tools/call", { name: "write_chip", arguments: { path: bigPath, confirm: true } });
+        const env = parseToolEnvelope(resp.result);
+        assertEqual(env.error.code, "FILE_TOO_LARGE", "FILE_TOO_LARGE refused");
+      } finally { try { await unlink(bigPath); } catch {} }
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("safety-enforce: MCP write_chip with missing file returns FILE_NOT_FOUND", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "write_chip", arguments: { path: "/no/such/file.bin", confirm: true } });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.error.code, "FILE_NOT_FOUND", "FILE_NOT_FOUND");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("safety-enforce: MCP erase_chip without confirm:true returns MISSING_CONFIRM", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "erase_chip", arguments: { confirm: false } });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.error.code, "MISSING_CONFIRM", "MISSING_CONFIRM");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("safety-enforce: MCP region_erase without confirm:true returns MISSING_CONFIRM", async () => {
+    const c = await mcpClient();
+    try {
+      const resp = await c.request("tools/call", { name: "region_erase", arguments: { start_addr: 0, length: 4096, confirm: false } });
+      const env = parseToolEnvelope(resp.result);
+      assertEqual(env.error.code, "MISSING_CONFIRM", "MISSING_CONFIRM");
+    } finally { c.close(); }
+  }));
+
+  results.push(await runTest("safety-enforce: voltage gate logic — 1.8V chip would trigger gate (unit-level)", async () => {
+    const { getChipVoltage, lookupChipByJedecId } = await import("./chips/database.js");
+    const chip = lookupChipByJedecId("ef6017");
+    assert(!!chip, "W25Q64FW 1.8V chip present in DB");
+    const v = getChipVoltage(chip!.jedecId);
+    assert(v !== undefined && v < 2.0, `voltage gate condition holds: ${v}V < 2.0V`);
+  }));
+
   // ─── Report ───
   console.log();
   console.log("━".repeat(40));
