@@ -3,5 +3,7 @@ dist/
 *.backup.*.bin
 .DS_Store
 tasks/
+!tasks/cli-smoke.sh
+!tasks/mcp-smoke.sh
 .claude/
 .claude-workspace/
