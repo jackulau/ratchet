@@ -6,6 +6,7 @@ pub mod backends;
 pub mod chips;
 pub mod connection;
 pub mod diagnostics;
+pub mod repl;
 pub mod serial;
 pub mod sfdp;
 pub mod types;
