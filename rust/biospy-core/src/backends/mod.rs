@@ -3,6 +3,7 @@
 // stays in that backend's module.
 
 pub mod ch341a;
+pub mod ch347;
 pub mod mock;
 
 use crate::types::*;
