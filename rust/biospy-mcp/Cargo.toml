@@ -1,0 +1,19 @@
+[package]
+name = "biospy-mcp"
+description = "biospy MCP server binary. JSON-RPC 2.0 over stdio, mirrors TS server tool surface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "biospy-mcp"
+path = "src/main.rs"
+
+[dependencies]
+biospy-core = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }

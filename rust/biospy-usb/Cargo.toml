@@ -1,0 +1,13 @@
+[package]
+name = "biospy-usb"
+description = "Safe Rust wrapper over biospy-usb-sys. RAII handles, typed errors, blocking I/O surface used by biospy backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+biospy-usb-sys = { workspace = true }
+thiserror      = { workspace = true }

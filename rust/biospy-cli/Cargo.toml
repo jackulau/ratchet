@@ -1,0 +1,19 @@
+[package]
+name = "biospy-cli"
+description = "biospy CLI binary — clap-based, all hardware ops + analysis + chip db."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "biospy"
+path = "src/main.rs"
+
+[dependencies]
+biospy-core = { workspace = true }
+clap        = { workspace = true }
+anyhow      = { workspace = true }
+serde_json  = { workspace = true }

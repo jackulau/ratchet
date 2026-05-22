@@ -1,0 +1,15 @@
+[package]
+name = "biospy-node"
+description = "napi-rs bridge — exposes biospy-core as a Node native addon for Node consumers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+biospy-core = { workspace = true }
