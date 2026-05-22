@@ -1,0 +1,31 @@
+{
+  "name": "biospy",
+  "version": "2.0.0-alpha.1",
+  "description": "Modern BIOS chip programmer and debugger (CH341A / CH347) — npm wrapper that downloads the native Rust binary at install time",
+  "license": "MIT",
+  "repository": "github:jacklau/biosMCP",
+  "bin": {
+    "biospy": "bin/biospy.js",
+    "biospy-mcp": "bin/biospy-mcp.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install-binary.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md"
+  ],
+  "keywords": [
+    "bios",
+    "spi-flash",
+    "ch341a",
+    "ch347",
+    "programmer",
+    "uefi",
+    "firmware"
+  ]
+}
