@@ -15,6 +15,12 @@ use serde_json::json;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Top-level alias for the `self-test` subcommand (mirrors TS CLI flag form).
+    #[arg(long = "self-test", global = true)]
+    self_test_flag: bool,
+    /// Top-level alias for `--json` (when used with `--self-test`).
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -197,6 +203,9 @@ fn emit_envelope<T: serde::Serialize>(
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.self_test_flag {
+        return cmd_self_test(cli.json);
+    }
     match cli.command {
         None => {
             println!(
