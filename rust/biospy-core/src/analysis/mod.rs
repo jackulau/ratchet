@@ -4,5 +4,7 @@
 pub mod bios;
 pub mod me;
 pub mod nvram;
+pub mod recovery;
 pub mod regions;
+pub mod repair;
 pub mod uefi;
