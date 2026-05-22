@@ -24,6 +24,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Decode a BIOS POST code across AMI / Award / Phoenix / UEFI tables.
+    PostDecode {
+        /// POST code (hex, with or without `0x` prefix).
+        code: String,
+        /// Restrict to a single BIOS standard (ami|award|phoenix|uefi).
+        #[arg(long)]
+        standard: Option<String>,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,6 +64,39 @@ fn main() -> anyhow::Result<()> {
                         biospy_core::chips::format_size(c.size_bytes),
                         c.voltage
                     );
+                }
+            }
+        }
+        Some(Command::PostDecode {
+            code,
+            standard,
+            json,
+        }) => {
+            use biospy_core::diagnostics::post_codes::{lookup, PostStandard};
+            let std_filter = match standard.as_deref() {
+                Some("ami") => Some(PostStandard::Ami),
+                Some("award") => Some(PostStandard::Award),
+                Some("phoenix") => Some(PostStandard::Phoenix),
+                Some("uefi") => Some(PostStandard::Uefi),
+                Some(other) => {
+                    anyhow::bail!("unknown --standard `{other}` (ami|award|phoenix|uefi)")
+                }
+                None => None,
+            };
+            let hits = lookup(&code, std_filter);
+            if json {
+                println!("{}", serde_json::to_string(&hits)?);
+            } else if hits.is_empty() {
+                println!("no POST code matched: {code}");
+            } else {
+                for h in hits {
+                    println!(
+                        "{:?} {:<6} [{}] {}",
+                        h.standard, h.phase, h.code, h.description
+                    );
+                    for c in &h.causes {
+                        println!("  - {c}");
+                    }
                 }
             }
         }
