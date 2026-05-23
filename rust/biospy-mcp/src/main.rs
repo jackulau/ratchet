@@ -8,6 +8,18 @@ use std::io::{BufRead, BufReader, Write};
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 fn main() -> anyhow::Result<()> {
+    // `--list-tools` short-circuits the JSON-RPC loop and prints just the
+    // registered tool names — handy for shell smoke tests and discovery.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--list-tools") {
+        for t in tool_list() {
+            if let Some(name) = t.get("name").and_then(|v| v.as_str()) {
+                println!("{name}");
+            }
+        }
+        return Ok(());
+    }
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -226,6 +238,128 @@ fn tool_list() -> Vec<Value> {
                 "properties":{"jedec_id":{"type":"string"}}
             }),
         ),
+        // ─── Hardware-capability tools (D28) ─────────────────────────────
+        tool(
+            "i2c_scan",
+            "Probe the I2C bus for ACKing 7-bit addresses (0x08..=0x77)",
+            json!({"type":"object","properties":{}}),
+        ),
+        tool(
+            "i2c_read",
+            "Read bytes from an I2C device at a register address",
+            json!({
+                "type":"object","required":["addr","reg","len"],
+                "properties":{
+                    "addr":{"type":"integer","description":"7-bit I2C address"},
+                    "reg":{"type":"integer"},
+                    "len":{"type":"integer","minimum":1,"maximum":256}
+                }
+            }),
+        ),
+        tool(
+            "i2c_write",
+            "Write hex-encoded bytes to an I2C device",
+            json!({
+                "type":"object","required":["addr","data_hex"],
+                "properties":{
+                    "addr":{"type":"integer"},
+                    "data_hex":{"type":"string"}
+                }
+            }),
+        ),
+        tool(
+            "uart_capture",
+            "Capture from a UART port for N milliseconds",
+            json!({
+                "type":"object","required":["port","baud","duration_ms"],
+                "properties":{
+                    "port":{"type":"string"},
+                    "baud":{"type":"integer"},
+                    "duration_ms":{"type":"integer"}
+                }
+            }),
+        ),
+        tool(
+            "jtag_idcode_scan",
+            "Scan the JTAG chain for IDCODE entries",
+            json!({
+                "type":"object",
+                "properties":{"max_devices":{"type":"integer","default":8}}
+            }),
+        ),
+        tool(
+            "swd_dump_ram",
+            "Read N bytes of target RAM via SWD",
+            json!({
+                "type":"object","required":["addr","len"],
+                "properties":{
+                    "addr":{"type":"integer"},
+                    "len":{"type":"integer","minimum":1}
+                }
+            }),
+        ),
+        tool(
+            "avr_program",
+            "Program an AVR (ATmega328P / ATtiny85 / ATmega2560) over ISP from an Intel HEX file",
+            json!({
+                "type":"object","required":["hex"],
+                "properties":{"hex":{"type":"string","description":"Path to .hex file"}}
+            }),
+        ),
+        tool(
+            "esp_flash",
+            "Flash a binary to ESP32/ESP8266 at a given offset",
+            json!({
+                "type":"object","required":["binary","offset"],
+                "properties":{
+                    "binary":{"type":"string"},
+                    "offset":{"type":"integer"}
+                }
+            }),
+        ),
+        tool(
+            "stm32_swd_flash",
+            "Program STM32 flash via SWD",
+            json!({
+                "type":"object","required":["binary","offset"],
+                "properties":{
+                    "binary":{"type":"string"},
+                    "offset":{"type":"integer"}
+                }
+            }),
+        ),
+        tool(
+            "la_capture",
+            "Capture a window of digital logic samples",
+            json!({
+                "type":"object","required":["channels","rate","samples"],
+                "properties":{
+                    "channels":{"type":"integer","minimum":1,"maximum":8},
+                    "rate":{"type":"integer"},
+                    "samples":{"type":"integer"}
+                }
+            }),
+        ),
+        tool(
+            "bus_pirate_proxy",
+            "Open a transparent terminal bridge to a Bus Pirate USB-CDC port",
+            json!({
+                "type":"object","required":["port"],
+                "properties":{"port":{"type":"string"}}
+            }),
+        ),
+        tool(
+            "can_sniff",
+            "Sniff a CAN bus via a slcan adapter for N milliseconds",
+            json!({
+                "type":"object","required":["port","bitrate_kbps","duration_ms"],
+                "properties":{
+                    "port":{"type":"string"},
+                    "bitrate_kbps":{"type":"integer"},
+                    "duration_ms":{"type":"integer"}
+                }
+            }),
+        ),
     ]
 }
 
@@ -268,6 +402,19 @@ fn tool_call(params: &Value) -> Result<Value, (i32, String)> {
         "post_decode" => call_post_decode(&args)?,
         "failure_search" => call_failure_search(&args)?,
         "voltage_reference" => call_voltage_reference(&args)?,
+        // D28 hardware-capability tools (stubs until live USB wiring lands).
+        "i2c_scan" => call_hw_stub("i2c_scan"),
+        "i2c_read" => call_hw_stub("i2c_read"),
+        "i2c_write" => call_hw_stub("i2c_write"),
+        "uart_capture" => call_hw_stub("uart_capture"),
+        "jtag_idcode_scan" => call_hw_stub("jtag_idcode_scan"),
+        "swd_dump_ram" => call_hw_stub("swd_dump_ram"),
+        "avr_program" => call_hw_stub("avr_program"),
+        "esp_flash" => call_hw_stub("esp_flash"),
+        "stm32_swd_flash" => call_hw_stub("stm32_swd_flash"),
+        "la_capture" => call_hw_stub("la_capture"),
+        "bus_pirate_proxy" => call_hw_stub("bus_pirate_proxy"),
+        "can_sniff" => call_hw_stub("can_sniff"),
         other => return Err((-32601, format!("Unknown tool: {other}"))),
     };
     Ok(json!({
@@ -291,6 +438,17 @@ fn arg_u64(args: &Value, key: &str) -> Result<u64, (i32, String)> {
 
 fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+// ─── Hardware-capability stub (D28) ─────────────────────────────────────────
+
+fn call_hw_stub(name: &str) -> Value {
+    json!({
+        "ok": true,
+        "stub": true,
+        "tool": name,
+        "note": "registered; live USB wiring lands in a follow-up goal"
+    })
 }
 
 // ─── Mock-backed tool impls ──────────────────────────────────────────────────
