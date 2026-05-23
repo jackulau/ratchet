@@ -181,6 +181,303 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// I2C bus operations (scan / read / write / sniff).
+    #[command(subcommand)]
+    I2c(I2cCmd),
+    /// UART operations (open / sniff).
+    #[command(subcommand)]
+    Uart(UartCmd),
+    /// 1-Wire bus operations.
+    #[command(subcommand)]
+    Onewire(OnewireCmd),
+    /// JTAG operations (idcode-scan, bsdl boundary-scan).
+    #[command(subcommand)]
+    Jtag(JtagCmd),
+    /// ARM SWD operations (connect / halt / dump).
+    #[command(subcommand)]
+    Swd(SwdCmd),
+    /// AVR ISP / Arduino bootloader programmers.
+    #[command(subcommand)]
+    Avr(AvrCmd),
+    /// I2C EEPROM (24Cxx) read/write.
+    #[command(subcommand)]
+    EepromI2c(EepromI2cCmd),
+    /// Microwire EEPROM (93xxx) read/write.
+    #[command(subcommand)]
+    EepromMicrowire(EepromMicrowireCmd),
+    /// ESP32 / ESP8266 esptool subset.
+    #[command(subcommand)]
+    Esp(EspCmd),
+    /// STM32 SWD / UART bootloader flashers.
+    #[command(subcommand)]
+    Stm32(Stm32Cmd),
+    /// Logic analyzer capture + export.
+    #[command(subcommand)]
+    La(LaCmd),
+    /// Bus Pirate USB-CDC bridge.
+    #[command(subcommand)]
+    Buspirate(BpCmd),
+    /// slcan CAN adapter (USBtin / CANable).
+    #[command(subcommand)]
+    Can(CanCmd),
+}
+
+// ─── Hardware-capability subcommand enums (D27) ────────────────────────────
+
+#[derive(Subcommand, Debug)]
+enum I2cCmd {
+    /// Probe addresses 0x08..=0x77 for ACK.
+    Scan {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read N bytes from a register on a 7-bit-addressed device.
+    Read {
+        #[arg(long)]
+        addr: String,
+        #[arg(long, default_value = "0")]
+        reg: String,
+        #[arg(long, default_value = "1")]
+        len: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write bytes (hex pairs) to a 7-bit-addressed device.
+    Write {
+        #[arg(long)]
+        addr: String,
+        data: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Passive sniff a saved trace file.
+    Sniff {
+        input: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum UartCmd {
+    /// Open and pump TX/RX (line mode).
+    Open {
+        port: String,
+        #[arg(long, default_value = "115200")]
+        baud: u32,
+    },
+    /// Decode a captured UART trace.
+    Sniff {
+        input: String,
+        #[arg(long, default_value = "115200")]
+        baud: u32,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OnewireCmd {
+    /// Search for 1-Wire ROM IDs on the bus.
+    Scan {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read DS18B20 temperature(s).
+    Temp {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum JtagCmd {
+    /// Scan the chain for IDCODE entries.
+    IdcodeScan {
+        #[arg(long, default_value = "8")]
+        max_devices: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run EXTEST boundary scan from a BSDL file.
+    BsdlScan {
+        bsdl: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SwdCmd {
+    /// Connect + read DPIDR.
+    Connect {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Halt the core.
+    Halt {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume the core.
+    Resume {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Single-step.
+    Step {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Dump memory range to file.
+    Dump {
+        #[arg(long)]
+        addr: String,
+        #[arg(long)]
+        len: usize,
+        output: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AvrCmd {
+    /// Read signature + part name.
+    Signature {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Program flash via ISP from an Intel HEX file.
+    Program {
+        hex: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read fuses (low / high / extended / lock).
+    Fuses {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Chip erase.
+    Erase {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EepromI2cCmd {
+    /// Read a 24Cxx EEPROM to file.
+    Read {
+        #[arg(long)]
+        addr: String,
+        #[arg(long, default_value = "24c256")]
+        part: String,
+        output: String,
+    },
+    /// Write file to a 24Cxx EEPROM.
+    Write {
+        #[arg(long)]
+        addr: String,
+        #[arg(long, default_value = "24c256")]
+        part: String,
+        input: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EepromMicrowireCmd {
+    /// Dump a 93xxx EEPROM to file.
+    Read {
+        #[arg(long, default_value = "93c46")]
+        part: String,
+        #[arg(long, default_value = "16")]
+        org: u8,
+        output: String,
+    },
+    /// Write a 93xxx EEPROM from file.
+    Write {
+        #[arg(long, default_value = "93c46")]
+        part: String,
+        #[arg(long, default_value = "16")]
+        org: u8,
+        input: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EspCmd {
+    /// Detect chip family via the magic register.
+    Detect {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Flash a binary at offset.
+    Flash {
+        #[arg(long, default_value = "0x10000")]
+        offset: String,
+        binary: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum Stm32Cmd {
+    /// SWD-based flasher.
+    SwdFlash {
+        binary: String,
+        #[arg(long, default_value = "0x08000000")]
+        offset: String,
+    },
+    /// UART bootloader flasher (AN3155).
+    UartFlash {
+        binary: String,
+        #[arg(long, default_value = "0x08000000")]
+        offset: String,
+        port: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LaCmd {
+    /// Capture digital samples to file.
+    Capture {
+        #[arg(long, default_value = "8")]
+        channels: u8,
+        #[arg(long, default_value = "1000000")]
+        rate: u32,
+        #[arg(long, default_value = "1024")]
+        samples: usize,
+        output: String,
+    },
+    /// Convert a capture file into Saleae/sigrok/CSV/JSONL format.
+    Export {
+        input: String,
+        output: String,
+        #[arg(long, default_value = "csv")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BpCmd {
+    /// Open transparent terminal bridge to a Bus Pirate.
+    Bridge { port: String },
+    /// Detect / probe a Bus Pirate (enters BBIO + reports).
+    Probe { port: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum CanCmd {
+    /// Sniff incoming CAN frames.
+    Sniff {
+        port: String,
+        #[arg(long, default_value = "500")]
+        bitrate_kbps: u32,
+    },
+    /// Send one frame.
+    Send {
+        port: String,
+        #[arg(long)]
+        id: String,
+        data: String,
+    },
 }
 
 fn force_mock() -> bool {
@@ -259,8 +556,143 @@ fn main() -> anyhow::Result<()> {
         }) => cmd_full_repair(reference.as_deref(), skip_write, json)?,
         Some(Command::FullBackup { json }) => cmd_full_backup(json)?,
         Some(Command::Monitor { interval_ms, json }) => cmd_monitor(interval_ms, json)?,
+        Some(Command::I2c(c)) => cmd_i2c(c)?,
+        Some(Command::Uart(c)) => cmd_uart(c)?,
+        Some(Command::Onewire(c)) => cmd_onewire(c)?,
+        Some(Command::Jtag(c)) => cmd_jtag(c)?,
+        Some(Command::Swd(c)) => cmd_swd(c)?,
+        Some(Command::Avr(c)) => cmd_avr(c)?,
+        Some(Command::EepromI2c(c)) => cmd_eeprom_i2c(c)?,
+        Some(Command::EepromMicrowire(c)) => cmd_eeprom_microwire(c)?,
+        Some(Command::Esp(c)) => cmd_esp(c)?,
+        Some(Command::Stm32(c)) => cmd_stm32(c)?,
+        Some(Command::La(c)) => cmd_la(c)?,
+        Some(Command::Buspirate(c)) => cmd_buspirate(c)?,
+        Some(Command::Can(c)) => cmd_can(c)?,
     }
     Ok(())
+}
+
+// ─── Hardware-capability command handlers (D27) ───────────────────────────
+//
+// These print a structured "not yet wired to live hardware" envelope and
+// exit 0 so smoke tests can verify the CLI surface without real devices.
+// Real-hardware integration follows in D28 + future goals.
+
+fn hw_stub(verb: &str, action: &str, json: bool) -> anyhow::Result<()> {
+    let env = AgentEnvelope::<serde_json::Value>::ok(
+        &format!("{verb} {action}"),
+        json!({
+            "stub": true,
+            "note": "hardware capability registered; live-hardware wiring follows in subsequent goals",
+        }),
+    );
+    if json {
+        println!("{}", serde_json::to_string(&env)?);
+    } else {
+        println!(
+            "{verb} {action}: registered (stub — live hardware path lands in a follow-up goal)"
+        );
+    }
+    Ok(())
+}
+
+fn cmd_i2c(c: I2cCmd) -> anyhow::Result<()> {
+    match c {
+        I2cCmd::Scan { json } => hw_stub("i2c", "scan", json),
+        I2cCmd::Read { json, .. } => hw_stub("i2c", "read", json),
+        I2cCmd::Write { json, .. } => hw_stub("i2c", "write", json),
+        I2cCmd::Sniff { json, .. } => hw_stub("i2c", "sniff", json),
+    }
+}
+
+fn cmd_uart(c: UartCmd) -> anyhow::Result<()> {
+    match c {
+        UartCmd::Open { .. } => hw_stub("uart", "open", false),
+        UartCmd::Sniff { .. } => hw_stub("uart", "sniff", false),
+    }
+}
+
+fn cmd_onewire(c: OnewireCmd) -> anyhow::Result<()> {
+    match c {
+        OnewireCmd::Scan { json } => hw_stub("onewire", "scan", json),
+        OnewireCmd::Temp { json } => hw_stub("onewire", "temp", json),
+    }
+}
+
+fn cmd_jtag(c: JtagCmd) -> anyhow::Result<()> {
+    match c {
+        JtagCmd::IdcodeScan { json, .. } => hw_stub("jtag", "idcode-scan", json),
+        JtagCmd::BsdlScan { json, .. } => hw_stub("jtag", "bsdl-scan", json),
+    }
+}
+
+fn cmd_swd(c: SwdCmd) -> anyhow::Result<()> {
+    match c {
+        SwdCmd::Connect { json } => hw_stub("swd", "connect", json),
+        SwdCmd::Halt { json } => hw_stub("swd", "halt", json),
+        SwdCmd::Resume { json } => hw_stub("swd", "resume", json),
+        SwdCmd::Step { json } => hw_stub("swd", "step", json),
+        SwdCmd::Dump { .. } => hw_stub("swd", "dump", false),
+    }
+}
+
+fn cmd_avr(c: AvrCmd) -> anyhow::Result<()> {
+    match c {
+        AvrCmd::Signature { json } => hw_stub("avr", "signature", json),
+        AvrCmd::Program { json, .. } => hw_stub("avr", "program", json),
+        AvrCmd::Fuses { json } => hw_stub("avr", "fuses", json),
+        AvrCmd::Erase { json } => hw_stub("avr", "erase", json),
+    }
+}
+
+fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
+    match c {
+        EepromI2cCmd::Read { .. } => hw_stub("eeprom-i2c", "read", false),
+        EepromI2cCmd::Write { .. } => hw_stub("eeprom-i2c", "write", false),
+    }
+}
+
+fn cmd_eeprom_microwire(c: EepromMicrowireCmd) -> anyhow::Result<()> {
+    match c {
+        EepromMicrowireCmd::Read { .. } => hw_stub("eeprom-microwire", "read", false),
+        EepromMicrowireCmd::Write { .. } => hw_stub("eeprom-microwire", "write", false),
+    }
+}
+
+fn cmd_esp(c: EspCmd) -> anyhow::Result<()> {
+    match c {
+        EspCmd::Detect { json } => hw_stub("esp", "detect", json),
+        EspCmd::Flash { .. } => hw_stub("esp", "flash", false),
+    }
+}
+
+fn cmd_stm32(c: Stm32Cmd) -> anyhow::Result<()> {
+    match c {
+        Stm32Cmd::SwdFlash { .. } => hw_stub("stm32", "swd-flash", false),
+        Stm32Cmd::UartFlash { .. } => hw_stub("stm32", "uart-flash", false),
+    }
+}
+
+fn cmd_la(c: LaCmd) -> anyhow::Result<()> {
+    match c {
+        LaCmd::Capture { .. } => hw_stub("la", "capture", false),
+        LaCmd::Export { .. } => hw_stub("la", "export", false),
+    }
+}
+
+fn cmd_buspirate(c: BpCmd) -> anyhow::Result<()> {
+    match c {
+        BpCmd::Bridge { .. } => hw_stub("buspirate", "bridge", false),
+        BpCmd::Probe { .. } => hw_stub("buspirate", "probe", false),
+    }
+}
+
+fn cmd_can(c: CanCmd) -> anyhow::Result<()> {
+    match c {
+        CanCmd::Sniff { .. } => hw_stub("can", "sniff", false),
+        CanCmd::Send { .. } => hw_stub("can", "send", false),
+    }
 }
 
 // ─── Command impls ───────────────────────────────────────────────────────────
