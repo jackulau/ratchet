@@ -5,4 +5,5 @@
 // programmers::*, debug::*, instruments::*) build on these primitives to
 // implement I2C, UART, JTAG, SWD, etc.
 
+pub mod ch347_raw;
 pub mod uio;
