@@ -1,6 +1,10 @@
 // ratchet MCP server — hand-rolled JSON-RPC 2.0 over stdio.
-// Skips third-party MCP crates per the goal's "fully custom" objective.
-// Surface: 18 tools mirroring the TS server.
+// Skips third-party MCP crates per the project's "fully custom" objective.
+// Surface: 30 tools — 18 SPI-flash / BIOS analysis + 12 hardware-protocol tools
+// (I2C, UART, JTAG, SWD, AVR/ESP/STM32 programmers, logic analyzer, Bus Pirate,
+// slcan CAN). Hardware-protocol handlers return placeholder JSON until live USB
+// wiring lands; the dispatch surface, JSON-schema descriptors, and arg shapes
+// are real today.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
