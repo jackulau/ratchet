@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Show programmer status (mock-aware when RATCHET_FORCE_MOCK=1).
+    /// Show programmer status. (Today all commands route through MockBackend; RATCHET_FORCE_MOCK is reported but not yet wired to switch backends.)
     Status {
         #[arg(long)]
         json: bool,

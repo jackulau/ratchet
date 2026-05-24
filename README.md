@@ -10,7 +10,19 @@ Replaces AsProgrammer / NeoProgrammer for the SPI-flash path, and overlaps with 
 
 ## Status
 
-Pre-release. Goal-005 shipped the full multi-protocol surface; goals 006 / 007 rebranded and audited. Hardware-protocol code paths (D1 to D26) are implemented and unit-tested mock-backed. **No GitHub Releases are published yet**, so the only supported install route today is from source via `cargo install`.
+Pre-release. Goal-005 shipped the full multi-protocol surface; goals 006 / 007 rebranded and audited; goals 008 / 010 reconciled the README with reality.
+
+What's done today:
+- Full CLI surface (39 top-level subcommands + nested groups). 442 unit + integration tests pass.
+- MCP server with 30 tools. JSON-RPC 2.0 stdio, schema descriptors live.
+- Protocol-level code (CH341A / CH347 packet builders, SPI / I2C / JTAG / SWD / etc.) is implemented and unit-tested.
+
+What's not done yet:
+- **CLI subcommands currently dispatch through `MockBackend` only.** The real-USB backends (`ratchet_core::backends::ch341a`, `ch347`) exist and are unit-tested at the protocol layer, but the CLI command handlers haven't been threaded to choose between mock and live USB yet. `RATCHET_FORCE_MOCK` is reported by `ratchet status` but doesn't currently switch backends (mock is the default and only mode).
+- **MCP handlers are likewise mock-only.** Hardware-protocol handlers (the 12 D28 tools) return placeholder JSON. SPI-flash tools use the mock backend.
+- **No GitHub Releases are published yet**, so the only supported install route today is from source via `cargo install`.
+
+Live USB wiring at the CLI / MCP dispatch level is the next planned goal. Real-hardware behavior is best exercised today by writing integration tests against the protocol-level backends directly.
 
 ## Install
 
@@ -101,7 +113,7 @@ ratchet i2c scan
 ratchet i2c read 0x50 0x00 256
 
 # JTAG IDCODE chain on unknown board
-ratchet jtag scan
+ratchet jtag idcode-scan
 
 # SWD: halt Cortex-M and dump RAM
 ratchet swd connect
@@ -135,8 +147,8 @@ ratchet can sniff /dev/tty.usbmodem*
 | Repair | `full-repair`, `full-backup`, `repl` |
 | Self-test | `self-test` (also exposed as `--self-test` top-level flag) |
 | I2C / UART / 1-Wire | `i2c scan/read/write/sniff`, `uart open/sniff`, `onewire scan` |
-| JTAG / SWD | `jtag scan/bsdl-scan`, `swd connect/halt/dump` |
-| Programmers | `avr program`, `arduino program`, `eeprom-i2c read/write`, `eeprom-microwire read/write`, `esp flash`, `stm32 swd-flash/uart-flash` |
+| JTAG / SWD | `jtag idcode-scan/bsdl-scan`, `swd connect/halt/dump` |
+| Programmers | `avr signature/program/fuses/erase` (ISP + Arduino STK500 bootloader), `eeprom-i2c read/write`, `eeprom-microwire read/write`, `esp flash`, `stm32 swd-flash/uart-flash` |
 | Instruments | `la capture/export`, `buspirate bridge`, `can sniff` |
 
 Every inspection command supports `--json` for AgentEnvelope output:
@@ -152,11 +164,10 @@ ratchet read backup.bin --ndjson
 
 ## Agent Interface (MCP)
 
-ratchet ships a built-in **MCP server** (`ratchet-mcp`) so AI agents (Claude Desktop, mcp-cli, custom SDK clients) can drive the hardware directly. Hand-rolled JSON-RPC 2.0 over stdio. **30 tools total**: 18 SPI-flash / BIOS analysis tools + 12 multi-protocol hardware tools. Hardware-protocol handlers currently return placeholder JSON until live USB wiring lands; the dispatch surface, JSON-schema descriptors, and argument shapes are real.
+ratchet ships a built-in **MCP server** (`ratchet-mcp`) so AI agents (Claude Desktop, mcp-cli, custom SDK clients) can connect to the tool surface over stdio. Hand-rolled JSON-RPC 2.0. **30 tools total**: 18 SPI-flash / BIOS analysis tools + 12 multi-protocol hardware tools. All tool handlers currently run against the mock backend (see [Status](#status)); the JSON-RPC dispatch, schema descriptors, and argument shapes are real.
 
 ```bash
-ratchet-mcp                              # live mode (real USB)
-RATCHET_FORCE_MOCK=1 ratchet-mcp         # mock mode (no hardware)
+ratchet-mcp                              # start the server (stdio, mock backend today)
 ratchet-mcp --list-tools                 # dump tool surface (one name per line)
 ```
 
