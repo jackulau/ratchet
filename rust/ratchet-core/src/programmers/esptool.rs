@@ -13,7 +13,7 @@
 //   DTR=high, RTS=high → EN released, GPIO0 released → boots into ROM loader
 //
 // Chip identification: read register 0x40001000 (UART_DATE) for ESP8266
-// or 0x60000078 for ESP32 — distinct values per chip family.
+// or 0x60000078 for ESP32  -  distinct values per chip family.
 //
 // Reference: github.com/espressif/esptool (esptool.py).
 
@@ -289,7 +289,7 @@ impl EspMockTransport {
 
     pub fn queue_read_reg_reply(&mut self, value: u32) {
         // ESP ROM responses encode the read value in the header's checksum
-        // field (bytes [4..8]), not in the payload — payload carries the
+        // field (bytes [4..8]), not in the payload  -  payload carries the
         // 1-byte status terminator (0=OK, 1=ERR) for stub loader replies.
         let resp = build_command(0x01, CMD_READ_REG, &[0u8, 0u8], value);
         self.rx_queue.push_back(slip_encode(&resp));

@@ -1,6 +1,6 @@
 [package]
 name = "ratchet-cli"
-description = "ratchet CLI binary — clap-based, all hardware ops + analysis + chip db."
+description = "ratchet CLI binary  -  clap-based, all hardware ops + analysis + chip db."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

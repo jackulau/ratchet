@@ -1,8 +1,8 @@
 // Logic-analyzer capture export formats.
 //
-// * CSV — universal; opens in Excel/spreadsheets and most logic-analyzer
+// * CSV  -  universal; opens in Excel/spreadsheets and most logic-analyzer
 //   tools (Saleae Logic 2, PulseView, KingstVIS) accept CSV imports.
-// * JSONL — one record per sample for streaming/scripted analysis.
+// * JSONL  -  one record per sample for streaming/scripted analysis.
 // * Saleae-compatible binary digital-data dump (per-channel packed bytes)
 //   plus a `meta.json` sidecar matching Saleae Logic 2's analyzer plugin
 //   spec. The full `.sal` container is a zip of these; producing the zip
@@ -35,7 +35,7 @@ pub fn write_csv(frame: &CaptureFrame, channels: u8) -> String {
     out
 }
 
-/// JSON Lines export — one object per sample.
+/// JSON Lines export  -  one object per sample.
 pub fn write_jsonl(frame: &CaptureFrame, channels: u8) -> String {
     let mut out = String::new();
     let dt_ns: u64 = 1_000_000_000 / frame.sample_rate_hz.max(1) as u64;
@@ -62,7 +62,7 @@ pub fn write_saleae_meta(frame: &CaptureFrame, channels: u8) -> String {
     )
 }
 
-/// Saleae digital-data binary dump for one channel — 1 bit per sample,
+/// Saleae digital-data binary dump for one channel  -  1 bit per sample,
 /// packed little-endian byte-by-byte (LSB = earliest sample).
 pub fn write_saleae_channel_bin(frame: &CaptureFrame, channel: u8) -> Vec<u8> {
     let mask = 1u8 << channel;

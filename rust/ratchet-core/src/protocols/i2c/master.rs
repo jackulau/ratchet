@@ -1,9 +1,9 @@
-// I2C master driver — backend-agnostic.
+// I2C master driver  -  backend-agnostic.
 //
 // Two transport backends are wired in:
-//   * CH341A UIO bit-bang  (`Ch341aI2c`)   — SCL on D0, SDA on D3, open-drain
+//   * CH341A UIO bit-bang  (`Ch341aI2c`)    -  SCL on D0, SDA on D3, open-drain
 //                                            emulated by toggling direction.
-//   * CH347 native I2C     (`Ch347I2c`)    — uses the chip's I2C engine via
+//   * CH347 native I2C     (`Ch347I2c`)     -  uses the chip's I2C engine via
 //                                            `hw::ch347_raw`.
 //
 // Both implement the `I2cMaster` trait so higher layers (programmers::i2c_eeprom,
@@ -15,7 +15,7 @@
 //   * START / repeated START / STOP framing
 //   * ACK / NACK polling
 //   * Clock-stretching tolerance via read-after-clock-rise wait
-//   * Auto-retry on lost-arbitration (single bus master only — collision is
+//   * Auto-retry on lost-arbitration (single bus master only  -  collision is
 //     treated as transient electrical fault)
 
 use crate::backends::ch341a::UsbBus;
@@ -50,7 +50,7 @@ impl I2cBusSpeed {
     }
 
     /// Translate to the CH347 native divisor (1 MHz mode is approximated by
-    /// the chip's "fast-plus" 750 kHz mode — no exact 1 MHz divisor in firmware).
+    /// the chip's "fast-plus" 750 kHz mode  -  no exact 1 MHz divisor in firmware).
     pub fn to_ch347(self) -> Ch347I2cSpeed {
         match self {
             I2cBusSpeed::Standard100kHz => Ch347I2cSpeed::Std100kHz,
@@ -60,7 +60,7 @@ impl I2cBusSpeed {
     }
 }
 
-// Tiny shim — the actual `I2cSpeed` enum lives in `hw::ch347_raw` so we
+// Tiny shim  -  the actual `I2cSpeed` enum lives in `hw::ch347_raw` so we
 // re-export the `FastPlus750kHz` variant under an alias name that reads
 // well in the public API here.
 #[doc(hidden)]
@@ -137,7 +137,7 @@ impl<'b, B: UsbBus> Ch341aI2c<'b, B> {
     }
 
     fn port_state_dir(&self) -> u8 {
-        // UioPort caches dir internally — we don't surface it. Use a clean-slate
+        // UioPort caches dir internally  -  we don't surface it. Use a clean-slate
         // assumption: tests rely on the actual byte stream rather than this.
         // For correctness in the bit-bang path we conservatively rebuild
         // direction per call, which is fine performance-wise (the cache in
@@ -203,7 +203,7 @@ impl<'b, B: UsbBus> Ch341aI2c<'b, B> {
 impl<'b, B: UsbBus> I2cMaster for Ch341aI2c<'b, B> {
     fn set_speed(&mut self, _speed: I2cBusSpeed) -> Result<()> {
         // Bit-bang speed is governed by USB packet latency, not a configurable
-        // divisor — accept the call but treat it as advisory.
+        // divisor  -  accept the call but treat it as advisory.
         Ok(())
     }
 
@@ -298,7 +298,7 @@ impl<'t, T: Ch347Transport> I2cMaster for Ch347I2c<'t, T> {
     fn scan_bus(&mut self) -> Result<Vec<u8>> {
         let mut found = Vec::new();
         for addr in 0x08u8..=0x77 {
-            // Probe with zero-length write — chip reports ACK in first reply byte.
+            // Probe with zero-length write  -  chip reports ACK in first reply byte.
             if self.raw.i2c_write(addr, &[]).is_ok() {
                 found.push(addr);
             }
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn ch347_scan_bus_probes_address_range() {
         let mut t = CapturingTransport::new();
-        // Queue a "no device responds" reply for every probe — Ch347Raw treats
+        // Queue a "no device responds" reply for every probe  -  Ch347Raw treats
         // missing replies as zeroed-out, so it passes through the write call.
         for _ in 0x08u8..=0x77 {
             t.queue_read(vec![0u8]);
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn ch341a_scan_bus_visits_all_addresses() {
-        // No real slaves on the mock bus — every read returns 0xFF (lines
+        // No real slaves on the mock bus  -  every read returns 0xFF (lines
         // idle-high, no slave pulling SDA low for ACK).
         let mut bus = MockBus::new();
         for _ in 0..(112 * 20) {
@@ -415,7 +415,7 @@ mod tests {
         // For each address probe, the master does: START, write_byte(addr<<1),
         // STOP. write_byte calls write_bit 8 times then read_bit (ACK sample).
         // We can simulate by queuing 0xFF for everyone except 0x50's ACK sample
-        // — but counting exact bit positions is fragile. Instead, just assert
+        //  -  but counting exact bit positions is fragile. Instead, just assert
         // the scan returns *some* address when the mock returns 0x00 unconditionally
         // (everything looks like ACK), which sanity-checks the wiring.
         let mut bus = MockBus::new();

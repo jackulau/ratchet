@@ -81,12 +81,12 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
         },
         detail: if is_pow2 {
             format!(
-                "{:.1} MB — valid flash chip size",
+                "{:.1} MB  -  valid flash chip size",
                 data.len() as f64 / 1024.0 / 1024.0
             )
         } else {
             format!(
-                "{} bytes — not a standard flash chip size (may be a partial dump or capsule)",
+                "{} bytes  -  not a standard flash chip size (may be a partial dump or capsule)",
                 data.len()
             )
         },
@@ -99,13 +99,13 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
         checks.push(HealthCheck {
             name: "Content check".to_string(),
             status: CheckStatus::Fail,
-            detail: "Image is entirely 0xFF — blank/erased chip".to_string(),
+            detail: "Image is entirely 0xFF  -  blank/erased chip".to_string(),
         });
     } else if all_zero {
         checks.push(HealthCheck {
             name: "Content check".to_string(),
             status: CheckStatus::Fail,
-            detail: "Image is entirely 0x00 — failed read or dead chip".to_string(),
+            detail: "Image is entirely 0x00  -  failed read or dead chip".to_string(),
         });
     } else {
         let ff_count = data.iter().filter(|b| **b == 0xff).count();
@@ -114,13 +114,13 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
             checks.push(HealthCheck {
                 name: "Content check".to_string(),
                 status: CheckStatus::Warn,
-                detail: format!("{ff_pct:.1}% empty (0xFF) — partially erased or minimal firmware"),
+                detail: format!("{ff_pct:.1}% empty (0xFF)  -  partially erased or minimal firmware"),
             });
         } else {
             checks.push(HealthCheck {
                 name: "Content check".to_string(),
                 status: CheckStatus::Pass,
-                detail: format!("{ff_pct:.1}% empty space — normal"),
+                detail: format!("{ff_pct:.1}% empty space  -  normal"),
             });
         }
     }
@@ -134,7 +134,7 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
             name: "Intel Flash Descriptor".to_string(),
             status: CheckStatus::Pass,
             detail: format!(
-                "Valid descriptor found — {} regions: {}",
+                "Valid descriptor found  -  {} regions: {}",
                 regions.len(),
                 names.join(", ")
             ),
@@ -157,7 +157,7 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
         checks.push(HealthCheck {
             name: "Intel Flash Descriptor".to_string(),
             status: CheckStatus::Warn,
-            detail: "No Intel Flash Descriptor — raw BIOS image or non-Intel platform".to_string(),
+            detail: "No Intel Flash Descriptor  -  raw BIOS image or non-Intel platform".to_string(),
         });
     }
 
@@ -184,14 +184,14 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
             checks.push(HealthCheck {
                 name: "PEI phase".to_string(),
                 status: CheckStatus::Warn,
-                detail: "No PEI firmware volume detected — may be compressed or nested".to_string(),
+                detail: "No PEI firmware volume detected  -  may be compressed or nested".to_string(),
             });
         }
         if !has_dxe {
             checks.push(HealthCheck {
                 name: "DXE phase".to_string(),
                 status: CheckStatus::Warn,
-                detail: "No DXE firmware volume detected — may be compressed or nested".to_string(),
+                detail: "No DXE firmware volume detected  -  may be compressed or nested".to_string(),
             });
         }
     } else if data.len() >= 16 && data[data.len() - 1] == 0xea {
@@ -204,7 +204,7 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
         checks.push(HealthCheck {
             name: "UEFI Firmware Volumes".to_string(),
             status: CheckStatus::Fail,
-            detail: "No UEFI firmware volumes found — image may be corrupt, truncated, or not a BIOS image".to_string(),
+            detail: "No UEFI firmware volumes found  -  image may be corrupt, truncated, or not a BIOS image".to_string(),
         });
     }
 
@@ -221,7 +221,7 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
                         _ => CheckStatus::Warn,
                     },
                     detail: format!(
-                        "ME {} — state: {:?}, {} partitions",
+                        "ME {}  -  state: {:?}, {} partitions",
                         me.version,
                         me.state,
                         me.partitions.len()
@@ -270,7 +270,7 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
         checks.push(HealthCheck {
             name: "NVRAM Store".to_string(),
             status: CheckStatus::Warn,
-            detail: "No NVRAM variable store found — may be in a compressed volume".to_string(),
+            detail: "No NVRAM variable store found  -  may be in a compressed volume".to_string(),
         });
     }
 
@@ -288,7 +288,7 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
             detail: if has_valid {
                 "Valid x86 reset vector at end of image".to_string()
             } else {
-                "No standard reset vector — may use UEFI SEC entry point instead".to_string()
+                "No standard reset vector  -  may use UEFI SEC entry point instead".to_string()
             },
         });
     }
@@ -330,7 +330,7 @@ fn suggest_recovery_strategy(checks: &[HealthCheck]) -> Vec<RecoveryStep> {
         steps.push(RecoveryStep {
             order,
             action:
-                "Image appears blank or all-zero — re-read the chip with better SOIC clip contact"
+                "Image appears blank or all-zero  -  re-read the chip with better SOIC clip contact"
                     .to_string(),
             command: "ratchet read new_dump.bin --safe".to_string(),
             risk: Risk::Low,
@@ -341,7 +341,7 @@ fn suggest_recovery_strategy(checks: &[HealthCheck]) -> Vec<RecoveryStep> {
     if fails.iter().any(|c| c.name == "UEFI Firmware Volumes") {
         steps.push(RecoveryStep {
             order,
-            action: "No valid firmware found — obtain correct BIOS from manufacturer and reflash"
+            action: "No valid firmware found  -  obtain correct BIOS from manufacturer and reflash"
                 .to_string(),
             command: "ratchet write correct_bios.bin".to_string(),
             risk: Risk::Medium,
@@ -353,7 +353,7 @@ fn suggest_recovery_strategy(checks: &[HealthCheck]) -> Vec<RecoveryStep> {
         steps.push(RecoveryStep {
             order,
             action:
-                "Region boundary error — image may be truncated. Re-read chip and verify full size"
+                "Region boundary error  -  image may be truncated. Re-read chip and verify full size"
                     .to_string(),
             command: "ratchet read full_dump.bin && ratchet analyze full_dump.bin".to_string(),
             risk: Risk::Low,
@@ -367,7 +367,7 @@ fn suggest_recovery_strategy(checks: &[HealthCheck]) -> Vec<RecoveryStep> {
     {
         steps.push(RecoveryStep {
             order,
-            action: "ME region corrupted — extract ME region from a donor image (same board model) and replace".to_string(),
+            action: "ME region corrupted  -  extract ME region from a donor image (same board model) and replace".to_string(),
             command: "ratchet region-extract donor.bin me --output donor_me.bin && ratchet region-replace corrupt.bin me donor_me.bin --output fixed.bin".to_string(),
             risk: Risk::Medium,
         });
@@ -381,7 +381,7 @@ fn suggest_recovery_strategy(checks: &[HealthCheck]) -> Vec<RecoveryStep> {
         if nv.detail.contains("deleted") {
             steps.push(RecoveryStep {
                 order,
-                action: "NVRAM has many deleted variables — clear CMOS or reflash to rebuild NVRAM"
+                action: "NVRAM has many deleted variables  -  clear CMOS or reflash to rebuild NVRAM"
                     .to_string(),
                 command: "Clear CMOS jumper on motherboard, or reflash clean BIOS".to_string(),
                 risk: Risk::Low,
@@ -397,7 +397,7 @@ fn suggest_recovery_strategy(checks: &[HealthCheck]) -> Vec<RecoveryStep> {
             RecoveryStep {
                 order: 1,
                 action:
-                    "Image has warnings but no critical failures — may be usable. Flash and test"
+                    "Image has warnings but no critical failures  -  may be usable. Flash and test"
                         .to_string(),
                 command: "ratchet write dump.bin && ratchet verify dump.bin".to_string(),
                 risk: Risk::Low,
@@ -405,7 +405,7 @@ fn suggest_recovery_strategy(checks: &[HealthCheck]) -> Vec<RecoveryStep> {
         } else {
             RecoveryStep {
                 order: 1,
-                action: "Image looks healthy — no recovery needed".to_string(),
+                action: "Image looks healthy  -  no recovery needed".to_string(),
                 command: "ratchet verify dump.bin".to_string(),
                 risk: Risk::Low,
             }

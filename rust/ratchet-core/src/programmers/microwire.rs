@@ -6,12 +6,12 @@
 // Per-part size + addressing (ORG pin selects 8-bit byte mode or 16-bit word
 // mode on parts that support it):
 //
-//   93C06   — 256 bits  : 4-bit addr (×16 words)
-//   93C46   — 1 kbit    : 7-bit addr ORG=0 (×128 bytes) / 6-bit ORG=1 (×64 words)
-//   93C56   — 2 kbit    : 9-bit addr ORG=0 / 8-bit ORG=1
-//   93C66   — 4 kbit    : 9-bit addr ORG=0 / 8-bit ORG=1
-//   93C76   — 8 kbit    : 11-bit addr ORG=0 / 10-bit ORG=1
-//   93C86   — 16 kbit   : 11-bit addr ORG=0 / 10-bit ORG=1
+//   93C06    -  256 bits  : 4-bit addr (×16 words)
+//   93C46    -  1 kbit    : 7-bit addr ORG=0 (×128 bytes) / 6-bit ORG=1 (×64 words)
+//   93C56    -  2 kbit    : 9-bit addr ORG=0 / 8-bit ORG=1
+//   93C66    -  4 kbit    : 9-bit addr ORG=0 / 8-bit ORG=1
+//   93C76    -  8 kbit    : 11-bit addr ORG=0 / 10-bit ORG=1
+//   93C86    -  16 kbit   : 11-bit addr ORG=0 / 10-bit ORG=1
 //
 // Reference: Atmel AT93C46 / AT93C66 datasheets.
 
@@ -95,7 +95,7 @@ impl<'t, T: MicrowireTransport> Microwire<'t, T> {
         Ok(())
     }
 
-    /// EWEN — enable subsequent writes.
+    /// EWEN  -  enable subsequent writes.
     pub fn write_enable(&mut self) -> Result<()> {
         let addr_bits = self.part.addr_bits(self.org);
         // Opcode = 00, address starts with 11.
@@ -130,12 +130,12 @@ impl<'t, T: MicrowireTransport> Microwire<'t, T> {
         self.t
             .shift_out(data & ((1u32 << data_bits) - 1), data_bits)?;
         self.t.set_cs(false)?;
-        // Datasheet specifies waiting for DO high after CS rises. Skipped here —
+        // Datasheet specifies waiting for DO high after CS rises. Skipped here  - 
         // synchronous bit-bang completes within the write delay budget.
         Ok(())
     }
 
-    /// ERAL — erase entire array (all bytes/words to 0xFF/0xFFFF).
+    /// ERAL  -  erase entire array (all bytes/words to 0xFF/0xFFFF).
     pub fn erase_all(&mut self) -> Result<()> {
         let addr_bits = self.part.addr_bits(self.org);
         // Opcode = 00, address starts with 10.

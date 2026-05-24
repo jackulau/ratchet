@@ -70,7 +70,7 @@ when biospy can't handle a chip / driver situation).
 ## 4. Build-time deps
 
 `rust/biospy-usb-sys/build.rs` invokes `pkg-config` via the `pkg-config`
-crate to find system libusb headers. This is a **build-only** call — it does
+crate to find system libusb headers. This is a **build-only** call  -  it does
 not run at biospy runtime. The audit explicitly permits build-time tools.
 
 ## 5. Conclusion

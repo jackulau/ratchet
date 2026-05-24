@@ -1,4 +1,4 @@
-// SFDP (Serial Flash Discoverable Parameters) — JEDEC JESD216.
+// SFDP (Serial Flash Discoverable Parameters)  -  JEDEC JESD216.
 // Pure parsers for the SFDP header and Basic Flash Parameter Table.
 // Mirrors src/chips/sfdp.ts byte-for-byte.
 

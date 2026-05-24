@@ -241,11 +241,11 @@ pub fn parse_nvram_store(data: &[u8], store_offset: Option<usize>) -> NvramStore
 
     if variables.is_empty() {
         warnings
-            .push("No valid NVRAM variables found — store may be empty or corrupted".to_string());
+            .push("No valid NVRAM variables found  -  store may be empty or corrupted".to_string());
     }
     if (deleted_count as usize) > variables.len() / 2 && !variables.is_empty() {
         warnings.push(format!(
-            "High proportion of deleted variables ({deleted_count}/{}) — NVRAM may need garbage collection or reflash",
+            "High proportion of deleted variables ({deleted_count}/{})  -  NVRAM may need garbage collection or reflash",
             variables.len()
         ));
     }

@@ -17,7 +17,7 @@ pub enum UsbError {
     InitFailed(i32),
     #[error("device not found: vid={vid:#06x} pid={pid:#06x}")]
     NotFound { vid: u16, pid: u16 },
-    #[error("access denied — check udev rules (Linux) / WinUSB driver (Windows) / Info.plist entitlements (macOS)")]
+    #[error("access denied  -  check udev rules (Linux) / WinUSB driver (Windows) / Info.plist entitlements (macOS)")]
     Access,
     #[error("I/O error")]
     Io,
@@ -25,7 +25,7 @@ pub enum UsbError {
     InvalidParam,
     #[error("device disconnected")]
     NoDevice,
-    #[error("interface busy — another process or driver may hold it")]
+    #[error("interface busy  -  another process or driver may hold it")]
     Busy,
     #[error("transfer timeout")]
     Timeout,
@@ -201,7 +201,7 @@ impl DeviceHandle {
         }
     }
 
-    /// Reset device — re-enumerates on the bus. Use after an unrecoverable error.
+    /// Reset device  -  re-enumerates on the bus. Use after an unrecoverable error.
     pub fn reset(&self) -> Result<()> {
         // SAFETY: ptr valid.
         let rc = unsafe { sys::libusb_reset_device(self.ptr.as_ptr()) };
@@ -333,7 +333,7 @@ pub mod request_type {
     pub const STANDARD_IN: u8 = 0x80;
 }
 
-/// Endpoint helper — OR with endpoint number for IN direction.
+/// Endpoint helper  -  OR with endpoint number for IN direction.
 pub const ENDPOINT_IN: u8 = 0x80;
 pub const ENDPOINT_OUT: u8 = 0x00;
 
@@ -360,7 +360,7 @@ mod tests {
         let ctx = Context::new().expect("libusb_init must succeed with a libusb runtime");
         // Listing devices should at least return a (possibly empty) vector without erroring.
         let devs = ctx.devices().expect("device enumeration");
-        // Don't assert a specific count — host may have 0 USB devices in CI sandboxes.
+        // Don't assert a specific count  -  host may have 0 USB devices in CI sandboxes.
         let _ = devs.len();
     }
 

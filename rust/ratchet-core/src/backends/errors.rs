@@ -25,7 +25,7 @@ pub enum UsbErrorKind {
     Timeout,
     /// Endpoint reported a pipe/stall error.
     PipeStall,
-    /// Driver missing — Windows-specific (WinUSB not bound).
+    /// Driver missing  -  Windows-specific (WinUSB not bound).
     DriverMissing,
     /// 1.8V chip on 3.3V programmer or supply rail outside spec.
     VoltageMismatch,
@@ -100,7 +100,7 @@ pub fn classify_usb_error(err: &UsbError) -> ClassifiedUsbError {
         UsbError::Busy => (
             UsbErrorKind::Busy,
             format!(
-                "USB interface busy — another process (or kernel driver) holds the interface. {original}"
+                "USB interface busy  -  another process (or kernel driver) holds the interface. {original}"
             ),
         ),
         UsbError::Timeout => (
@@ -113,12 +113,12 @@ pub fn classify_usb_error(err: &UsbError) -> ClassifiedUsbError {
         ),
         UsbError::Overflow => (
             UsbErrorKind::PipeStall,
-            format!("USB overflow / stall — endpoint reset may be needed. {original}"),
+            format!("USB overflow / stall  -  endpoint reset may be needed. {original}"),
         ),
         UsbError::ShortTransfer { expected, actual } => (
             UsbErrorKind::Disconnected,
             format!(
-                "USB short transfer (expected {expected} bytes, got {actual}) — likely cable/clip issue."
+                "USB short transfer (expected {expected} bytes, got {actual})  -  likely cable/clip issue."
             ),
         ),
         UsbError::Interrupted => (
@@ -164,7 +164,7 @@ pub fn classify_str(s: &str) -> ClassifiedUsbError {
     } else if is_voltage_string(s) {
         (
             UsbErrorKind::VoltageMismatch,
-            format!("Voltage mismatch — check 3.3V vs 1.8V chip class. {s}"),
+            format!("Voltage mismatch  -  check 3.3V vs 1.8V chip class. {s}"),
         )
     } else {
         (UsbErrorKind::Other, s.to_string())
@@ -180,11 +180,11 @@ fn disconnect_message(original: &str) -> String {
     format!(
         "USB programmer disconnected: {original}\n\n\
          Troubleshooting:\n  \
-         1. Check USB cable — reseat or try a different cable\n  \
+         1. Check USB cable  -  reseat or try a different cable\n  \
          2. Try a different USB port (avoid hubs)\n  \
-         3. If using SOIC clip — check clip is firmly seated\n  \
+         3. If using SOIC clip  -  check clip is firmly seated\n  \
          4. Check for loose solder joints on programmer board\n  \
-         5. Some USB ports have power limits — try a powered hub\n  \
+         5. Some USB ports have power limits  -  try a powered hub\n  \
          6. On Linux: check `dmesg` for USB errors"
     )
 }
@@ -205,7 +205,7 @@ fn timeout_message(original: &str) -> String {
     format!(
         "USB transfer timed out: {original}\n\n\
          Troubleshooting:\n  \
-         1. Reseat the SOIC clip — bad contact is the #1 cause\n  \
+         1. Reseat the SOIC clip  -  bad contact is the #1 cause\n  \
          2. Lower SPI speed (CH347 supports clock divisors up to 7)\n  \
          3. Check chip voltage matches programmer (3.3V vs 1.8V)\n  \
          4. Try shorter USB cable / different port"
@@ -216,7 +216,7 @@ fn driver_message(original: &str) -> String {
     format!(
         "USB driver not bound: {original}\n\n\
          Troubleshooting:\n  \
-         - Windows: install the WinUSB driver via Zadig — https://zadig.akeo.ie/\n  \
+         - Windows: install the WinUSB driver via Zadig  -  https://zadig.akeo.ie/\n  \
          - Linux: ensure the `usb` group exists and your user is in it\n  \
          - macOS: no extra driver needed; check for kext blockers"
     )

@@ -3,7 +3,7 @@
 // All STM32 parts ship with a factory ROM bootloader accessible via
 // USART1 (or other peripherals) when the BOOT0 pin is strapped high at
 // reset. Default config 8E1 (with parity) for backward compatibility;
-// some newer parts support 8N1 — we configure 8E1 to match AN3155.
+// some newer parts support 8N1  -  we configure 8E1 to match AN3155.
 //
 // Each command is framed as `[cmd, ~cmd]` (1's complement check), waits
 // for ACK=0x79 / NACK=0x1F. Address writes are 4 big-endian bytes + XOR
@@ -53,7 +53,7 @@ impl<'t, T: Stm32UartTransport> Stm32Uart<'t, T> {
         }
     }
 
-    /// Auto-baud init — sends 0x7F, expects ACK.
+    /// Auto-baud init  -  sends 0x7F, expects ACK.
     pub fn init(&mut self) -> Result<()> {
         self.t.write(&[INIT_BYTE])?;
         self.expect_ack()

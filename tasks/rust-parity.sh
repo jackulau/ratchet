@@ -3,7 +3,7 @@
 # with BIOSPY_FORCE_MOCK=1 and asserts equivalent semantic output.
 #
 # Envelope shape differs between the two impls (TS wraps everything in
-# {ok, query, ...}, Rust returns the data directly) — so the comparison is
+# {ok, query, ...}, Rust returns the data directly)  -  so the comparison is
 # field-level via jq, not raw diff.
 
 set -euo pipefail
@@ -13,11 +13,11 @@ RUST_BIN="$ROOT/rust/target/release/biospy-cli"
 TS_BIN="node $ROOT/dist/cli.js"
 
 if [ ! -x "$RUST_BIN" ]; then
-  echo "Rust CLI not built — running: cargo build --release -p biospy-cli"
+  echo "Rust CLI not built  -  running: cargo build --release -p biospy-cli"
   (cd "$ROOT/rust" && cargo build --release -p biospy-cli) >&2
 fi
 if [ ! -f "$ROOT/dist/cli.js" ]; then
-  echo "TS CLI not built — running: npm run build"
+  echo "TS CLI not built  -  running: npm run build"
   (cd "$ROOT" && npm run build) >&2
 fi
 

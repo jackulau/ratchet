@@ -1,12 +1,12 @@
-// Minimal ELF parser — enough to look up symbol addresses by name and
+// Minimal ELF parser  -  enough to look up symbol addresses by name and
 // reverse-look-up names by address in firmware images. Supports ELF32
 // little-endian (the common case for ARM Cortex-M firmware). ELF64 LE
 // supported for desktop tooling.
 //
-// We deliberately do NOT pull a `goblin` / `object` crate — the parser
+// We deliberately do NOT pull a `goblin` / `object` crate  -  the parser
 // is tiny and avoids dragging in a heavy dependency.
 //
-// Reference: System V ABI — ELF specification.
+// Reference: System V ABI  -  ELF specification.
 
 use crate::backends::{BackendError, Result};
 
@@ -16,7 +16,7 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
 const SHT_SYMTAB: u32 = 2;
-// `SHT_STRTAB` (3) — kept for future BSDL/.debug_str expansion. Skip silenced via allow.
+// `SHT_STRTAB` (3)  -  kept for future BSDL/.debug_str expansion. Skip silenced via allow.
 #[allow(dead_code)]
 const SHT_STRTAB: u32 = 3;
 
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn parses_synthesized_elf32_header() {
-        // Construct a minimal ELF32 LE header (no sections) — just enough to
+        // Construct a minimal ELF32 LE header (no sections)  -  just enough to
         // exercise the magic + class + endian + entry parsing path.
         let mut buf = vec![0u8; 0x34];
         buf[0..4].copy_from_slice(&ELF_MAGIC);
@@ -250,7 +250,7 @@ mod tests {
         buf[6] = 1; // version
                     // Entry point at 0x18..0x1C
         buf[0x18..0x1C].copy_from_slice(&0x08001234u32.to_le_bytes());
-        // shoff/shentsize/shnum/shstrndx = 0 — no sections, fine.
+        // shoff/shentsize/shnum/shstrndx = 0  -  no sections, fine.
         let elf = ElfFile::parse(&buf).unwrap();
         assert!(!elf.is_64);
         assert!(elf.little_endian);

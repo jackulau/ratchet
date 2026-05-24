@@ -1,6 +1,6 @@
 [package]
 name = "ratchet-node"
-description = "napi-rs bridge — exposes ratchet-core as a Node native addon for Node consumers."
+description = "napi-rs bridge  -  exposes ratchet-core as a Node native addon for Node consumers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

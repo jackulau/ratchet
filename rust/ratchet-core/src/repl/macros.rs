@@ -1,4 +1,4 @@
-// Macro recorder — record sequences of REPL commands, save/load to JSON.
+// Macro recorder  -  record sequences of REPL commands, save/load to JSON.
 // Ports src/repl/macros.ts.
 
 use serde::{Deserialize, Serialize};
@@ -96,7 +96,7 @@ fn timestamp_iso() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     // Cheap ISO8601-ish (no chrono dep): YYYY-MM-DDTHH:MM:SSZ approximation.
-    // Caller-facing field is opaque — just needs to be a string.
+    // Caller-facing field is opaque  -  just needs to be a string.
     format!("ts:{secs}")
 }
 

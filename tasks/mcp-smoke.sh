@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MCP smoke — drives dist/mcp/server.js end-to-end via JSON-RPC over stdio.
+# MCP smoke  -  drives dist/mcp/server.js end-to-end via JSON-RPC over stdio.
 # Asserts the server starts, advertises tools, and answers calls with envelope-shaped responses.
 # Runs in mock mode (BIOSPY_FORCE_MOCK=1) so no real hardware is required.
 #
@@ -9,7 +9,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 if [ ! -x dist/mcp/server.js ]; then
-  echo "FAIL: dist/mcp/server.js not built — run 'npm run build' first" >&2
+  echo "FAIL: dist/mcp/server.js not built  -  run 'npm run build' first" >&2
   exit 1
 fi
 
@@ -68,20 +68,20 @@ expect() {
   local response="$3"
 
   if ! echo "$response" | node -e 'let s=""; process.stdin.on("data",d=>s+=d); process.stdin.on("end",()=>{try{JSON.parse(s)}catch{process.exit(1)}})' 2>/dev/null; then
-    FAIL=$((FAIL + 1)); FAILED_CHECKS+=("$label — non-JSON response")
-    echo "  FAIL: $label — non-JSON: $response" >&2
+    FAIL=$((FAIL + 1)); FAILED_CHECKS+=("$label  -  non-JSON response")
+    echo "  FAIL: $label  -  non-JSON: $response" >&2
     return
   fi
 
   if [ "$expected_ok" = "" ]; then
-    # tools/list path — assert result.tools exists
+    # tools/list path  -  assert result.tools exists
     local tool_count
     tool_count=$(echo "$response" | node -e 'let s=""; process.stdin.on("data",d=>s+=d); process.stdin.on("end",()=>{const r=JSON.parse(s); process.stdout.write(String(r.result?.tools?.length ?? 0))})')
     if [ "$tool_count" -ge 17 ]; then
       PASS=$((PASS + 1))
     else
-      FAIL=$((FAIL + 1)); FAILED_CHECKS+=("$label — tool count $tool_count < 17")
-      echo "  FAIL: $label — expected ≥17 tools, got $tool_count" >&2
+      FAIL=$((FAIL + 1)); FAILED_CHECKS+=("$label  -  tool count $tool_count < 17")
+      echo "  FAIL: $label  -  expected ≥17 tools, got $tool_count" >&2
     fi
     return
   fi
@@ -99,8 +99,8 @@ expect() {
   if [ "$actual_ok" = "$expected_ok" ]; then
     PASS=$((PASS + 1))
   else
-    FAIL=$((FAIL + 1)); FAILED_CHECKS+=("$label — envelope.ok=$actual_ok (expected $expected_ok)")
-    echo "  FAIL: $label — envelope.ok=$actual_ok (expected $expected_ok)" >&2
+    FAIL=$((FAIL + 1)); FAILED_CHECKS+=("$label  -  envelope.ok=$actual_ok (expected $expected_ok)")
+    echo "  FAIL: $label  -  envelope.ok=$actual_ok (expected $expected_ok)" >&2
   fi
 }
 
@@ -123,7 +123,7 @@ expect "write_chip without confirm fails" "false" "$(mcp_call tools/call '{"name
 expect "erase_chip without confirm fails" "false" "$(mcp_call tools/call '{"name":"erase_chip","arguments":{"confirm":false}}')"
 expect "region_erase without confirm fails" "false" "$(mcp_call tools/call '{"name":"region_erase","arguments":{"start_addr":0,"length":4096,"confirm":false}}')"
 
-# ── Erase with confirm (mock backend — should succeed) ───
+# ── Erase with confirm (mock backend  -  should succeed) ───
 expect "erase_chip with confirm succeeds" "true" "$(mcp_call tools/call '{"name":"erase_chip","arguments":{"confirm":true}}')"
 
 # ── Image analysis with synthetic 8MB image ───

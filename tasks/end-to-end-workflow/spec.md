@@ -12,8 +12,8 @@ biosMCP now has all the individual pieces: connection quality (`connect`), readi
 
 - **Framework**: Custom self-test harness in `src/self-test.ts`
 - **Runner**: `runTest(name, asyncFn)` returns `{ name, status, detail, durationMs }`
-- **Assertions**: `assert(condition, msg)`, `assertEqual(actual, expected, label)` — throw on failure
-- **Mock**: MockBackend in `src/backends/mock.ts` — simulates chip I/O without hardware
+- **Assertions**: `assert(condition, msg)`, `assertEqual(actual, expected, label)`  -  throw on failure
+- **Mock**: MockBackend in `src/backends/mock.ts`  -  simulates chip I/O without hardware
 - **Build**: `npx tsc`
 - **Type check**: `npx tsc --noEmit`
 - **Run tests**: `npm run build && node dist/cli.js --self-test`
@@ -35,15 +35,15 @@ biosMCP now has all the individual pieces: connection quality (`connect`), readi
 
 ## Design Decisions
 
-1. **New file `src/workflows/pipeline.ts`** — Workflow orchestration in its own module. Rationale: workflows compose existing CLI operations; they're a layer above analysis and backends. Separate directory signals this is orchestration, not new capability.
+1. **New file `src/workflows/pipeline.ts`**  -  Workflow orchestration in its own module. Rationale: workflows compose existing CLI operations; they're a layer above analysis and backends. Separate directory signals this is orchestration, not new capability.
 
-2. **Step-based pipeline with bail-out** — Each step returns success/fail. Pipeline stops on first failure. Rationale: for flash chip operations, continuing after a failed step risks bricking hardware. Fail-fast is safest.
+2. **Step-based pipeline with bail-out**  -  Each step returns success/fail. Pipeline stops on first failure. Rationale: for flash chip operations, continuing after a failed step risks bricking hardware. Fail-fast is safest.
 
-3. **Buffer-based pipeline internally** — Pipeline functions take/return Buffers. File I/O at CLI boundary only. Rationale: matches repair.ts pattern, enables testing with MockBackend without filesystem.
+3. **Buffer-based pipeline internally**  -  Pipeline functions take/return Buffers. File I/O at CLI boundary only. Rationale: matches repair.ts pattern, enables testing with MockBackend without filesystem.
 
-4. **Metadata sidecar as JSON** — Structured metadata alongside the binary dump. Rationale: binary dump must be raw flash content (no headers), so metadata goes in a companion file. JSON is human-readable and machine-parseable.
+4. **Metadata sidecar as JSON**  -  Structured metadata alongside the binary dump. Rationale: binary dump must be raw flash content (no headers), so metadata goes in a companion file. JSON is human-readable and machine-parseable.
 
-5. **Reuse existing helpers** — Uses `runPreFlightQualityCheck`, `analyzeBiosHealthFromBuffer`, `repairAuto`/`repairFromReference`. Rationale: these are tested and proven. The workflow is orchestration, not reimplementation.
+5. **Reuse existing helpers**  -  Uses `runPreFlightQualityCheck`, `analyzeBiosHealthFromBuffer`, `repairAuto`/`repairFromReference`. Rationale: these are tested and proven. The workflow is orchestration, not reimplementation.
 
 ## Confidence
 
@@ -75,9 +75,9 @@ biosMCP now has all the individual pieces: connection quality (`connect`), readi
 - [ ] `PipelineContext` type carries state between steps (buffers, chip info, quality score, etc.)
 
 **Tests to Write**:
-- `runPipeline with all passing steps completes` — 3 steps all succeed → result.success = true
-- `runPipeline stops on first failure` — step 2 of 3 fails → result shows step 2 failed, step 3 not run
-- `runPipeline collects step timing` — verify each step has duration recorded
+- `runPipeline with all passing steps completes`  -  3 steps all succeed → result.success = true
+- `runPipeline stops on first failure`  -  step 2 of 3 fails → result shows step 2 failed, step 3 not run
+- `runPipeline collects step timing`  -  verify each step has duration recorded
 
 **Verification**:
 ```bash
@@ -101,9 +101,9 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "runPipeline|FAIL" 
 - [ ] `generateBackupMetadata()` collects all metadata from pipeline context into structured object
 
 **Tests to Write**:
-- `buildBackupPipeline creates 4 steps` — verify step count and names
-- `generateBackupMetadata includes all required fields` — mock data → verify chipInfo, sha256, timestamp present
-- `backup pipeline with MockBackend completes` — run full backup pipeline with mock → success
+- `buildBackupPipeline creates 4 steps`  -  verify step count and names
+- `generateBackupMetadata includes all required fields`  -  mock data → verify chipInfo, sha256, timestamp present
+- `backup pipeline with MockBackend completes`  -  run full backup pipeline with mock → success
 
 **Verification**:
 ```bash
@@ -130,10 +130,10 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "backup|Backup|FAIL
 - [ ] Write step checks/disables write protection before writing
 
 **Tests to Write**:
-- `buildRepairPipeline creates correct step sequence` — verify step names
-- `repair pipeline with healthy image skips write` — no damage → pipeline reports no repairs, skips write
-- `repair pipeline with damaged image performs full cycle` — corrupt reset vector → repair → write → verify
-- `repair pipeline with reference uses reference repair` — ctx.referencePath set → uses repairFromReference
+- `buildRepairPipeline creates correct step sequence`  -  verify step names
+- `repair pipeline with healthy image skips write`  -  no damage → pipeline reports no repairs, skips write
+- `repair pipeline with damaged image performs full cycle`  -  corrupt reset vector → repair → write → verify
+- `repair pipeline with reference uses reference repair`  -  ctx.referencePath set → uses repairFromReference
 
 **Verification**:
 ```bash
@@ -159,9 +159,9 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "repair pipeline|FA
 - [ ] Error messages identify which pipeline step failed
 
 **Tests to Write**:
-- `full-backup dry-run completes with MockBackend` — dry-run backup → success, metadata generated
-- `full-repair dry-run with healthy mock reports no repairs` — dry-run repair → no repairs needed
-- `full-repair dry-run with --skip-write skips write step` — verify write step skipped
+- `full-backup dry-run completes with MockBackend`  -  dry-run backup → success, metadata generated
+- `full-repair dry-run with healthy mock reports no repairs`  -  dry-run repair → no repairs needed
+- `full-repair dry-run with --skip-write skips write step`  -  verify write step skipped
 
 **Verification**:
 ```bash
@@ -183,10 +183,10 @@ npm run build && npx tsc --noEmit && echo "PASS" || echo "FAIL"
 - [ ] All integration tests pass
 
 **Tests to Write**:
-- `full-backup end-to-end: mock read → analyze → metadata` — complete backup with mock
-- `full-repair end-to-end: mock healthy → no write needed` — healthy image → skip write
-- `full-repair end-to-end: mock damaged → repair → write → verify` — damaged image → full cycle
-- `pipeline bail-out: step failure stops execution` — inject failure → verify clean stop
+- `full-backup end-to-end: mock read → analyze → metadata`  -  complete backup with mock
+- `full-repair end-to-end: mock healthy → no write needed`  -  healthy image → skip write
+- `full-repair end-to-end: mock damaged → repair → write → verify`  -  damaged image → full cycle
+- `pipeline bail-out: step failure stops execution`  -  inject failure → verify clean stop
 
 **Verification**:
 ```bash
@@ -220,4 +220,4 @@ Rationale: Previous specs' reviewers hallucinated content. Codebase well-underst
 
 ## Open Questions
 
-None — all resolved from codebase analysis.
+None  -  all resolved from codebase analysis.

@@ -6,7 +6,7 @@
 // exposes UIO as a generic GPIO + bit-bang substrate that I2C, JTAG, 1-Wire,
 // logic-analyzer and arbitrary protocol modules build on top of.
 //
-// Pin map (UIO mode, D0..D5 — physical CH341A pin numbers in comments):
+// Pin map (UIO mode, D0..D5  -  physical CH341A pin numbers in comments):
 //   D0  = SCL / TCK / SCK (pin 18)
 //   D1  = unused           (pin 19)
 //   D2  = unused           (pin 20)  -- D2 is the legacy CS line in SPI mode
@@ -70,7 +70,7 @@ pub fn read_pins_packet() -> [u8; 2] {
 /// CH341A's internal clock).
 ///
 /// Returns a single packet capped at the UIO packet limit (~30 transitions
-/// per packet — the chip silently truncates beyond that).
+/// per packet  -  the chip silently truncates beyond that).
 pub fn multi_out_packet(out_states: &[u8]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(2 + out_states.len());
     pkt.push(CMD_UIO_STREAM);
@@ -85,7 +85,7 @@ pub fn multi_out_packet(out_states: &[u8]) -> Vec<u8> {
 /// before silently truncating. Conservative ceiling vs. observed silicon.
 pub const MAX_TRANSITIONS_PER_PACKET: usize = 28;
 
-/// A combined "drive outputs, then sample inputs" packet — exactly one USB
+/// A combined "drive outputs, then sample inputs" packet  -  exactly one USB
 /// round trip captures the state after the drive completes. Used by I2C ACK
 /// sampling and JTAG TDO capture.
 ///
@@ -102,7 +102,7 @@ pub fn drive_then_sample_packet(out_state: u8) -> [u8; 4] {
 
 /// High-level safe handle over a `UsbBus` that tracks pin state in software
 /// and exposes ergonomic GPIO operations. Cloning is intentionally NOT
-/// derived — the underlying bus is exclusive.
+/// derived  -  the underlying bus is exclusive.
 pub struct UioPort<'b, B: UsbBus> {
     bus: &'b mut B,
     dir_cache: u8,

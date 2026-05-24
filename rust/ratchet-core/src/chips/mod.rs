@@ -1,6 +1,6 @@
 // Chip database: 806 SPI flash chips ported from src/chips/database.ts.
 // Data lives in `data/chips.json` (include_str! at compile, parsed once via OnceLock).
-// JEDEC manufacturer table is inline below (24 entries — small enough to keep in code).
+// JEDEC manufacturer table is inline below (24 entries  -  small enough to keep in code).
 
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -42,7 +42,7 @@ fn chips() -> &'static Vec<Chip> {
     static DB: OnceLock<Vec<Chip>> = OnceLock::new();
     DB.get_or_init(|| {
         serde_json::from_str(CHIPS_JSON)
-            .expect("data/chips.json is malformed — regenerate from TS source")
+            .expect("data/chips.json is malformed  -  regenerate from TS source")
     })
 }
 
@@ -116,7 +116,7 @@ pub fn needs_4byte_addressing(jedec_id: &str) -> bool {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// JEDEC manufacturer table — keep in code, only 24 entries, never mutated.
+// JEDEC manufacturer table  -  keep in code, only 24 entries, never mutated.
 // ═════════════════════════════════════════════════════════════════════════════
 
 const JEDEC_MANUFACTURERS: &[(&str, &str)] = &[
@@ -193,7 +193,7 @@ pub fn fuzzy_match_jedec(jedec_id: &str) -> FuzzyMatch {
 
     if id == "000000" || id == "ffffff" || id.is_empty() || id.len() < 6 {
         let reasoning = if id == "000000" || id == "ffffff" {
-            "Dead chip response — no SPI flash detected. Check SOIC clip connection."
+            "Dead chip response  -  no SPI flash detected. Check SOIC clip connection."
         } else {
             "Invalid or incomplete JEDEC ID"
         };
@@ -256,11 +256,11 @@ pub fn fuzzy_match_jedec(jedec_id: &str) -> FuzzyMatch {
             format_size(estimated_size),
             cap_byte
         ));
-        reasons.push("Exact type byte not in database — voltage is estimated".to_string());
+        reasons.push("Exact type byte not in database  -  voltage is estimated".to_string());
     } else if manufacturer != "Unknown" {
         confidence = Confidence::Medium;
         reasons.push(format!("Known manufacturer: {manufacturer}"));
-        reasons.push("Capacity byte outside standard range — size unknown".to_string());
+        reasons.push("Capacity byte outside standard range  -  size unknown".to_string());
     } else {
         confidence = Confidence::Low;
         reasons.push(format!("Unknown manufacturer byte: 0x{mfg_byte}"));
@@ -307,7 +307,7 @@ pub fn get_chip_recommendations(chip: &Chip) -> ChipRecommendation {
 
     if chip.voltage < 2.0 {
         warnings.push(
-            "1.8V chip — CH341A outputs 3.3V natively. Use a 1.8V adapter or level shifter to avoid chip damage."
+            "1.8V chip  -  CH341A outputs 3.3V natively. Use a 1.8V adapter or level shifter to avoid chip damage."
                 .to_string(),
         );
     }
@@ -317,11 +317,11 @@ pub fn get_chip_recommendations(chip: &Chip) -> ChipRecommendation {
             let conservative = mhz.min(30);
             format!("{mhz}MHz max (conservative: {conservative}MHz for CH341A)")
         }
-        None => "Unknown — use conservative 25MHz".to_string(),
+        None => "Unknown  -  use conservative 25MHz".to_string(),
     };
 
     let erase_strategy = if chip.size_bytes <= 1024 * 1024 {
-        "Sector erase (4KB) recommended — chip is small enough for fast targeted erase".to_string()
+        "Sector erase (4KB) recommended  -  chip is small enough for fast targeted erase".to_string()
     } else if chip.size_bytes <= 16 * 1024 * 1024 {
         "Block erase (64KB) for bulk operations, sector erase (4KB) for targeted updates"
             .to_string()
@@ -599,7 +599,7 @@ mod tests {
         assert!(res.errors.iter().any(|e| e.contains("power of 2")));
     }
 
-    /// Parity test — sample 10 well-known JEDEC IDs and assert key fields match the TS impl.
+    /// Parity test  -  sample 10 well-known JEDEC IDs and assert key fields match the TS impl.
     #[test]
     fn parity_with_ts_for_known_ids() {
         let cases = [

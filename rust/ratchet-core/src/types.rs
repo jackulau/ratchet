@@ -1,4 +1,4 @@
-// Shared types — ports of src/types.ts.
+// Shared types  -  ports of src/types.ts.
 // Serialized into the `--json` envelope output, so field renaming is observable.
 
 use serde::{Deserialize, Serialize};

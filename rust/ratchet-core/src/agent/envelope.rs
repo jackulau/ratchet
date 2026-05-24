@@ -1,5 +1,5 @@
 // Stable JSON envelope for `--json` mode (CLI + MCP server).
-// Shape must remain backward-compatible — agents depend on these field names.
+// Shape must remain backward-compatible  -  agents depend on these field names.
 
 use serde::{Deserialize, Serialize};
 

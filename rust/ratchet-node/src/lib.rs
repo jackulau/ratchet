@@ -1,5 +1,5 @@
 // napi-rs Node-API bridge. Exposes ratchet-core's pure functions to Node
-// consumers without requiring users to install Rust — `napi build` produces
+// consumers without requiring users to install Rust  -  `napi build` produces
 // `index.node` (a platform-specific .so/.dylib/.dll renamed) that Node loads
 // directly via `require("./index.node")`.
 //
@@ -10,7 +10,7 @@
 //     zero compiler / build-tool requirements
 //   - node-gyp directly requires distutils + python on the install host
 //
-// This bridge is OPTIONAL — the primary distribution is the standalone Rust
+// This bridge is OPTIONAL  -  the primary distribution is the standalone Rust
 // binaries (ratchet / ratchet-mcp). Node consumers only need this if they want
 // to call ratchet from JS without spawning a subprocess.
 

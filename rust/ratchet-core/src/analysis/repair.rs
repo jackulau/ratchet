@@ -126,7 +126,7 @@ pub fn repair_from_reference(broken: &[u8], reference: &[u8]) -> RepairResult {
     // Non-Intel-FD: full replacement.
     if broken_regions.len() == 1 && broken_regions[0].region_type == "raw" {
         actions.push("Full image replacement (no Intel Flash Descriptor)".to_string());
-        warnings.push("No Intel FD — replaced entire image from reference".to_string());
+        warnings.push("No Intel FD  -  replaced entire image from reference".to_string());
         let repaired: Vec<u8> = if reference.len() == broken.len() {
             reference.to_vec()
         } else if reference.len() < broken.len() {
@@ -167,7 +167,7 @@ pub fn repair_from_reference(broken: &[u8], reference: &[u8]) -> RepairResult {
     }
 
     if actions.is_empty() {
-        actions.push("No corrupted regions found — image matches reference".to_string());
+        actions.push("No corrupted regions found  -  image matches reference".to_string());
     }
     let mut report = generate_repair_report(broken, &repaired, actions);
     report.warnings = warnings;
@@ -233,7 +233,7 @@ pub fn repair_reset_vector(image: &[u8]) -> RepairResult {
             report: generate_repair_report(
                 image,
                 image,
-                vec!["Reset vector already valid — no repair needed".to_string()],
+                vec!["Reset vector already valid  -  no repair needed".to_string()],
             ),
         };
     }
@@ -281,7 +281,7 @@ pub fn repair_auto(image: &[u8]) -> RepairResult {
     }
 
     if actions.is_empty() {
-        actions.push("No repairs needed — image appears healthy".to_string());
+        actions.push("No repairs needed  -  image appears healthy".to_string());
     }
     let report = generate_repair_report(image, &current, actions);
     let _ = NvramVarState::Valid; // silence unused-import lint when feature gates change

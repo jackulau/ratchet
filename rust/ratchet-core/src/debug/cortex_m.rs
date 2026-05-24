@@ -1,4 +1,4 @@
-// Cortex-M live debug — halt/resume/step + core register R/W + RAM dump +
+// Cortex-M live debug  -  halt/resume/step + core register R/W + RAM dump +
 // hardware breakpoints via the FPB unit. Built on top of ADIv5 MEM-AP.
 //
 // Register map (ARMv7-M Architecture Reference Manual §C1):
@@ -8,7 +8,7 @@
 //   0xE000EDF8  DCRDR  Debug Core Register Data
 //   0xE000EDFC  DEMCR  Debug Exception and Monitor Control
 //   0xE0001000  DWT_CTRL
-//   0xE0002000  FP_CTRL (BPU / FPBv1) — count of HW breakpoints in bits 4..7+8..11
+//   0xE0002000  FP_CTRL (BPU / FPBv1)  -  count of HW breakpoints in bits 4..7+8..11
 //   0xE0002008+ FP_COMPn (one 32-bit comparator per breakpoint slot)
 //
 // DHCSR layout (writes require DBGKEY=0xA05F in upper 16 bits):

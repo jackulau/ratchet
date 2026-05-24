@@ -1,4 +1,4 @@
-// CH347 backend — USB-HS SPI programmer (up to 60MHz, 510-byte SPI packets, 4-byte addr).
+// CH347 backend  -  USB-HS SPI programmer (up to 60MHz, 510-byte SPI packets, 4-byte addr).
 // Ports src/backends/ch347.ts. Transport-abstracted for hardware-free tests.
 
 #![allow(dead_code)]
@@ -538,7 +538,7 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
                 None
             } else {
                 Some(format!(
-                    "Unstable: {matches}/10 consistent — reseat clip/check power"
+                    "Unstable: {matches}/10 consistent  -  reseat clip/check power"
                 ))
             },
         })
@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(writes[0][0], CH347_CMD_SPI_CS_XFER);
         assert_eq!(writes[0][4], SPI_CMD_WREN);
 
-        // Second spi_command = ERASE: skip the deassert packet (writes[1]) — it's empty.
+        // Second spi_command = ERASE: skip the deassert packet (writes[1])  -  it's empty.
         // writes[2] = CS_XFER assert + [0x20 0xab 0xcd 0xef].
         // writes[1] is the WREN deassert (empty payload).
         assert_eq!(writes[2][0], CH347_CMD_SPI_CS_XFER);

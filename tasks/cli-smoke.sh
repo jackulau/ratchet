@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CLI smoke — exercises every documented biospy command in safe modes
+# CLI smoke  -  exercises every documented biospy command in safe modes
 # (dry-run / lookup-only). Fails fast on any non-zero exit from a path that
 # should succeed. Hardware commands run with --dry-run; lookup commands have
 # no hardware dependency.

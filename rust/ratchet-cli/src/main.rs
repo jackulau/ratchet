@@ -1,4 +1,4 @@
-// ratchet CLI — full subcommand surface (D18). Hardware ops are stubs that
+// ratchet CLI  -  full subcommand surface (D18). Hardware ops are stubs that
 // honour RATCHET_FORCE_MOCK=1 by routing through the mock backend in
 // ratchet-core. Live USB I/O is wired up incrementally as backends mature.
 
@@ -10,7 +10,7 @@ use serde_json::json;
 #[command(
     name = "ratchet",
     version,
-    about = "ratchet — multi-protocol hardware debug + programming toolkit (CH341A / CH347): SPI flash, I2C, UART, 1-Wire, JTAG, SWD, CAN, AVR / STM32 / ESP programmers, logic analyzer. Fully native Rust."
+    about = "ratchet  -  multi-protocol hardware debug + programming toolkit (CH341A / CH347): SPI flash, I2C, UART, 1-Wire, JTAG, SWD, CAN, AVR / STM32 / ESP programmers, logic analyzer. Fully native Rust."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -92,7 +92,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Serial debug — connect to a CH343 UART and stream lines.
+    /// Serial debug  -  connect to a CH343 UART and stream lines.
     Serial {
         port: String,
         #[arg(long, default_value = "115200")]
@@ -591,7 +591,7 @@ fn hw_stub(verb: &str, action: &str, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&env)?);
     } else {
         println!(
-            "{verb} {action}: registered (stub — live hardware path lands in a follow-up goal)"
+            "{verb} {action}: registered (stub  -  live hardware path lands in a follow-up goal)"
         );
     }
     Ok(())
@@ -989,7 +989,7 @@ fn cmd_blank_check(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_repl() -> anyhow::Result<()> {
-    println!("ratchet REPL — type 'help' or 'quit'");
+    println!("ratchet REPL  -  type 'help' or 'quit'");
     println!("(non-interactive build; live rustyline TTY loop pending)");
     Ok(())
 }
@@ -1110,7 +1110,7 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
         );
         for s in &result.step_results {
             println!(
-                "  [{}] {} — {} ({}ms)",
+                "  [{}] {}  -  {} ({}ms)",
                 s.number, s.name, s.detail, s.duration_ms
             );
         }

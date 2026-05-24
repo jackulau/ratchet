@@ -17,7 +17,7 @@ Expand self-test coverage for edge cases: partial read failures, write-during-di
 
 ## Tasks
 
-### Task 1: Edge case tests — partial reads, disconnect, region round-trip
+### Task 1: Edge case tests  -  partial reads, disconnect, region round-trip
 ### Task 2: Missing CLI command coverage
 ### Task 3: Fix any bugs discovered
 

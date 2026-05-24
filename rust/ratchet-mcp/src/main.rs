@@ -1,6 +1,6 @@
-// ratchet MCP server — hand-rolled JSON-RPC 2.0 over stdio.
+// ratchet MCP server  -  hand-rolled JSON-RPC 2.0 over stdio.
 // Skips third-party MCP crates per the project's "fully custom" objective.
-// Surface: 30 tools — 18 SPI-flash / BIOS analysis + 12 hardware-protocol tools
+// Surface: 30 tools  -  18 SPI-flash / BIOS analysis + 12 hardware-protocol tools
 // (I2C, UART, JTAG, SWD, AVR/ESP/STM32 programmers, logic analyzer, Bus Pirate,
 // slcan CAN). Hardware-protocol handlers return placeholder JSON until live USB
 // wiring lands; the dispatch surface, JSON-schema descriptors, and arg shapes
@@ -13,7 +13,7 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 
 fn main() -> anyhow::Result<()> {
     // `--list-tools` short-circuits the JSON-RPC loop and prints just the
-    // registered tool names — handy for shell smoke tests and discovery.
+    // registered tool names  -  handy for shell smoke tests and discovery.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--list-tools") {
         for t in tool_list() {

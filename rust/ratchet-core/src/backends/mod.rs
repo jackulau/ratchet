@@ -1,4 +1,4 @@
-// Backend trait — every programmer (mock, ch341a, ch347) implements it.
+// Backend trait  -  every programmer (mock, ch341a, ch347) implements it.
 // Keep surface minimal: anything specific to one programmer (e.g. CH341A SPI mode)
 // stays in that backend's module.
 

@@ -54,7 +54,7 @@ impl<'s, T: SwdTransport> Adiv5<'s, T> {
         }
     }
 
-    /// Bring the debug power domain up — must succeed before any AP access.
+    /// Bring the debug power domain up  -  must succeed before any AP access.
     pub fn power_up_debug(&mut self) -> Result<()> {
         let target = DP_CTRLSTAT_CSYSPWRUPREQ | DP_CTRLSTAT_CDBGPWRUPREQ;
         self.swd.write_register(false, DP_CTRLSTAT, target)?;
@@ -118,7 +118,7 @@ impl<'s, T: SwdTransport> Adiv5<'s, T> {
     /// Read a contiguous block via TAR auto-increment.
     #[cfg(test)]
     fn swd_for_test_count(&self) -> usize {
-        0 // unused — placeholder for future inspection helpers.
+        0 // unused  -  placeholder for future inspection helpers.
     }
 
     pub fn mem_read_block(&mut self, addr: u32, count: usize) -> Result<Vec<u32>> {

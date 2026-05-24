@@ -1,4 +1,4 @@
-// CH341A SPI backend — ports src/backends/ch341a.ts.
+// CH341A SPI backend  -  ports src/backends/ch341a.ts.
 //
 // Architecture: protocol-level functions (packet builders / parsers) are pure
 // and heavily tested without USB. The backend struct wires them to a `UsbBus`

@@ -1,4 +1,4 @@
-// BIOS analyzer — UEFI FV detection, Intel FD region walk, vendor/version scan,
+// BIOS analyzer  -  UEFI FV detection, Intel FD region walk, vendor/version scan,
 // diff, checksum, firmware-blob extraction (UEFI Capsule / Intel Flash Image / AMI cap).
 // Ports src/analysis/bios.ts.
 
@@ -287,7 +287,7 @@ fn find_substring_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> Option<usize> 
     None
 }
 
-/// Analyze raw firmware bytes (in-memory variant — file variant just wraps it).
+/// Analyze raw firmware bytes (in-memory variant  -  file variant just wraps it).
 pub fn analyze_bytes(data: &[u8]) -> BiosAnalysis {
     let mut regions: Vec<BiosRegion> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -337,15 +337,15 @@ pub fn analyze_bytes(data: &[u8]) -> BiosAnalysis {
     if data.is_empty() {
         warnings.push("Image is empty (0 bytes)".to_string());
     } else if data.iter().all(|b| *b == 0xff) {
-        warnings.push("Image is entirely 0xFF — chip may be blank or erased".to_string());
+        warnings.push("Image is entirely 0xFF  -  chip may be blank or erased".to_string());
     } else if data.iter().all(|b| *b == 0x00) {
-        warnings.push("Image is entirely 0x00 — read may have failed".to_string());
+        warnings.push("Image is entirely 0x00  -  read may have failed".to_string());
     } else {
         let ff_count = data.iter().filter(|b| **b == 0xff).count();
         let ff_pct = (ff_count as f64 / data.len() as f64) * 100.0;
         if ff_pct > 90.0 {
             warnings.push(format!(
-                "Image is {ff_pct:.1}% empty (0xFF) — may be partially erased"
+                "Image is {ff_pct:.1}% empty (0xFF)  -  may be partially erased"
             ));
         }
     }
@@ -475,7 +475,7 @@ pub fn extract_firmware(data: &[u8]) -> (Vec<u8>, ExtractResult) {
         }
     }
 
-    // Intel Flash Image — descriptor signature 5AA5F00F at offset 0x10
+    // Intel Flash Image  -  descriptor signature 5AA5F00F at offset 0x10
     if data.len() > 0x14 && read_u32_le(data, 0x10) == 0x0ff0_a55a {
         let flmap0 = read_u32_le(data, 0x14 + 0x14);
         let region_base = (((flmap0 >> 16) & 0xff) as usize) << 4;
@@ -492,7 +492,7 @@ pub fn extract_firmware(data: &[u8]) -> (Vec<u8>, ExtractResult) {
                 let me_limit = ((((me_reg >> 16) & 0x1fff) as usize) << 12) | 0xfff;
                 if me_limit > me_base {
                     warnings.push(
-                        "Intel ME region detected — this may be locked by the chipset".to_string(),
+                        "Intel ME region detected  -  this may be locked by the chipset".to_string(),
                     );
                 }
             }
@@ -523,7 +523,7 @@ pub fn extract_firmware(data: &[u8]) -> (Vec<u8>, ExtractResult) {
         );
     }
 
-    // AMI .cap — MZ header + 0x800 envelope
+    // AMI .cap  -  MZ header + 0x800 envelope
     const AMI_CAP_HEADER_SIZE: usize = 0x800;
     if data.len() > AMI_CAP_HEADER_SIZE && data[0] == 0x4d && data[1] == 0x5a {
         let after = &data[AMI_CAP_HEADER_SIZE..];
@@ -569,7 +569,7 @@ mod tests {
         let mut v = vec![0u8; 4096];
         // FV base at 0, header at offset 40 contains "_FVH" signature.
         v[40..44].copy_from_slice(UEFI_FV_SIGNATURE);
-        // FV length at offset 32 (LE u32) — declare 1KB volume.
+        // FV length at offset 32 (LE u32)  -  declare 1KB volume.
         let len: u32 = 1024;
         v[32..36].copy_from_slice(&len.to_le_bytes());
         v
@@ -761,7 +761,7 @@ mod tests {
         v[0..16].copy_from_slice(UEFI_CAPSULE_GUID);
         // body_offset at offset 16 = 28.
         // capsule_size field overlaps GUID bytes 8..12 (matches TS quirk).
-        // Do NOT overwrite GUID bytes — the GUID-equality check would fail.
+        // Do NOT overwrite GUID bytes  -  the GUID-equality check would fail.
         v[16..20].copy_from_slice(&28u32.to_le_bytes());
         v[28..1024].fill(0xab);
         let (body, meta) = extract_firmware(&v);
@@ -807,7 +807,7 @@ mod tests {
         assert_eq!(c.crc32, "3610a686");
     }
 
-    /// Parity test #1 — synthetic AMI BIOS image with reset vector + vendor string.
+    /// Parity test #1  -  synthetic AMI BIOS image with reset vector + vendor string.
     /// Asserts the same fields the TS impl reports.
     #[test]
     fn parity_ami_legacy_image() {
@@ -819,7 +819,7 @@ mod tests {
         assert!(!a.is_uefi);
     }
 
-    /// Parity test #2 — synthetic UEFI image with FV header.
+    /// Parity test #2  -  synthetic UEFI image with FV header.
     #[test]
     fn parity_uefi_fv_image() {
         let v = synthetic_uefi_image();
@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(a.file_size, 4096);
     }
 
-    /// Parity test #3 — synthetic Intel Flash Descriptor image with BIOS region.
+    /// Parity test #3  -  synthetic Intel Flash Descriptor image with BIOS region.
     #[test]
     fn parity_intel_fd_image() {
         let v = intel_fd_image();

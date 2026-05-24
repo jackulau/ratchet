@@ -5,11 +5,11 @@
 // USB latency floor (~1 ms) is too coarse for in-line bit-timing, so the
 // real-hardware backend will assemble a multi-transition packet per slot
 // (chip clocks the transitions at ~166 ns ticks). The protocol module
-// itself is timing-abstracted — wire-level slots are emitted as logical
+// itself is timing-abstracted  -  wire-level slots are emitted as logical
 // `OneWireSlot` ops to a transport trait, which the CH341A and CH347
 // backends translate into appropriate USB packet sequences.
 //
-// Reference: Maxim AN187 — "1-Wire Search Algorithm".
+// Reference: Maxim AN187  -  "1-Wire Search Algorithm".
 
 use crate::backends::{BackendError, Result};
 
@@ -77,7 +77,7 @@ impl<'t, T: OneWireTransport> OneWireMaster<'t, T> {
         Ok(out)
     }
 
-    /// Issue READ ROM (0x33) — only valid with exactly one slave on the bus.
+    /// Issue READ ROM (0x33)  -  only valid with exactly one slave on the bus.
     /// Returns the 8-byte ROM ID (family code, serial, CRC8).
     pub fn read_rom(&mut self) -> Result<[u8; 8]> {
         if !self.reset()? {
@@ -93,7 +93,7 @@ impl<'t, T: OneWireTransport> OneWireMaster<'t, T> {
         Ok(arr)
     }
 
-    /// SKIP ROM (0xCC) — broadcast to all slaves (only useful with one).
+    /// SKIP ROM (0xCC)  -  broadcast to all slaves (only useful with one).
     pub fn skip_rom(&mut self) -> Result<()> {
         if !self.reset()? {
             return Err(BackendError::Other("no presence on bus".into()));
@@ -101,7 +101,7 @@ impl<'t, T: OneWireTransport> OneWireMaster<'t, T> {
         self.write_byte(CMD_SKIP_ROM)
     }
 
-    /// MATCH ROM (0x55) — address one specific slave by ROM ID.
+    /// MATCH ROM (0x55)  -  address one specific slave by ROM ID.
     pub fn match_rom(&mut self, rom: [u8; 8]) -> Result<()> {
         if !self.reset()? {
             return Err(BackendError::Other("no presence on bus".into()));
@@ -110,7 +110,7 @@ impl<'t, T: OneWireTransport> OneWireMaster<'t, T> {
         self.write(&rom)
     }
 
-    /// SEARCH ROM (0xF0) — enumerate all slaves via the Maxim AN187 algorithm.
+    /// SEARCH ROM (0xF0)  -  enumerate all slaves via the Maxim AN187 algorithm.
     /// Returns a list of 8-byte ROM IDs.
     pub fn search_rom(&mut self) -> Result<Vec<[u8; 8]>> {
         let mut results = Vec::new();
@@ -132,7 +132,7 @@ impl<'t, T: OneWireTransport> OneWireMaster<'t, T> {
                 let cmp_id_bit = self.transport.read_bit()?;
 
                 if id_bit && cmp_id_bit {
-                    // No devices responded — bus error.
+                    // No devices responded  -  bus error.
                     return Err(BackendError::Other("search: no response".into()));
                 }
 
@@ -140,7 +140,7 @@ impl<'t, T: OneWireTransport> OneWireMaster<'t, T> {
                 if id_bit != cmp_id_bit {
                     search_bit = id_bit;
                 } else {
-                    // Discrepancy — both 0 and 1 devices exist on this bit.
+                    // Discrepancy  -  both 0 and 1 devices exist on this bit.
                     if id_bit_number < last_discrepancy {
                         let byte_idx = ((id_bit_number - 1) / 8) as usize;
                         let bit_idx = (id_bit_number - 1) % 8;

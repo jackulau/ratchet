@@ -6,7 +6,7 @@
 //   * Byte             (8 bits clocked on rising SCL edges) + ACK/NACK bit
 //   * Repeated START   (START without an intervening STOP)
 //
-// This is pure decoder logic — no I/O. Capture-side code (logic analyzer in
+// This is pure decoder logic  -  no I/O. Capture-side code (logic analyzer in
 // D23) supplies the trace; the decoder is also reusable against external
 // captures (Saleae CSV, sigrok exports, etc.).
 //

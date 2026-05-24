@@ -1,4 +1,4 @@
-// Serial debug surface — ports src/serial/debug.ts.
+// Serial debug surface  -  ports src/serial/debug.ts.
 // Hardware I/O is hidden behind `SerialPort` trait → unit tests use InMemorySerialPort.
 
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,7 @@ pub trait SerialPort {
     fn close(&mut self);
 }
 
-/// In-memory test transport — queues bytes for poll() and records writes.
+/// In-memory test transport  -  queues bytes for poll() and records writes.
 #[derive(Default)]
 pub struct InMemorySerialPort {
     pub writes: Vec<Vec<u8>>,
@@ -118,7 +118,7 @@ impl SerialPort for InMemorySerialPort {
     }
 }
 
-// ─── SerialDebug — the public driver ─────────────────────────────────────────
+// ─── SerialDebug  -  the public driver ─────────────────────────────────────────
 
 pub struct SerialDebug<T: SerialPort> {
     port: Option<T>,
@@ -231,7 +231,7 @@ fn now_ms() -> u128 {
 }
 
 /// Filter a list of `(path, manufacturer, vendorId)` candidates down to CH34x-style ports.
-/// Caller is responsible for enumerating the platform — this is pure logic.
+/// Caller is responsible for enumerating the platform  -  this is pure logic.
 pub fn looks_like_ch34x(path: &str, manufacturer: Option<&str>, vendor_id: Option<&str>) -> bool {
     let m = manufacturer.unwrap_or("");
     let v = vendor_id.unwrap_or("").to_ascii_lowercase();

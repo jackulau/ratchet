@@ -101,7 +101,7 @@ pub fn parse_me_region(data: &[u8], region_offset: u64) -> IntelMeInfo {
                     region_size: data.len() as u64,
                     partitions: vec![],
                     warnings: vec![
-                        "ME region is blank (all 0xFF) — ME disabled or not present".to_string()
+                        "ME region is blank (all 0xFF)  -  ME disabled or not present".to_string()
                     ],
                 };
             }
@@ -114,7 +114,7 @@ pub fn parse_me_region(data: &[u8], region_offset: u64) -> IntelMeInfo {
                     region_size: data.len() as u64,
                     partitions: vec![],
                     warnings: vec![
-                        "ME region is all zeros — likely erased or corrupted".to_string()
+                        "ME region is all zeros  -  likely erased or corrupted".to_string()
                     ],
                 };
             }
@@ -145,7 +145,7 @@ pub fn parse_me_region(data: &[u8], region_offset: u64) -> IntelMeInfo {
     let num_entries = read_u32_le(data, fpt_offset + 4);
     if num_entries > 32 {
         warnings.push(format!(
-            "Unusual FPT entry count: {num_entries} — may be corrupted"
+            "Unusual FPT entry count: {num_entries}  -  may be corrupted"
         ));
     }
 
@@ -199,7 +199,7 @@ pub fn parse_me_region(data: &[u8], region_offset: u64) -> IntelMeInfo {
 
     if version == "unknown" {
         warnings
-            .push("Could not extract ME firmware version — $MN2 manifest not found".to_string());
+            .push("Could not extract ME firmware version  -  $MN2 manifest not found".to_string());
     }
 
     IntelMeInfo {

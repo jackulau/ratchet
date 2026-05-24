@@ -1,4 +1,4 @@
-// Connection quality scoring — produces 0-100 quality score from raw JEDEC
+// Connection quality scoring  -  produces 0-100 quality score from raw JEDEC
 // reads + timings + status-register flag. Ports src/connection/quality.ts.
 
 use serde::{Deserialize, Serialize};
@@ -56,7 +56,7 @@ fn score_consistency(readings: &[String]) -> (u32, Option<String>) {
     if valid.is_empty() {
         return (
             0,
-            Some("Reseat clip or probe — all JEDEC reads returned invalid data".to_string()),
+            Some("Reseat clip or probe  -  all JEDEC reads returned invalid data".to_string()),
         );
     }
     let mut freq: HashMap<&String, u32> = HashMap::new();
@@ -71,7 +71,7 @@ fn score_consistency(readings: &[String]) -> (u32, Option<String>) {
         return (
             score,
             Some(format!(
-                "Reseat SOIC clip — {bad}/{} reads inconsistent",
+                "Reseat SOIC clip  -  {bad}/{} reads inconsistent",
                 readings.len()
             )),
         );
@@ -84,7 +84,7 @@ fn score_jedec(readings: &[String]) -> (u32, Option<String>) {
     if valid_count == 0 {
         return (
             0,
-            Some("Check chip orientation — JEDEC ID reads as all-zero or all-one".to_string()),
+            Some("Check chip orientation  -  JEDEC ID reads as all-zero or all-one".to_string()),
         );
     }
     let ratio = valid_count as f32 / readings.len() as f32;
@@ -92,7 +92,7 @@ fn score_jedec(readings: &[String]) -> (u32, Option<String>) {
     if score < 70 {
         return (
             score,
-            Some("Check chip orientation — some JEDEC reads returned invalid values".to_string()),
+            Some("Check chip orientation  -  some JEDEC reads returned invalid values".to_string()),
         );
     }
     (score, None)
@@ -123,7 +123,7 @@ fn score_timing(timings: &[u32]) -> (u32, Option<String>) {
     if score < 70 {
         return (
             score,
-            Some("Shorten USB cable or remove hub — response times are unstable".to_string()),
+            Some("Shorten USB cable or remove hub  -  response times are unstable".to_string()),
         );
     }
     (score, None)
@@ -135,7 +135,7 @@ fn score_status(ok: bool) -> (u32, Option<String>) {
     } else {
         (
             0,
-            Some("Status register unreadable — verify VCC voltage and chip power".to_string()),
+            Some("Status register unreadable  -  verify VCC voltage and chip power".to_string()),
         )
     }
 }
@@ -171,7 +171,7 @@ pub fn compute_quality_score(data: &RawConnectionData) -> ConnectionQualityResul
                     diagnostic: None,
                 },
             ],
-            diagnostics: vec!["Not enough data — fewer than 2 successful reads".to_string()],
+            diagnostics: vec!["Not enough data  -  fewer than 2 successful reads".to_string()],
         };
     }
 
@@ -241,10 +241,10 @@ pub fn format_monitor_line(current_score: u32, previous_score: Option<u32>) -> S
         let mut line = format!("Quality: {score_str} \x1b[31m↓{delta}\x1b[0m");
         if current_score < MONITOR_AUTO_EXIT_THRESHOLD {
             line.push_str(&format!(
-                " \x1b[31mCRITICAL — score below {MONITOR_AUTO_EXIT_THRESHOLD}, auto-exiting\x1b[0m"
+                " \x1b[31mCRITICAL  -  score below {MONITOR_AUTO_EXIT_THRESHOLD}, auto-exiting\x1b[0m"
             ));
         } else if delta.abs() >= 15 {
-            line.push_str(" \x1b[33mWARNING — significant degradation\x1b[0m");
+            line.push_str(" \x1b[33mWARNING  -  significant degradation\x1b[0m");
         }
         line
     } else {

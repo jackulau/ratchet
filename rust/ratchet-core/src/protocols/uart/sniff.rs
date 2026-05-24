@@ -74,7 +74,7 @@ impl UartDecoder {
                 let start_t = samples[i].t_us;
                 let mid_start = i as u32 + mid_offset;
 
-                // Sample mid-start-bit — should still be low.
+                // Sample mid-start-bit  -  should still be low.
                 let s = mid_start as usize;
                 if s >= samples.len() || samples[s].level {
                     i += 1;

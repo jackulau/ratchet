@@ -71,7 +71,7 @@ impl<'t, T: Stk500Transport> Stk500<'t, T> {
         Ok(reply[1..reply.len() - 1].to_vec())
     }
 
-    /// Achieve sync — retry a few times since the bootloader window is short.
+    /// Achieve sync  -  retry a few times since the bootloader window is short.
     pub fn sync(&mut self) -> Result<()> {
         for _ in 0..5 {
             if self.cmd(&[STK_GET_SYNC], 0).is_ok() {

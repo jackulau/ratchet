@@ -2,25 +2,21 @@
 
 Multi-protocol **hardware debug + programming toolkit** built on **CH341A / CH347** USB programmers.
 
-SPI flash programming + BIOS analysis was the starting point. The current surface adds **I2C / UART / 1-Wire / passive SPI sniff / JTAG / SWD / CAN**, target-MCU programmers (**AVR ISP, STK500 / Arduino bootloader, 24Cxx EEPROM, 93xxx Microwire EEPROM, ESP32/ESP8266 esptool, STM32 SWD, STM32 UART AN3155**), ARM debug (**ADIv5, Cortex-M halt/resume/step, ELF symbol-aware peek**), JTAG IDCODE chain + BSDL boundary scan, multi-channel logic analyzer with Saleae/sigrok export, and bridges for **Bus Pirate** + **slcan CAN**.
+SPI flash programming + BIOS analysis was the starting point. The current surface adds **I2C / UART / 1-Wire / passive SPI sniff / JTAG / SWD / CAN**, target-MCU programmers (**AVR ISP, STK500 / Arduino bootloader, 24Cxx EEPROM, 93xxx Microwire EEPROM, ESP32 / ESP8266 esptool, STM32 SWD, STM32 UART AN3155**), ARM debug (**ADIv5, Cortex-M halt/resume/step, ELF symbol-aware peek**), JTAG IDCODE chain + BSDL boundary scan, multi-channel logic analyzer with Saleae / sigrok export, and bridges for **Bus Pirate** + **slcan CAN**.
 
 **Rust-first.** Single self-contained binary, custom libusb FFI, custom JSON-RPC MCP server, no Node runtime required.
 
-Replaces AsProgrammer / NeoProgrammer for the SPI-flash path, and overlaps with flashrom / avrdude / esptool / stm32flash / OpenOCD-as-bit-bang for the broader hardware surface — but with one binary, native USB, image analysis, knowledge-base diagnostics, real progress reporting, and a built-in MCP server for AI agents.
+Replaces AsProgrammer / NeoProgrammer for the SPI-flash path, and overlaps with flashrom / avrdude / esptool / stm32flash / OpenOCD-as-bit-bang for the broader hardware surface, with one binary, native USB, image analysis, knowledge-base diagnostics, real progress reporting, and a built-in MCP server for AI agents.
+
+## Status
+
+Pre-release. Goal-005 shipped the full multi-protocol surface; goals 006 / 007 rebranded and audited. Hardware-protocol code paths (D1 to D26) are implemented and unit-tested mock-backed. **No GitHub Releases are published yet**, so the only supported install route today is from source via `cargo install`.
 
 ## Install
 
-### macOS / Linux — pre-built binary (recommended)
+### From source via cargo (the path that works today)
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/jackulau/ratchet/main/install.sh | bash
-```
-
-This downloads the latest release for your host triple from GitHub Releases
-and installs `ratchet` + `ratchet-mcp` into `/usr/local/bin` (or `~/.local/bin`
-if the former isn't writable).
-
-### From source via cargo
+Requires Rust 1.82+ and libusb-1.0 installed (see [Requirements](#requirements)).
 
 ```bash
 git clone https://github.com/jackulau/ratchet
@@ -29,25 +25,55 @@ cargo install --path ratchet-cli
 cargo install --path ratchet-mcp
 ```
 
-The release-profile binaries land in `rust/target/release/ratchet` and
-`rust/target/release/ratchet-mcp` and run standalone — no Node, no Python.
+This installs `ratchet` and `ratchet-mcp` into `~/.cargo/bin/` (or the value of `CARGO_INSTALL_ROOT` if set). Both binaries are self-contained Rust executables; no Node, no Python.
 
-### Via npm (thin wrapper)
+If you prefer not to mix global state, install to a sandbox directory:
 
 ```bash
-npm install -g ratchet-hw
+cargo install --path ratchet-cli --root /opt/ratchet
+cargo install --path ratchet-mcp --root /opt/ratchet
+export PATH="/opt/ratchet/bin:$PATH"
 ```
 
-The npm package is a wrapper: `postinstall` downloads the same native binary
-from GitHub Releases. Useful if your toolchain already runs through npm.
+### From a checkout (no install)
 
-### Windows
+```bash
+git clone https://github.com/jackulau/ratchet
+cd ratchet/rust
+cargo build --release
+# Binaries land at target/release/ratchet and target/release/ratchet-mcp
+```
 
-Pre-built `ratchet.exe` + `ratchet-mcp.exe` are on the GitHub Releases page.
-Install the WinUSB driver for your CH34x device via [Zadig](https://zadig.akeo.ie/)
-before first use.
+## Uninstall
 
-## Quick Start — SPI flash
+### If you used `cargo install`
+
+```bash
+cargo uninstall ratchet-cli
+cargo uninstall ratchet-mcp
+```
+
+If you used `--root /opt/ratchet` during install, pass the same root:
+
+```bash
+cargo uninstall ratchet-cli --root /opt/ratchet
+cargo uninstall ratchet-mcp --root /opt/ratchet
+```
+
+### If you built from a checkout
+
+Nothing to uninstall; delete the cloned directory. Optionally:
+
+```bash
+cd ratchet/rust && cargo clean    # remove build artifacts
+cd .. && rm -rf ratchet           # remove the checkout
+```
+
+### Removing the Claude Desktop MCP registration
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or the platform equivalent and remove the `"ratchet"` entry under `mcpServers`. Restart Claude Desktop.
+
+## Quick Start - SPI flash
 
 ```bash
 # 1. Plug in CH341A programmer with chip in ZIF socket
@@ -67,7 +93,7 @@ ratchet write new_bios.bin
 ratchet verify new_bios.bin
 ```
 
-## Quick Start — multi-protocol
+## Quick Start - multi-protocol
 
 ```bash
 # I2C bus scan + read
@@ -97,19 +123,21 @@ ratchet can sniff /dev/tty.usbmodem*
 
 ## Commands
 
+`ratchet --help` exposes 39 top-level subcommands plus `help`. Groups:
+
 | Group | Commands |
 |-------|----------|
-| Hardware | `status`, `detect`, `identify`, `connection-test`, `monitor` |
+| Hardware | `status`, `detect`, `identify`, `monitor` |
 | Chip ops | `read`, `write`, `verify`, `erase`, `region-erase`, `blank-check`, `sfdp`, `wp-status` |
-| Analysis | `analyze`, `diff`, `checksum`, `bios-regions`, `nvram-vars` |
+| Analysis | `analyze`, `diff`, `checksum` |
 | Knowledge base | `search`, `chip-info`, `post-decode`, `failure-search`, `voltage-reference` |
 | Serial | `serial`, `serial-list` |
 | Repair | `full-repair`, `full-backup`, `repl` |
+| Self-test | `self-test` (also exposed as `--self-test` top-level flag) |
 | I2C / UART / 1-Wire | `i2c scan/read/write/sniff`, `uart open/sniff`, `onewire scan` |
 | JTAG / SWD | `jtag scan/bsdl-scan`, `swd connect/halt/dump` |
 | Programmers | `avr program`, `arduino program`, `eeprom-i2c read/write`, `eeprom-microwire read/write`, `esp flash`, `stm32 swd-flash/uart-flash` |
 | Instruments | `la capture/export`, `buspirate bridge`, `can sniff` |
-| Self-test | `--self-test` (top-level flag) |
 
 Every inspection command supports `--json` for AgentEnvelope output:
 `{ok, command, data?|error, nextAction?}`. Long-running commands also accept
@@ -124,15 +152,12 @@ ratchet read backup.bin --ndjson
 
 ## Agent Interface (MCP)
 
-ratchet ships a built-in **MCP server** (`ratchet-mcp`) so AI agents — Claude
-Desktop, mcp-cli, custom SDK clients — can drive the hardware directly.
-Hand-rolled JSON-RPC 2.0 over stdio, 30 tools covering BIOS ops + multi-protocol
-hardware (I2C, JTAG, SWD, AVR, ESP, STM32, logic analyzer, Bus Pirate, CAN).
+ratchet ships a built-in **MCP server** (`ratchet-mcp`) so AI agents (Claude Desktop, mcp-cli, custom SDK clients) can drive the hardware directly. Hand-rolled JSON-RPC 2.0 over stdio. **30 tools total**: 18 SPI-flash / BIOS analysis tools + 12 multi-protocol hardware tools. Hardware-protocol handlers currently return placeholder JSON until live USB wiring lands; the dispatch surface, JSON-schema descriptors, and argument shapes are real.
 
 ```bash
 ratchet-mcp                              # live mode (real USB)
 RATCHET_FORCE_MOCK=1 ratchet-mcp         # mock mode (no hardware)
-ratchet-mcp --list-tools                 # dump tool surface
+ratchet-mcp --list-tools                 # dump tool surface (one name per line)
 ```
 
 Register with Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`):
@@ -169,14 +194,13 @@ Register with Claude Desktop (`~/Library/Application Support/Claude/claude_deskt
 
 ratchet refuses to let you brick your board:
 
-- **Auto-backup** before every write — original chip contents saved to a
-  timestamped backup
-- **Verify-after-write** by default
-- **Blank file detection** — refuses to write all-0xFF or all-0x00 files
-- **File size check** — blocks writes that exceed chip capacity
-- **1.8V voltage gate** — flags 1.8V chips on stock CH341A (3.3V output)
-- **Erase confirmation** required before destructive ops
-- **Post-read warnings** — alerts on blank (0xFF) or failed (0x00) reads
+- **Auto-backup** before every write. Original chip contents saved to a timestamped backup.
+- **Verify-after-write** by default.
+- **Blank file detection**: refuses to write all-0xFF or all-0x00 files.
+- **File size check**: blocks writes that exceed chip capacity.
+- **1.8V voltage gate**: flags 1.8V chips on stock CH341A (3.3V output).
+- **Erase confirmation** required before destructive ops.
+- **Post-read warnings**: alerts on blank (0xFF) or failed (0x00) reads.
 
 ## Architecture
 
@@ -191,54 +215,43 @@ rust/
 │                       debug (ADIv5/Cortex-M/ELF/boundary-scan),
 │                       instruments (logic-analyzer/export/Bus-Pirate/slcan),
 │                       workflow pipeline, REPL state, agent envelope
-├── ratchet-cli       ← clap-based CLI, 28+ subcommand groups + --self-test
+├── ratchet-cli       ← clap-based CLI, 39 top-level subcommands + --self-test flag
 ├── ratchet-mcp       ← MCP JSON-RPC 2.0 server (30 tools, stdio)
 └── ratchet-node      ← optional napi-rs bridge for Node consumers
 ```
 
-**Fully native.** Direct SPI / I2C / UART / JTAG / SWD over libusb. No external
-tools shelled out. No `flashrom` / `avrdude` / `esptool` / `stm32flash` /
-`OpenOCD` dependency at runtime — ratchet is an alternative to those, not a
-wrapper around them.
+**Fully native.** Direct SPI / I2C / UART / JTAG / SWD over libusb. No external tools shelled out. No `flashrom` / `avrdude` / `esptool` / `stm32flash` / `OpenOCD` dependency at runtime; ratchet is an alternative to those, not a wrapper around them.
 
 ## Supported Hardware
 
 ### Programmers
 
-- **CH341A** (`1a86:5512`) — most common, SPI + UIO bit-bang for I2C/JTAG/SWD/1-Wire, ~$3 on AliExpress
-- **CH347** (`1a86:55db`, `55dc`, `55de`) — newer, up to 60MHz SPI, native I2C + UART, JTAG
-- **CH343** (`1a86:55d3`) — UART serial-debug only
+- **CH341A** (`1a86:5512`): most common, SPI + UIO bit-bang for I2C / JTAG / SWD / 1-Wire, ~$3 on AliExpress.
+- **CH347** (`1a86:55db`, `55dc`, `55de`): newer, up to 60 MHz SPI, native I2C + UART, JTAG.
+- **CH343** (`1a86:55d3`): UART serial-debug only.
 
 ### Flash Chips (806 in database)
 
-Winbond, Macronix, GigaDevice, SST/Microchip, EON, Spansion/Cypress/Infineon,
-Micron/Numonyx, ISSI, AMIC, XMC, PUYA, ESMT, Intel, Atmel/Adesto, and more.
-Both 3.3V and 1.8V variants.
+Winbond, Macronix, GigaDevice, SST / Microchip, EON, Spansion / Cypress / Infineon, Micron / Numonyx, ISSI, AMIC, XMC, PUYA, ESMT, Intel, Atmel / Adesto, and more. Both 3.3V and 1.8V variants.
 
 ### Target MCUs
 
-- **AVR** — ATmega328P (Arduino UNO), ATmega2560, ATtiny85, ATmega32U4 via ISP or STK500 bootloader
-- **STM32** — F0/F1/F2/F3/F4/F7/G0/G4/H7/L0/L4/L5 via SWD or AN3155 UART bootloader
-- **ESP** — ESP8266, ESP32, ESP32-S2/S3/C3/C6 via ROM bootloader + optional stub
-- **ARM Cortex-M** — generic debug surface (halt/resume/step/RAM dump) via SWD on any ADIv5-compliant target
+- **AVR**: ATmega328P (Arduino UNO), ATmega2560, ATtiny85, ATmega32U4 via ISP or STK500 bootloader.
+- **STM32**: F0 / F1 / F2 / F3 / F4 / F7 / G0 / G4 / H7 / L0 / L4 / L5 via SWD or AN3155 UART bootloader.
+- **ESP**: ESP8266, ESP32, ESP32-S2 / S3 / C3 / C6 via ROM bootloader + optional stub.
+- **ARM Cortex-M**: generic debug surface (halt / resume / step / RAM dump) via SWD on any ADIv5-compliant target.
 
 ## Requirements
 
-- **End user**: nothing extra (pre-built binary is self-contained)
-- **From-source build**: Rust 1.82+, libusb-1.0 (system package)
-- **macOS**: `brew install libusb`
-- **Linux (Debian/Ubuntu)**: `sudo apt install libusb-1.0-0-dev`
-- **Windows**: vcpkg-installed libusb for build; WinUSB driver for runtime
+- **End user (cargo-install path)**: Rust 1.82+ and libusb-1.0 (system package).
+- **macOS**: `brew install libusb`.
+- **Linux (Debian / Ubuntu)**: `sudo apt install libusb-1.0-0-dev`.
+- **Windows**: vcpkg-installed libusb for build; WinUSB driver via [Zadig](https://zadig.akeo.ie/) for runtime.
 
 ## History
 
-This repo started life as `biosMCP` — a CH341A-focused BIOS chip programmer
-that replaced AsProgrammer / NeoProgrammer. The TypeScript prototype was
-fully replaced by a native Rust workspace in goal 004 (`ts-final` git tag
-preserves the prior state). Goal 005 expanded the scope from SPI-flash-only
-into the multi-protocol hardware toolkit you see today, and goal 006 rebranded
-the project to `ratchet` to reflect the broader surface.
+This repo started life as `biosMCP`, a CH341A-focused BIOS chip programmer that replaced AsProgrammer / NeoProgrammer. The TypeScript prototype was fully replaced by a native Rust workspace in goal 004 (the `ts-final` git tag preserves the prior state). Goal 005 expanded the scope from SPI-flash-only into the multi-protocol hardware toolkit; goal 006 rebranded the project to `ratchet` to reflect the broader surface; goal 007 audited the full capability matrix; goal 008 added the LICENSE file and reconciled README claims with reality.
 
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE).

@@ -1,7 +1,7 @@
-// Plugin system stub. The TS version dynamically imports JS modules — Rust
+// Plugin system stub. The TS version dynamically imports JS modules  -  Rust
 // can't do that without an embedded JS runtime. Two paths forward (D17 scope
 // is just the surface):
-//   1. Shell-out to an external script (deliberately rejected — goal forbids exec/spawn).
+//   1. Shell-out to an external script (deliberately rejected  -  goal forbids exec/spawn).
 //   2. Statically compiled Rust plugin trait; users link extra crates against ratchet-core.
 // We expose the trait so the CLI's `plugin` subcommand can be wired in D18.
 

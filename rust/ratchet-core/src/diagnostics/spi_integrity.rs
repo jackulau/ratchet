@@ -1,4 +1,4 @@
-// SPI integrity analysis — pattern classification + recommendation.
+// SPI integrity analysis  -  pattern classification + recommendation.
 // Ports src/diagnostics/spi-integrity.ts.
 
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ pub fn analyze_spi_readings(readings: Vec<SpiReading>) -> SpiIntegrityReport {
             dominant_id: String::new(),
             dominant_count: 0,
             total_reads: 0,
-            recommendation: "No readings — check programmer connection".to_string(),
+            recommendation: "No readings  -  check programmer connection".to_string(),
             status_register_consistent: false,
         };
     }
@@ -78,10 +78,10 @@ pub fn analyze_spi_readings(readings: Vec<SpiReading>) -> SpiIntegrityReport {
     };
 
     let recommendation: String = match pattern {
-        SpiPattern::Dead => "All reads return 0x000000 or 0xFFFFFF — no chip detected. Check: (1) SOIC clip seating on chip, (2) pin 1 alignment, (3) programmer is powered, (4) chip is a valid SPI flash.".to_string(),
+        SpiPattern::Dead => "All reads return 0x000000 or 0xFFFFFF  -  no chip detected. Check: (1) SOIC clip seating on chip, (2) pin 1 alignment, (3) programmer is powered, (4) chip is a valid SPI flash.".to_string(),
         _ if score >= 95 => "Connection is solid. Safe to proceed with read/write operations.".to_string(),
-        _ if score >= 80 => "Connection is marginal — some reads are inconsistent. Reseat the SOIC clip and ensure firm pressure on all 8 pins. Avoid touching the clip during operations.".to_string(),
-        _ if score >= 50 => "Connection is unreliable — too many inconsistent reads. Do NOT attempt write operations. Fix the physical connection first: clean chip pads, check clip spring tension, try a different clip or use a ZIF socket.".to_string(),
+        _ if score >= 80 => "Connection is marginal  -  some reads are inconsistent. Reseat the SOIC clip and ensure firm pressure on all 8 pins. Avoid touching the clip during operations.".to_string(),
+        _ if score >= 50 => "Connection is unreliable  -  too many inconsistent reads. Do NOT attempt write operations. Fix the physical connection first: clean chip pads, check clip spring tension, try a different clip or use a ZIF socket.".to_string(),
         _ => "Connection is very poor or no chip present. Check all physical connections, verify chip is correct type, and ensure programmer is working (try 'ratchet test-connection').".to_string(),
     };
 

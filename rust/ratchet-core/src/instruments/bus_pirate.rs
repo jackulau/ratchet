@@ -121,7 +121,7 @@ impl<'t, T: BusPirateTransport> BusPirate<'t, T> {
         Ok(())
     }
 
-    /// SPI bulk transfer — sends 1..16 MOSI bytes; returns MISO.
+    /// SPI bulk transfer  -  sends 1..16 MOSI bytes; returns MISO.
     pub fn spi_bulk(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         if self.current_mode != BpMode::Spi {
             return Err(BackendError::Other("Bus Pirate: not in SPI mode".into()));

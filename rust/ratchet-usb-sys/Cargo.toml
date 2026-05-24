@@ -1,6 +1,6 @@
 [package]
 name = "ratchet-usb-sys"
-description = "Raw FFI bindings to libusb-1.0, generated at build time by bindgen. Custom binding — no third-party USB crate."
+description = "Raw FFI bindings to libusb-1.0, generated at build time by bindgen. Custom binding  -  no third-party USB crate."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -16,7 +16,7 @@ rust-version = "1.82"
 license = "MIT"
 authors = ["ratchet contributors"]
 repository = "https://github.com/jackulau/ratchet"
-description = "ratchet — multi-protocol hardware debug + programming toolkit (CH341A / CH347 USB programmers, SPI / I2C / UART / 1-Wire / JTAG / SWD / CAN, AVR / STM32 / ESP programmers). Fully native Rust."
+description = "ratchet  -  multi-protocol hardware debug + programming toolkit (CH341A / CH347 USB programmers, SPI / I2C / UART / 1-Wire / JTAG / SWD / CAN, AVR / STM32 / ESP programmers). Fully native Rust."
 
 [workspace.dependencies]
 ratchet-usb-sys = { path = "ratchet-usb-sys", version = "2.0.0-alpha.1" }

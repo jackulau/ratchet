@@ -1,4 +1,4 @@
-// Mock backend — in-memory flash emulation. Used for tests and `RATCHET_FORCE_MOCK=1`.
+// Mock backend  -  in-memory flash emulation. Used for tests and `RATCHET_FORCE_MOCK=1`.
 // Mirrors src/backends/mock.ts.
 
 use super::{Backend, BackendError, Result, WriteOpts};
@@ -13,7 +13,7 @@ const MOCK_JEDEC: JedecId = JedecId {
     memory_type: 0x40,
     capacity: 0x17,
 };
-const MOCK_SIZE: usize = 8 * 1024 * 1024; // 8MB — W25Q64
+const MOCK_SIZE: usize = 8 * 1024 * 1024; // 8MB  -  W25Q64
 
 pub struct MockBackend {
     flash: Vec<u8>,
@@ -284,7 +284,7 @@ impl Backend for MockBackend {
                 jedec_id: "000000".to_string(),
                 timings: vec![5; read_count as usize],
                 status_register: None,
-                error: Some("No chip responding — check clip/socket connection".to_string()),
+                error: Some("No chip responding  -  check clip/socket connection".to_string()),
             }),
             QualityMode::Noisy => {
                 let noisy_ids = ["ab1234", "cd5678", "000000"];
@@ -309,7 +309,7 @@ impl Backend for MockBackend {
                     timings,
                     status_register: Some(0x00),
                     error: Some(format!(
-                        "Unstable: {}/{} consistent — reseat SOIC clip",
+                        "Unstable: {}/{} consistent  -  reseat SOIC clip",
                         matches, read_count
                     )),
                 })

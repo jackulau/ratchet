@@ -1,12 +1,12 @@
 // UART master.
 //
 // Two implementations:
-//   * `Ch341aUart` — bit-bang on UIO pins. TX = D5 (default), RX = D7 (input
+//   * `Ch341aUart`  -  bit-bang on UIO pins. TX = D5 (default), RX = D7 (input
 //     only). Timing is governed by USB packet latency, so reliable bit-bang
 //     UART caps at ~38400 baud in practice. Above that, jitter exceeds the
 //     half-bit-period margin and frames corrupt.
 //
-//   * `Ch347Uart` — uses the chip's native UART engine via `hw::ch347_raw`.
+//   * `Ch347Uart`  -  uses the chip's native UART engine via `hw::ch347_raw`.
 //     Supported speeds 1200–6_000_000 baud per WCH spec, hardware-clocked.
 
 use crate::backends::ch341a::UsbBus;
@@ -110,7 +110,7 @@ pub fn encode_frame(byte: u8, cfg: UartConfig) -> Vec<bool> {
         bits.push(p);
     }
     // Stop bit(s): high. 1.5 stops are encoded as a single bit period plus
-    // a half — we approximate as 1 here; the chip handles fractional stops
+    // a half  -  we approximate as 1 here; the chip handles fractional stops
     // in hardware.
     let stop_count = match cfg.stop_bits {
         StopBits::One => 1,
@@ -182,7 +182,7 @@ impl<'t, T: Ch347Transport> Ch347Uart<'t, T> {
         );
         // Use the underlying transport directly since Ch347Raw doesn't have a
         // dedicated uart_init helper.
-        // Take a fresh reference via mem swap — pattern below uses raw transport.
+        // Take a fresh reference via mem swap  -  pattern below uses raw transport.
         // For simplicity we re-build via Ch347Raw and call its primitives instead.
         // Actually `build_uart_init` is enough; just write it.
         let _ = pkt;
@@ -277,7 +277,7 @@ mod tests {
         let mut t = CapturingTransport::new();
         let cfg = UartConfig::standard_8n1(115200);
         let _uart = Ch347Uart::open(&mut t, cfg).unwrap();
-        // Open doesn't currently emit init via `raw` — verify the cfg is stored.
+        // Open doesn't currently emit init via `raw`  -  verify the cfg is stored.
         assert_eq!(_uart.config().baud, 115200);
     }
 }

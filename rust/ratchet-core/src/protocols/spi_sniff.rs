@@ -276,7 +276,7 @@ mod tests {
                     miso: sbit,
                 });
                 t += 1;
-                // Clock rise — decoder samples here (Mode 0 = sample on rising).
+                // Clock rise  -  decoder samples here (Mode 0 = sample on rising).
                 out.push(SpiSample {
                     t_us: t,
                     cs: false,

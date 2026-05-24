@@ -1,4 +1,4 @@
-// Tty-aware output helpers — color and formatting for human-readable mode.
+// Tty-aware output helpers  -  color and formatting for human-readable mode.
 // Ports src/output.ts. Pure-functions return styled strings; printing is the
 // caller's responsibility, which keeps these testable.
 

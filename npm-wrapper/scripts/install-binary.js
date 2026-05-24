@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// postinstall hook — downloads the native biospy binary from GitHub Releases
+// postinstall hook  -  downloads the native biospy binary from GitHub Releases
 // matching the npm package version + host platform.
 
 const fs = require("node:fs");

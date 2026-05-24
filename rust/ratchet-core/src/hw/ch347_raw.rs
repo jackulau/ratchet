@@ -1,7 +1,7 @@
 // CH347 raw / MPSSE-like primitive layer.
 //
 // The CH347 exposes three independent USB interfaces:
-//   - Interface 0 (UART): VCP/CDC class — handled by the OS serial driver,
+//   - Interface 0 (UART): VCP/CDC class  -  handled by the OS serial driver,
 //     so we mostly bypass it and talk via the standard tty path.
 //   - Interface 2 (SPI):  used by the existing `backends::ch347` flash backend.
 //   - Interface 1 (I2C / GPIO / JTAG bit-bang): exposed here.
@@ -12,7 +12,7 @@
 // `ch347-utility` / `libusb-CH347` projects.
 //
 // Unlike the CH341A UIO layer (which is bit-bang only), the CH347's I2C and
-// UART engines run in dedicated firmware on the chip — host sends a logical
+// UART engines run in dedicated firmware on the chip  -  host sends a logical
 // "transfer this byte stream" command and the chip clocks it out at the
 // requested speed (up to 1 MHz I2C / 6 Mbaud UART).
 
@@ -21,13 +21,13 @@ use crate::backends::Result;
 
 // ─── Command opcodes (interface 1: I2C / GPIO) ─────────────────────────────
 
-/// I2C stream — a sequence of inline sub-commands (start/stop/write/read).
+/// I2C stream  -  a sequence of inline sub-commands (start/stop/write/read).
 pub const CMD_I2C_STREAM: u8 = 0xAA;
 
-/// GPIO get/set — reads or writes the 8 free GPIO pins on the CH347.
+/// GPIO get/set  -  reads or writes the 8 free GPIO pins on the CH347.
 pub const CMD_GPIO: u8 = 0xCC;
 
-/// JTAG bit-bang stream — TCK/TMS/TDI per-byte transitions, TDO returned.
+/// JTAG bit-bang stream  -  TCK/TMS/TDI per-byte transitions, TDO returned.
 pub const CMD_JTAG_BITBANG: u8 = 0xD1;
 
 /// UART config (interface 0). Sub-fields: baud (u32 LE), data bits (u8),
@@ -39,13 +39,13 @@ pub const CMD_UART_XFER: u8 = 0xC1;
 //
 // These appear in the payload of a CMD_I2C_STREAM packet:
 //
-//   0x74              SET_START      — drive START condition
-//   0x75              SET_STOP       — drive STOP condition
-//   0x76              SET_ACK        — drive ACK on next read byte
-//   0x77              SET_NACK       — drive NACK on next read byte
-//   0x80..=0xBF       WRITE_N_BYTES  — N = (code & 0x3F) +1; payload N bytes
-//   0xC0..=0xCF       READ_N_ACK     — N = (code & 0x0F); ACK each, last NACK
-//   0xE0              SET_SPEED      — next byte = divisor (0..3 → 20/100/400/750 kHz)
+//   0x74              SET_START       -  drive START condition
+//   0x75              SET_STOP        -  drive STOP condition
+//   0x76              SET_ACK         -  drive ACK on next read byte
+//   0x77              SET_NACK        -  drive NACK on next read byte
+//   0x80..=0xBF       WRITE_N_BYTES   -  N = (code & 0x3F) +1; payload N bytes
+//   0xC0..=0xCF       READ_N_ACK      -  N = (code & 0x0F); ACK each, last NACK
+//   0xE0              SET_SPEED       -  next byte = divisor (0..3 → 20/100/400/750 kHz)
 
 pub const I2C_SET_START: u8 = 0x74;
 pub const I2C_SET_STOP: u8 = 0x75;

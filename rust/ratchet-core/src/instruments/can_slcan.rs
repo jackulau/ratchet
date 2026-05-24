@@ -2,13 +2,13 @@
 //
 // The slcan protocol is a simple line-oriented text framing over USB-CDC:
 //
-//   Sxx\r        — set bit rate (S0..S8 = 10k..1M)
-//   O\r          — open channel  (replies '\r' on success, 0x07 on error)
-//   C\r          — close channel
-//   t<id><dlc><d>\r  — TX standard frame (11-bit id, 3 hex chars)
-//   T<id><dlc><d>\r  — TX extended frame (29-bit id, 8 hex chars)
-//   r<id><dlc>\r     — TX standard remote-request frame
-//   R<id><dlc>\r     — TX extended remote-request frame
+//   Sxx\r         -  set bit rate (S0..S8 = 10k..1M)
+//   O\r           -  open channel  (replies '\r' on success, 0x07 on error)
+//   C\r           -  close channel
+//   t<id><dlc><d>\r   -  TX standard frame (11-bit id, 3 hex chars)
+//   T<id><dlc><d>\r   -  TX extended frame (29-bit id, 8 hex chars)
+//   r<id><dlc>\r      -  TX standard remote-request frame
+//   R<id><dlc>\r      -  TX extended remote-request frame
 //
 // Async RX frames arrive in the same form, terminated with '\r'.
 

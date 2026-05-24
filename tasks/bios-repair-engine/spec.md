@@ -6,13 +6,13 @@ Actual BIOS image repair capability: extract/replace corrupted regions from refe
 
 ## Context
 
-biosMCP can diagnose BIOS health (via `analyzeBiosHealth()` in recovery.ts) and suggest recovery steps, but cannot actually perform repairs. The region infrastructure exists (`extractRegion`, `replaceRegion`, `rebuildImage` in regions.ts), NVRAM parsing exists (nvram.ts), ME parsing exists (me.ts) — but no automated repair orchestration ties these together. Users must manually extract regions, compare, replace, and verify. This deliverable adds actual repair commands.
+biosMCP can diagnose BIOS health (via `analyzeBiosHealth()` in recovery.ts) and suggest recovery steps, but cannot actually perform repairs. The region infrastructure exists (`extractRegion`, `replaceRegion`, `rebuildImage` in regions.ts), NVRAM parsing exists (nvram.ts), ME parsing exists (me.ts)  -  but no automated repair orchestration ties these together. Users must manually extract regions, compare, replace, and verify. This deliverable adds actual repair commands.
 
 ## Test Infrastructure
 
 - **Framework**: Custom self-test harness in `src/self-test.ts`
 - **Runner**: `runTest(name, asyncFn)` returns `{ name, status, detail, durationMs }`
-- **Assertions**: `assert(condition, msg)`, `assertEqual(actual, expected, label)` — throw on failure
+- **Assertions**: `assert(condition, msg)`, `assertEqual(actual, expected, label)`  -  throw on failure
 - **Mock**: MockBackend + Buffer-based image manipulation for testing
 - **Build**: `npx tsc`
 - **Type check**: `npx tsc --noEmit`
@@ -25,7 +25,7 @@ biosMCP can diagnose BIOS health (via `analyzeBiosHealth()` in recovery.ts) and 
 3. `biospy repair broken.bin --nvram-reset` clears NVRAM variable store (write 0xFF to NVRAM region, preserve $VSS header)
 4. All repair operations produce diff report: what regions changed, bytes modified, before/after checksums
 5. Repair output goes to `repaired_<original>.bin` by default, or `--output <path>` for custom path
-6. Never modify input file in-place — always produce new output file
+6. Never modify input file in-place  -  always produce new output file
 7. Reference-based repair: for each Intel FD region, compare checksums; if different, take region from reference
 8. Reset vector repair: if last 16 bytes are zeroed, restore standard x86 far jump (0xEA) pattern from reference or known-good template
 9. NVRAM reset: find $VSS store offset, preserve 28-byte header, fill variable area with 0xFF
@@ -33,15 +33,15 @@ biosMCP can diagnose BIOS health (via `analyzeBiosHealth()` in recovery.ts) and 
 
 ## Design Decisions
 
-1. **New file `src/analysis/repair.ts`** — Repair logic lives alongside existing analysis modules (bios.ts, recovery.ts, regions.ts). Rationale: repairs depend on analysis infrastructure; same module boundary.
+1. **New file `src/analysis/repair.ts`**  -  Repair logic lives alongside existing analysis modules (bios.ts, recovery.ts, regions.ts). Rationale: repairs depend on analysis infrastructure; same module boundary.
 
-2. **Buffer-based API** — All repair functions take Buffer inputs and return Buffer outputs (plus metadata). File I/O handled at CLI layer. Rationale: makes testing easy (create buffers, verify results) and matches existing pattern in regions.ts.
+2. **Buffer-based API**  -  All repair functions take Buffer inputs and return Buffer outputs (plus metadata). File I/O handled at CLI layer. Rationale: makes testing easy (create buffers, verify results) and matches existing pattern in regions.ts.
 
-3. **Non-destructive** — Never modifies input buffers or files. Always returns new Buffer. Rationale: safety-first for a tool that writes to flash chips.
+3. **Non-destructive**  -  Never modifies input buffers or files. Always returns new Buffer. Rationale: safety-first for a tool that writes to flash chips.
 
-4. **Diff report as structured data** — Repair functions return `RepairReport` with regions changed, byte counts, checksums. CLI formats for display. Rationale: testable (assert on structured data), reusable.
+4. **Diff report as structured data**  -  Repair functions return `RepairReport` with regions changed, byte counts, checksums. CLI formats for display. Rationale: testable (assert on structured data), reusable.
 
-5. **NVRAM reset preserves $VSS header** — The 28-byte Variable Store header contains format version and size info needed for UEFI to recognize the store. Erasing it would brick NVRAM entirely. Rationale: matches how UEFI firmware initializes clean NVRAM.
+5. **NVRAM reset preserves $VSS header**  -  The 28-byte Variable Store header contains format version and size info needed for UEFI to recognize the store. Erasing it would brick NVRAM entirely. Rationale: matches how UEFI firmware initializes clean NVRAM.
 
 ## Confidence
 
@@ -71,9 +71,9 @@ biosMCP can diagnose BIOS health (via `analyzeBiosHealth()` in recovery.ts) and 
 - [ ] For non-Intel-FD images (raw), report treats entire image as single region
 
 **Tests to Write**:
-- `generateRepairReport with identical images shows no changes` — same buffer → 0 bytes changed, no region diffs
-- `generateRepairReport with different regions shows correct diffs` — modify one region → report shows that region changed
-- `generateRepairReport with raw image (no Intel FD) shows single region` — non-FD image → one "bios" region
+- `generateRepairReport with identical images shows no changes`  -  same buffer → 0 bytes changed, no region diffs
+- `generateRepairReport with different regions shows correct diffs`  -  modify one region → report shows that region changed
+- `generateRepairReport with raw image (no Intel FD) shows single region`  -  non-FD image → one "bios" region
 
 **Verification**:
 ```bash
@@ -85,7 +85,7 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "generateRepairRepo
 **Files**: `src/analysis/repair.ts` (modify)
 **Test Files**: `src/self-test.ts` (extend)
 
-**Description**: Implement `repairFromReference()` — compares broken image against reference, replaces corrupted regions. Uses `listRegions()` to find Intel FD regions, compares SHA256 per region, replaces any that differ.
+**Description**: Implement `repairFromReference()`  -  compares broken image against reference, replaces corrupted regions. Uses `listRegions()` to find Intel FD regions, compares SHA256 per region, replaces any that differ.
 
 **Acceptance Criteria**:
 - [ ] `repairFromReference(broken: Buffer, reference: Buffer)` returns `{ repaired: Buffer; report: RepairReport }`
@@ -96,10 +96,10 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "generateRepairRepo
 - [ ] Returns detailed report of what was replaced
 
 **Tests to Write**:
-- `repairFromReference fixes corrupted ME region` — corrupt ME bytes → repaired matches reference ME region
-- `repairFromReference preserves identical regions` — corrupt only BIOS region → ME/descriptor/GBE unchanged
-- `repairFromReference handles non-Intel-FD image` — raw image → full replacement with warning
-- `repairFromReference handles size mismatch` — different sizes → warning + repair proceeds
+- `repairFromReference fixes corrupted ME region`  -  corrupt ME bytes → repaired matches reference ME region
+- `repairFromReference preserves identical regions`  -  corrupt only BIOS region → ME/descriptor/GBE unchanged
+- `repairFromReference handles non-Intel-FD image`  -  raw image → full replacement with warning
+- `repairFromReference handles size mismatch`  -  different sizes → warning + repair proceeds
 
 **Verification**:
 ```bash
@@ -111,7 +111,7 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "repairFromReferenc
 **Files**: `src/analysis/repair.ts` (modify)
 **Test Files**: `src/self-test.ts` (extend)
 
-**Description**: Implement `resetNvram()` — finds NVRAM variable store, preserves $VSS header (28 bytes), fills variable area with 0xFF. This clears all UEFI variables (settings, boot order, passwords) while keeping the store structure recognizable by firmware.
+**Description**: Implement `resetNvram()`  -  finds NVRAM variable store, preserves $VSS header (28 bytes), fills variable area with 0xFF. This clears all UEFI variables (settings, boot order, passwords) while keeping the store structure recognizable by firmware.
 
 **Acceptance Criteria**:
 - [ ] `resetNvram(image: Buffer)` returns `{ repaired: Buffer; report: RepairReport; storeOffset: number; storeSize: number }`
@@ -122,9 +122,9 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "repairFromReferenc
 - [ ] Report shows NVRAM region as changed, byte count of cleared area
 
 **Tests to Write**:
-- `resetNvram clears variables but preserves header` — create image with NVRAM → reset → header intact, variables zeroed
-- `resetNvram returns error for image without NVRAM` — blank image → error
-- `resetNvram report shows correct byte count` — verify bytes changed matches NVRAM variable area size
+- `resetNvram clears variables but preserves header`  -  create image with NVRAM → reset → header intact, variables zeroed
+- `resetNvram returns error for image without NVRAM`  -  blank image → error
+- `resetNvram report shows correct byte count`  -  verify bytes changed matches NVRAM variable area size
 
 **Verification**:
 ```bash
@@ -136,10 +136,10 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "resetNvram|FAIL" &
 **Files**: `src/analysis/repair.ts` (modify)
 **Test Files**: `src/self-test.ts` (extend)
 
-**Description**: Implement `repairAuto()` — runs health analysis, auto-fixes detectable issues without reference image. Also implement `repairResetVector()` for zeroed reset vector fix.
+**Description**: Implement `repairAuto()`  -  runs health analysis, auto-fixes detectable issues without reference image. Also implement `repairResetVector()` for zeroed reset vector fix.
 
 **Acceptance Criteria**:
-- [ ] `repairResetVector(image: Buffer)` returns `{ repaired: Buffer; report: RepairReport }` — patches last 16 bytes if zeroed
+- [ ] `repairResetVector(image: Buffer)` returns `{ repaired: Buffer; report: RepairReport }`  -  patches last 16 bytes if zeroed
 - [ ] Reset vector patch writes standard x86 far jump: `EA F0 FF 00 F0` at offset `length-16`
 - [ ] `repairAuto(image: Buffer)` runs `analyzeBiosHealthFromBuffer()`, applies fixes for detected issues
 - [ ] Auto-repair fixes: zeroed reset vector, NVRAM with > 50% deleted variables (resets), blank regions (fills with 0xFF pattern)
@@ -147,10 +147,10 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "resetNvram|FAIL" &
 - [ ] If no issues detected, returns unchanged image with "no repairs needed" report
 
 **Tests to Write**:
-- `repairResetVector fixes zeroed reset vector` — zero last 16 bytes → repair → valid reset vector
-- `repairResetVector leaves valid reset vector unchanged` — already valid → no change
-- `repairAuto fixes zeroed reset vector` — auto-detect and fix
-- `repairAuto with healthy image returns no changes` — healthy image → report says no repairs needed
+- `repairResetVector fixes zeroed reset vector`  -  zero last 16 bytes → repair → valid reset vector
+- `repairResetVector leaves valid reset vector unchanged`  -  already valid → no change
+- `repairAuto fixes zeroed reset vector`  -  auto-detect and fix
+- `repairAuto with healthy image returns no changes`  -  healthy image → report says no repairs needed
 
 **Verification**:
 ```bash
@@ -176,9 +176,9 @@ npm run build && node dist/cli.js --self-test 2>&1 | grep -E "repairResetVector|
 - [ ] Error handling: missing files, unreadable images, no NVRAM found
 
 **Tests to Write**:
-- `cmdRepair reference mode produces repaired file` — dry-run with mock data, verify report output
-- `cmdRepair auto mode with healthy image reports no changes` — auto on healthy mock → "no repairs needed"
-- `cmdRepair nvram-reset mode reports reset` — nvram reset on mock → report shows NVRAM cleared
+- `cmdRepair reference mode produces repaired file`  -  dry-run with mock data, verify report output
+- `cmdRepair auto mode with healthy image reports no changes`  -  auto on healthy mock → "no repairs needed"
+- `cmdRepair nvram-reset mode reports reset`  -  nvram reset on mock → report shows NVRAM cleared
 
 **Verification**:
 ```bash
@@ -200,10 +200,10 @@ npm run build && npx tsc --noEmit && echo "PASS" || echo "FAIL"
 - [ ] All integration tests pass
 
 **Tests to Write**:
-- `full repair pipeline: broken → reference → repaired` — end-to-end with buffer manipulation
-- `full auto-repair pipeline: damaged → auto → fixed` — create damage, verify auto-fix
-- `NVRAM reset round-trip: populate → reset → verify` — full NVRAM lifecycle
-- `dry-run repair produces report but no output` — verify report generated without side effects
+- `full repair pipeline: broken → reference → repaired`  -  end-to-end with buffer manipulation
+- `full auto-repair pipeline: damaged → auto → fixed`  -  create damage, verify auto-fix
+- `NVRAM reset round-trip: populate → reset → verify`  -  full NVRAM lifecycle
+- `dry-run repair produces report but no output`  -  verify report generated without side effects
 
 **Verification**:
 ```bash
@@ -237,4 +237,4 @@ Rationale for skipping reviews: Previous spec's 3 reviewers all hallucinated con
 
 ## Open Questions
 
-None — all resolved from codebase analysis.
+None  -  all resolved from codebase analysis.

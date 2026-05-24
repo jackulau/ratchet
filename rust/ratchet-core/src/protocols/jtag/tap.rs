@@ -3,7 +3,7 @@
 // 16-state TAP state machine; transitions selected by TMS on each TCK rising
 // edge. Backend-agnostic: drives a `JtagTransport` trait that pumps TMS/TDI
 // transitions and returns TDO samples. The CH341A UIO and CH347 backends
-// both satisfy the trait — CH341A via raw bit-bang packets, CH347 via the
+// both satisfy the trait  -  CH341A via raw bit-bang packets, CH347 via the
 // native JTAG-bit-bang command (0xD1) exposed in `hw::ch347_raw`.
 
 use crate::backends::Result;
@@ -106,7 +106,7 @@ pub fn tms_path(from: TapState, to: TapState) -> Vec<bool> {
 pub trait JtagTransport {
     fn pulse(&mut self, tms: bool, tdi: bool) -> Result<bool>;
 
-    /// Default batch impl in terms of `pulse` — backends can override for
+    /// Default batch impl in terms of `pulse`  -  backends can override for
     /// efficiency. Returns sampled TDO per cycle.
     fn pulses(&mut self, ops: &[(bool, bool)]) -> Result<Vec<bool>> {
         let mut out = Vec::with_capacity(ops.len());

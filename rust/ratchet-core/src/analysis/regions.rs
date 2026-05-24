@@ -103,7 +103,7 @@ pub fn replace_region(
     let rep_data: Vec<u8> = if replacement.len() != region_size {
         if replacement.len() < region_size {
             warnings.push(format!(
-                "Replacement ({} bytes) smaller than region ({} bytes) — padding with 0xFF",
+                "Replacement ({} bytes) smaller than region ({} bytes)  -  padding with 0xFF",
                 replacement.len(),
                 region_size
             ));
@@ -112,7 +112,7 @@ pub fn replace_region(
             v
         } else {
             warnings.push(format!(
-                "Replacement ({} bytes) larger than region ({} bytes) — truncating",
+                "Replacement ({} bytes) larger than region ({} bytes)  -  truncating",
                 replacement.len(),
                 region_size
             ));
@@ -143,7 +143,7 @@ pub fn rebuild_image(base: &[u8], replacements: &[(String, Vec<u8>)]) -> (Vec<u8
                 result = r.data;
                 warnings.extend(r.warnings);
             }
-            None => warnings.push(format!("Region \"{name}\" not found in image — skipped")),
+            None => warnings.push(format!("Region \"{name}\" not found in image  -  skipped")),
         }
     }
     (result, warnings)
@@ -158,7 +158,7 @@ mod tests {
         let mut v = vec![0u8; 4 * 1024 * 1024];
         v[0x10..0x14].copy_from_slice(&INTEL_FD_SIG.to_le_bytes());
         v[0x28..0x2c].copy_from_slice(&0x0004_0000u32.to_le_bytes());
-        // region 0 (descriptor): base=0, limit=0 — fixture keeps `a | (b << 16)` shape for parity with other regions
+        // region 0 (descriptor): base=0, limit=0  -  fixture keeps `a | (b << 16)` shape for parity with other regions
         let desc_reg: u32 = 0 | (0 << 16);
         v[0x40..0x44].copy_from_slice(&desc_reg.to_le_bytes());
         // region 1 (bios): base=0x100000, limit=0x1fffff
@@ -230,7 +230,7 @@ mod tests {
         let r = replace_region(&v, "bios", &rep).unwrap();
         assert!(r.warnings.iter().any(|w| w.contains("truncating")));
         assert_eq!(r.data[0x100000], 0x42);
-        // Just past end of BIOS region — should be untouched from base image (0x00).
+        // Just past end of BIOS region  -  should be untouched from base image (0x00).
         assert_eq!(r.data[0x100000 + 0x100000], 0x00);
     }
 

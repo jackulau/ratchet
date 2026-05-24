@@ -316,7 +316,7 @@ mod tests {
         let fv_len: usize = 1024;
         let header_len: usize = 0x48;
         let mut v = vec![0u8; fv_len];
-        // FileSystemGuid at offset 0 — anything works for tests.
+        // FileSystemGuid at offset 0  -  anything works for tests.
         v[8..16].copy_from_slice(&[0x55u8; 8]);
         // FvLength at offset 32 (u64 LE)
         v[32..40].copy_from_slice(&(fv_len as u64).to_le_bytes());

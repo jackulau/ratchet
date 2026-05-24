@@ -5,7 +5,7 @@
 // low to enter programming mode, sends a magic sequence, then issues
 // 4-byte SPI commands per AVR040/AVR910 application notes.
 //
-// This module is transport-agnostic — it talks to an `AvrIspTransport`
+// This module is transport-agnostic  -  it talks to an `AvrIspTransport`
 // trait that exposes RESET control + 4-byte SPI transactions. CH341A
 // satisfies the trait via UIO pin manipulation; CH347 via its native SPI
 // interface with a manual RESET pin.
@@ -280,7 +280,7 @@ pub struct AvrMockTransport {
     pub in_programming: bool,
     pub reset_high: bool,
     // Page-write scratch buffer (load-program-memory-page commands fill this before commit_page).
-    // Read by the page commit logic only — never observed externally, hence dead_code.
+    // Read by the page commit logic only  -  never observed externally, hence dead_code.
     #[allow(dead_code)]
     page_buf: std::collections::HashMap<u16, u8>,
     pub xfers: Vec<[u8; 4]>,

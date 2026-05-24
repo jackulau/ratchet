@@ -1,4 +1,4 @@
-// SPI bus sniffer state machine — generates events from polled JEDEC IDs.
+// SPI bus sniffer state machine  -  generates events from polled JEDEC IDs.
 // The TTY loop driving this state lives in the CLI binary (D18).
 // Ports src/repl/sniffer.ts.
 

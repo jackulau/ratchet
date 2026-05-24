@@ -1,5 +1,5 @@
 // Custom libusb FFI bindings. Built at compile time by bindgen against system libusb.h.
-// No third-party `rusb` or `nusb` crate — we own the binding layer.
+// No third-party `rusb` or `nusb` crate  -  we own the binding layer.
 
 use std::env;
 use std::path::PathBuf;

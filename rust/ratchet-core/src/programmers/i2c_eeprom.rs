@@ -3,16 +3,16 @@
 // All 24Cxx parts use I2C address 0x50..0x57 (3 lower bits = A0/A1/A2 strap),
 // with a 1- or 2-byte internal-cursor address depending on capacity:
 //
-//   24C01..24C16  — 1-byte addressing (8-bit cursor)
-//   24C32..24C1024 — 2-byte addressing (16-bit cursor)
+//   24C01..24C16   -  1-byte addressing (8-bit cursor)
+//   24C32..24C1024  -  2-byte addressing (16-bit cursor)
 //
 // Larger parts (>16 kbit) use the I2C address LSBs as high-order cursor bits
 // to extend the address space. Page-write granularity varies by family:
 //
-//   24C01..24C16   — 8-byte page
-//   24C32/64       — 32-byte page
-//   24C128/256/512 — 64-byte page
-//   24C1024        — 128-byte page
+//   24C01..24C16    -  8-byte page
+//   24C32/64        -  32-byte page
+//   24C128/256/512  -  64-byte page
+//   24C1024         -  128-byte page
 //
 // Write completion is signalled by the next probe-ACK (ACK polling) per
 // AN-558. Standard timing: 5 ms internal write cycle.
@@ -136,7 +136,7 @@ impl<'m, M: I2cMaster> I2cEeprom<'m, M> {
         let page = self.size.page_size();
         let mut cursor = offset;
         for chunk in data.chunks(page) {
-            // Honor page boundary — chunks must not cross a page.
+            // Honor page boundary  -  chunks must not cross a page.
             let to_page_end = page - (cursor as usize % page);
             let actual_len = chunk.len().min(to_page_end);
             let mut payload = self.encode_address(cursor);
@@ -175,7 +175,7 @@ impl<'m, M: I2cMaster> I2cEeprom<'m, M> {
         if !scan.contains(&address) {
             return Ok(None);
         }
-        // We can't easily distinguish sizes without writing — return a
+        // We can't easily distinguish sizes without writing  -  return a
         // conservative default. Caller should disambiguate by markings on chip.
         Ok(Some(EepromSize::Kbit256))
     }
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn page_boundary_split() {
-        // Write across page boundary — page=8, write 6 bytes at offset 5.
+        // Write across page boundary  -  page=8, write 6 bytes at offset 5.
         let mut emu = EmuMaster::new(256, 1, 0x50);
         let mut eeprom = I2cEeprom::new(&mut emu, 0x50, EepromSize::Kbit2);
         eeprom.write(5, b"ABCDEF").unwrap();

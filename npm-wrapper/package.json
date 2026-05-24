@@ -1,7 +1,7 @@
 {
   "name": "biospy",
   "version": "2.0.0-alpha.1",
-  "description": "Modern BIOS chip programmer and debugger (CH341A / CH347) — npm wrapper that downloads the native Rust binary at install time",
+  "description": "Modern BIOS chip programmer and debugger (CH341A / CH347)  -  npm wrapper that downloads the native Rust binary at install time",
   "license": "MIT",
   "repository": "github:jacklau/biosMCP",
   "bin": {

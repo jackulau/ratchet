@@ -8,7 +8,7 @@ Remove the flashrom backend entirely from biospy. Make native CH341A/CH347 the o
 
 ## Context
 
-biospy v0.5.0 has three backends: CH341A (native USB), CH347 (native USB), and flashrom (external CLI wrapper). The flashrom backend is a fallback that shells out to the `flashrom` binary. The native backends are superior — direct USB control, progress reporting, SFDP support, region erase, write protection management. flashrom adds complexity without value. Removing it simplifies the codebase, eliminates an external dependency, and makes error messages clearer.
+biospy v0.5.0 has three backends: CH341A (native USB), CH347 (native USB), and flashrom (external CLI wrapper). The flashrom backend is a fallback that shells out to the `flashrom` binary. The native backends are superior  -  direct USB control, progress reporting, SFDP support, region erase, write protection management. flashrom adds complexity without value. Removing it simplifies the codebase, eliminates an external dependency, and makes error messages clearer.
 
 ## Test Infrastructure
 
@@ -24,14 +24,14 @@ biospy v0.5.0 has three backends: CH341A (native USB), CH347 (native USB), and f
 2. Remove all flashrom imports, instantiation, and references from `src/cli.ts`
 3. Remove `"flashrom"` from `BackendType` union in `src/types.ts`
 4. Update `BackendKind` type in `src/cli.ts` to `"ch341a" | "ch347"` only
-5. Remove flashrom fallback from `pickBackend()` — when no programmer found, throw clear error with troubleshooting steps
-6. Remove flashrom fallback from `identifyAny()` — only try CH341A and CH347
+5. Remove flashrom fallback from `pickBackend()`  -  when no programmer found, throw clear error with troubleshooting steps
+6. Remove flashrom fallback from `identifyAny()`  -  only try CH341A and CH347
 7. Remove flashrom branches from all command handlers (read, write, erase, blank-check, verify)
 8. Remove flashrom section from `cmdStatus()` and `cmdSetup()`
-9. Update help text — remove flashrom from `-b` options, `-p` option, and backends section
+9. Update help text  -  remove flashrom from `-b` options, `-p` option, and backends section
 10. Remove `-p, --programmer` flag entirely (only used for flashrom programmer type)
 11. Update version to 0.6.0
-12. Update README.md — remove flashrom references
+12. Update README.md  -  remove flashrom references
 13. When no programmer detected, show actionable error: check USB connection, verify driver, check SOIC clip seating
 
 ## Design Decisions
@@ -75,7 +75,7 @@ test ! -f src/backends/flashrom.ts && echo "PASS" || echo "FAIL"
 
 ---
 
-### Task 2: Update types.ts — remove flashrom from BackendType
+### Task 2: Update types.ts  -  remove flashrom from BackendType
 
 **Files**: `src/types.ts`
 **Description**: Change `BackendType` from `"native" | "flashrom"` to just `"native"`. Also remove the `backend?: BackendType` field from `ProgrammerInfo` since it's now always native, or keep it as `"native"` only.
@@ -91,7 +91,7 @@ test ! -f src/backends/flashrom.ts && echo "PASS" || echo "FAIL"
 
 ---
 
-### Task 3: Clean cli.ts — remove flashrom import, instance, and BackendKind
+### Task 3: Clean cli.ts  -  remove flashrom import, instance, and BackendKind
 
 **Files**: `src/cli.ts`
 **Description**:
@@ -111,19 +111,19 @@ test ! -f src/backends/flashrom.ts && echo "PASS" || echo "FAIL"
 
 ---
 
-### Task 4: Update pickBackend() — remove flashrom, improve no-programmer error
+### Task 4: Update pickBackend()  -  remove flashrom, improve no-programmer error
 
 **Files**: `src/cli.ts`
 **Description**:
 - Remove `if (force === "flashrom")` branch (lines 34-36)
 - Remove flashrom auto-detect fallback (lines 58-62)
-- Add explicit validation for unknown backend names — if `force` is set but not `"ch341a"` or `"ch347"`, throw error: `Unknown backend: "${force}". Supported: ch341a, ch347`
+- Add explicit validation for unknown backend names  -  if `force` is set but not `"ch341a"` or `"ch347"`, throw error: `Unknown backend: "${force}". Supported: ch341a, ch347`
 - When no programmer found (all detection fails), throw descriptive error with troubleshooting:
   ```
   No CH341A or CH347 programmer detected.
 
   Troubleshooting:
-    1. Check USB connection — unplug and reconnect the programmer
+    1. Check USB connection  -  unplug and reconnect the programmer
     2. Verify the programmer is powered (LED should be on)
     3. Try a different USB port (avoid hubs)
     4. Check driver installation:
@@ -147,7 +147,7 @@ test ! -f src/backends/flashrom.ts && echo "PASS" || echo "FAIL"
 
 ---
 
-### Task 5: Update identifyAny() — remove flashrom fallback
+### Task 5: Update identifyAny()  -  remove flashrom fallback
 
 **Files**: `src/cli.ts`
 **Description**:
@@ -166,7 +166,7 @@ test ! -f src/backends/flashrom.ts && echo "PASS" || echo "FAIL"
 
 ---
 
-### Task 6: Update command handlers — remove flashrom branches
+### Task 6: Update command handlers  -  remove flashrom branches
 
 **Files**: `src/cli.ts`
 **Description**: Remove the `else` (flashrom) branches from these command handlers:
@@ -176,7 +176,7 @@ test ! -f src/backends/flashrom.ts && echo "PASS" || echo "FAIL"
 - `cmdErase()`: Remove `else result = await flashrom.eraseChip(...)` (line 548)
 - `cmdBlankCheck()`: Remove `else { flashrom.readChip(...) }` branch (lines 462-463)
 - `cmdVerify()`: Remove `else result = await flashrom.verifyChip(...)` (line 620)
-- `cmdRegionErase()`: Remove the `if (backend.kind === "flashrom")` error check (lines 585-588) — this is now impossible since pickBackend can't return flashrom
+- `cmdRegionErase()`: Remove the `if (backend.kind === "flashrom")` error check (lines 585-588)  -  this is now impossible since pickBackend can't return flashrom
 
 For each, the pattern changes from:
 ```typescript
@@ -202,10 +202,10 @@ else { /* ch347 */ }
 
 ---
 
-### Task 7: Update cmdSetup() — remove flashrom check
+### Task 7: Update cmdSetup()  -  remove flashrom check
 
 **Files**: `src/cli.ts`
-**Description**: Remove the flashrom detection block from setup/doctor (lines 970-978). No replacement needed — setup should only check CH341A, CH347, serialport, and chip database.
+**Description**: Remove the flashrom detection block from setup/doctor (lines 970-978). No replacement needed  -  setup should only check CH341A, CH347, serialport, and chip database.
 
 **Acceptance Criteria**:
 - Setup command doesn't check for or mention flashrom
@@ -268,7 +268,7 @@ grep -q '"0.6.0"' package.json && grep -q '0.6.0' src/cli.ts && echo "PASS" || e
 - Remove `-p, --programmer` from options
 - Update `-b, --backend` to show only `native | ch341a | ch347`
 - Remove `flashrom (optional, for fallback backend)` from requirements
-- Add note that v0.6.0 is fully native — no external tools required
+- Add note that v0.6.0 is fully native  -  no external tools required
 
 **Acceptance Criteria**:
 - No flashrom references in README
@@ -350,15 +350,15 @@ Key feedback applied: explicit validation for unknown backend names (prevents si
 
 ## Open Questions
 
-None — all questions self-resolved from codebase analysis.
+None  -  all questions self-resolved from codebase analysis.
 
 ## Self-Resolution Log
 
 | Question | Resolution | Confidence | Source |
 |----------|-----------|------------|--------|
 | What files reference flashrom? | 4 source files + README | HIGH | grep -r flashrom src/ |
-| Does removing flashrom lose functionality? | No — native backends cover all operations + more | HIGH | Method comparison across backends |
+| Does removing flashrom lose functionality? | No  -  native backends cover all operations + more | HIGH | Method comparison across backends |
 | What should BackendType become? | Just "native" | HIGH | types.ts:1 |
-| Is -p flag used for anything else? | No — only feeds flashrom programmer type | HIGH | cli.ts:1016, parseArgs() |
-| Should we add a Backend interface? | Out of scope — separate refactor | MEDIUM | Architecture analysis |
+| Is -p flag used for anything else? | No  -  only feeds flashrom programmer type | HIGH | cli.ts:1016, parseArgs() |
+| Should we add a Backend interface? | Out of scope  -  separate refactor | MEDIUM | Architecture analysis |
 | What error message for no programmer? | Structured troubleshooting checklist | HIGH | Best practice for hardware tools |

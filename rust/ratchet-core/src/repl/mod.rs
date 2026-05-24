@@ -1,5 +1,5 @@
 // REPL state machines + macros + sniffer/watch event generators.
-// Hardware-free — actual TTY loop (rustyline) lives in the CLI binary (D18).
+// Hardware-free  -  actual TTY loop (rustyline) lives in the CLI binary (D18).
 // Pure logic here lets us unit-test the behavior without a real serial port.
 
 pub mod macros;
@@ -9,7 +9,7 @@ pub mod watch;
 
 use serde::{Deserialize, Serialize};
 
-/// Parsed REPL command — the CLI binary translates user lines into these.
+/// Parsed REPL command  -  the CLI binary translates user lines into these.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReplCommand {
     Help,

@@ -68,18 +68,18 @@ pub fn search(query: &str) -> Vec<&'static PostCode> {
 }
 
 const PHASE_DESCRIPTIONS: &[(&str, &str)] = &[
-    ("SEC", "Security Phase — first code executed from flash. CPU cache-as-RAM mode, no main memory yet."),
-    ("PEI", "Pre-EFI Initialization — memory training, chipset config. Board is waking up but has no display."),
-    ("MEM_INIT", "Memory Initialization — DRAM detection, timing configuration, and testing."),
-    ("DXE", "Driver Execution Environment — PCI enumeration, device drivers, console output, ACPI."),
-    ("BDS", "Boot Device Selection — finding and loading the OS boot loader."),
-    ("BOOT", "Boot Phase — OS hand-off, option ROMs, boot device preparation."),
-    ("EARLY", "Early initialization — CPU and chipset basic setup before memory."),
-    ("INIT", "System initialization — testing core hardware components."),
-    ("MEM", "Memory testing — RAM detection, sizing, and pattern verification."),
-    ("PCI", "PCI initialization — bus enumeration and device setup."),
-    ("DEVICE", "Device initialization — storage, keyboard, USB, and peripheral setup."),
-    ("ERROR", "Error condition — something failed. Check causes."),
+    ("SEC", "Security Phase  -  first code executed from flash. CPU cache-as-RAM mode, no main memory yet."),
+    ("PEI", "Pre-EFI Initialization  -  memory training, chipset config. Board is waking up but has no display."),
+    ("MEM_INIT", "Memory Initialization  -  DRAM detection, timing configuration, and testing."),
+    ("DXE", "Driver Execution Environment  -  PCI enumeration, device drivers, console output, ACPI."),
+    ("BDS", "Boot Device Selection  -  finding and loading the OS boot loader."),
+    ("BOOT", "Boot Phase  -  OS hand-off, option ROMs, boot device preparation."),
+    ("EARLY", "Early initialization  -  CPU and chipset basic setup before memory."),
+    ("INIT", "System initialization  -  testing core hardware components."),
+    ("MEM", "Memory testing  -  RAM detection, sizing, and pattern verification."),
+    ("PCI", "PCI initialization  -  bus enumeration and device setup."),
+    ("DEVICE", "Device initialization  -  storage, keyboard, USB, and peripheral setup."),
+    ("ERROR", "Error condition  -  something failed. Check causes."),
 ];
 
 pub fn get_phase_description(phase: &str) -> String {

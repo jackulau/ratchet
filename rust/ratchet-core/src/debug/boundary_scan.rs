@@ -1,4 +1,4 @@
-// JTAG boundary-scan (IEEE 1149.1) — minimal BSDL parser + EXTEST driver.
+// JTAG boundary-scan (IEEE 1149.1)  -  minimal BSDL parser + EXTEST driver.
 //
 // BSDL is a VHDL-derived language for describing JTAG-testable devices.
 // The full grammar is large; this module implements a useful subset:
@@ -8,7 +8,7 @@
 //   * `attribute BOUNDARY_REGISTER` (cell records: num, type, port, direction)
 //
 // Once parsed, the driver loads SAMPLE/PRELOAD to capture pin state, then
-// EXTEST to drive selected output cells while sampling inputs — useful for
+// EXTEST to drive selected output cells while sampling inputs  -  useful for
 // solder-joint and trace continuity testing.
 
 use crate::backends::{BackendError, Result};

@@ -1,6 +1,6 @@
 // Backup + repair pipeline orchestrator.
 // PipelineBackend abstracts the hardware so tests inject a stub backend.
-// Sync (blocking) — Rust doesn't need Node-style async for file/USB IO.
+// Sync (blocking)  -  Rust doesn't need Node-style async for file/USB IO.
 
 use crate::analysis::recovery::{analyze_bios_health_from_buffer, BiosHealthReport, CheckStatus};
 use crate::analysis::repair::{repair_auto, repair_from_reference, RepairReport};
@@ -172,7 +172,7 @@ pub struct PipelineResult {
     pub total_duration_ms: u64,
 }
 
-/// Step kinds — implemented inline by the pipeline runner.
+/// Step kinds  -  implemented inline by the pipeline runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
     Quality,
@@ -330,7 +330,7 @@ fn execute_step(step: &Step, ctx: &mut PipelineContext) -> Result<String, String
             };
             ctx.health_report = Some(h);
             Ok(format!(
-                "Health: {p} pass, {w} warn, {f} fail — {status_label}"
+                "Health: {p} pass, {w} warn, {f} fail  -  {status_label}"
             ))
         }
         StepKind::Repair => {
@@ -352,7 +352,7 @@ fn execute_step(step: &Step, ctx: &mut PipelineContext) -> Result<String, String
             ctx.repaired_data = Some(repaired);
             ctx.repair_report = Some(report);
             if !ctx.repairs_needed {
-                Ok("No repairs needed — image is healthy".to_string())
+                Ok("No repairs needed  -  image is healthy".to_string())
             } else {
                 Ok(format!(
                     "Repaired: {bytes} bytes changed, {action_count} actions"
@@ -364,7 +364,7 @@ fn execute_step(step: &Step, ctx: &mut PipelineContext) -> Result<String, String
                 return Ok(if ctx.skip_write {
                     "Write skipped (--skip-write)".to_string()
                 } else {
-                    "No repairs needed — write skipped".to_string()
+                    "No repairs needed  -  write skipped".to_string()
                 });
             }
             let data = ctx
@@ -387,7 +387,7 @@ fn execute_step(step: &Step, ctx: &mut PipelineContext) -> Result<String, String
         }
         StepKind::PostVerify => {
             if !ctx.repairs_needed || ctx.skip_write {
-                return Ok("Verify skipped — no write performed".to_string());
+                return Ok("Verify skipped  -  no write performed".to_string());
             }
             let data = ctx
                 .repaired_data
@@ -397,11 +397,11 @@ fn execute_step(step: &Step, ctx: &mut PipelineContext) -> Result<String, String
             ctx.write_verified = v.matches;
             if !v.matches {
                 return Err(
-                    "Post-write verification FAILED — chip content does not match repaired image"
+                    "Post-write verification FAILED  -  chip content does not match repaired image"
                         .to_string(),
                 );
             }
-            Ok("Verification passed — chip matches repaired image".to_string())
+            Ok("Verification passed  -  chip matches repaired image".to_string())
         }
         StepKind::FinalHealth => {
             let img = if ctx.repairs_needed && !ctx.skip_write {
