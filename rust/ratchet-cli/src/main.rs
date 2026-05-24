@@ -2,15 +2,15 @@
 // honour RATCHET_FORCE_MOCK=1 by routing through the mock backend in
 // ratchet-core. Live USB I/O is wired up incrementally as backends mature.
 
-use ratchet_core::agent::envelope::AgentEnvelope;
 use clap::{Parser, Subcommand};
+use ratchet_core::agent::envelope::AgentEnvelope;
 use serde_json::json;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "ratchet",
     version,
-    about = "Modern BIOS chip programmer and debugger (CH341A / CH347) — fully native Rust"
+    about = "ratchet — multi-protocol hardware debug + programming toolkit (CH341A / CH347): SPI flash, I2C, UART, 1-Wire, JTAG, SWD, CAN, AVR / STM32 / ESP programmers, logic analyzer. Fully native Rust."
 )]
 struct Cli {
     #[command(subcommand)]
