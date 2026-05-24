@@ -1,0 +1,13 @@
+[package]
+name = "ratchet-usb"
+description = "Safe Rust wrapper over ratchet-usb-sys. RAII handles, typed errors, blocking I/O surface used by ratchet backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ratchet-usb-sys = { workspace = true }
+thiserror       = { workspace = true }

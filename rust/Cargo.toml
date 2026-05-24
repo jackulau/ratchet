@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "biospy-usb-sys",
-    "biospy-usb",
-    "biospy-core",
-    "biospy-cli",
-    "biospy-mcp",
-    "biospy-node",
+    "ratchet-usb-sys",
+    "ratchet-usb",
+    "ratchet-core",
+    "ratchet-cli",
+    "ratchet-mcp",
+    "ratchet-node",
 ]
 
 [workspace.package]
@@ -14,14 +14,14 @@ version = "2.0.0-alpha.1"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
-authors = ["biospy contributors"]
-repository = "https://github.com/jacklau/biosMCP"
-description = "Modern BIOS chip programmer and debugger for CH341A / CH347 USB programmers — fully native Rust"
+authors = ["ratchet contributors"]
+repository = "https://github.com/jackulau/ratchet"
+description = "ratchet — multi-protocol hardware debug + programming toolkit (CH341A / CH347 USB programmers, SPI / I2C / UART / 1-Wire / JTAG / SWD / CAN, AVR / STM32 / ESP programmers). Fully native Rust."
 
 [workspace.dependencies]
-biospy-usb-sys = { path = "biospy-usb-sys", version = "2.0.0-alpha.1" }
-biospy-usb     = { path = "biospy-usb",     version = "2.0.0-alpha.1" }
-biospy-core    = { path = "biospy-core",    version = "2.0.0-alpha.1" }
+ratchet-usb-sys = { path = "ratchet-usb-sys", version = "2.0.0-alpha.1" }
+ratchet-usb     = { path = "ratchet-usb",     version = "2.0.0-alpha.1" }
+ratchet-core    = { path = "ratchet-core",    version = "2.0.0-alpha.1" }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"

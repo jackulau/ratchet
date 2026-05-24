@@ -1,0 +1,21 @@
+[package]
+name = "ratchet-node"
+description = "napi-rs bridge — exposes ratchet-core as a Node native addon for Node consumers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ratchet-core = { workspace = true }
+napi         = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive  = "2"
+serde_json   = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"

@@ -1,0 +1,21 @@
+[package]
+name = "ratchet-core"
+description = "Chip database, backends, BIOS + hardware analysis, workflows. Hardware-agnostic core of ratchet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Expose mock transports/backends outside of test builds (useful for integration tests in downstream crates).
+mock = []
+
+[dependencies]
+ratchet-usb = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+sha2        = "0.10"
