@@ -192,6 +192,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)] // helper for upcoming mem_read tests
     fn queue_mem_read(t: &mut SwdMockTransport, value: u32) {
         // mem_read32 = SELECT (maybe) + CSW write + TAR write + DRW read.
         for _ in 0..3 {
@@ -248,7 +249,7 @@ mod tests {
 
     #[test]
     fn fp_comp_address_calculation() {
-        assert_eq!(FP_COMP_BASE + 0, 0xE0002008);
+        assert_eq!(FP_COMP_BASE, 0xE0002008);
         assert_eq!(FP_COMP_BASE + 4 * 7, 0xE0002024);
     }
 
@@ -268,7 +269,7 @@ mod tests {
             .write_log
             .iter()
             .filter(|(_, n)| *n == 32)
-            .last()
+            .next_back()
             .unwrap()
             .0 as u32;
         assert_eq!(last_drw, expected);

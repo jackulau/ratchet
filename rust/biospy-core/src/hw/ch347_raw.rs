@@ -113,7 +113,7 @@ pub fn build_i2c_read(addr7: u8, count: u8) -> Vec<u8> {
     assert!(count < 0x10, "max 15 bytes per CH347 I2C read packet");
     let payload = vec![
         I2C_SET_START,
-        I2C_WRITE_BASE | 0x00, // 1 byte = address
+        I2C_WRITE_BASE, // 1 byte = address
         ((addr7 & 0x7F) << 1) | 0x01,
         I2C_READ_BASE | count,
         I2C_SET_STOP,
@@ -131,7 +131,7 @@ pub fn build_i2c_write_then_read(addr7: u8, reg: &[u8], read_count: u8) -> Vec<u
     payload.extend_from_slice(reg);
     payload.extend_from_slice(&[
         I2C_SET_START, // repeated start
-        I2C_WRITE_BASE | 0x00,
+        I2C_WRITE_BASE,
         ((addr7 & 0x7F) << 1) | 0x01,
         I2C_READ_BASE | read_count,
         I2C_SET_STOP,

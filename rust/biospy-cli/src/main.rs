@@ -581,7 +581,7 @@ fn main() -> anyhow::Result<()> {
 
 fn hw_stub(verb: &str, action: &str, json: bool) -> anyhow::Result<()> {
     let env = AgentEnvelope::<serde_json::Value>::ok(
-        &format!("{verb} {action}"),
+        format!("{verb} {action}"),
         json!({
             "stub": true,
             "note": "hardware capability registered; live-hardware wiring follows in subsequent goals",
@@ -981,8 +981,8 @@ fn cmd_region_erase(start: &str, length: &str, json: bool) -> anyhow::Result<()>
 }
 
 fn cmd_blank_check(json: bool) -> anyhow::Result<()> {
-    use biospy_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    use biospy_core::backends::mock::MockBackend;
+    let m = MockBackend::default();
     let blank = m.flash_bytes().iter().all(|b| *b == 0xff);
     let env = AgentEnvelope::ok("blank-check", json!({"blank": blank}));
     emit_envelope(&env, json, || println!("blank={blank}"))

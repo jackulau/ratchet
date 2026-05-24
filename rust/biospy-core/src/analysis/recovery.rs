@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn healthy_image_gets_verify_recovery_step() {
-        let mut v = vec![0x55u8; 1 * 1024 * 1024];
+        let mut v = vec![0x55u8; 1024 * 1024];
         {
             let n = v.len() - 1;
             v[n] = 0xea;

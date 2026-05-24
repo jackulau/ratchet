@@ -319,7 +319,7 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
     fn read_sfdp(&mut self) -> Result<Option<SfdpInfo>> {
         let mut cmd = vec![SPI_SFDP, 0, 0, 0, 0];
         // 8 bytes header
-        cmd.extend(std::iter::repeat(0).take(8));
+        cmd.extend(std::iter::repeat_n(0, 8));
         let rx = self.spi_command(&cmd)?;
         // First 5 bytes are cmd + 3 addr + dummy. Header bytes start at 5.
         if rx.len() < 5 + 8 {
@@ -356,7 +356,7 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
             let n = chunk_size.min(size - addr as usize);
             let mut cmd = vec![SPI_READ];
             cmd.extend(address_bytes(addr, self.use_4byte_addr));
-            cmd.extend(std::iter::repeat(0u8).take(n));
+            cmd.extend(std::iter::repeat_n(0u8, n));
             let rx = self.spi_command(&cmd)?;
             let data_start = 1 + if self.use_4byte_addr { 4 } else { 3 };
             buf.extend_from_slice(&rx[data_start..data_start + n]);

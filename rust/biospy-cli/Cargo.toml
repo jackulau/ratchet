@@ -12,11 +12,6 @@ repository.workspace = true
 name = "biospy"
 path = "src/main.rs"
 
-# Alias bin so `target/release/biospy-cli` resolves (D22 verify scripts use this name).
-[[bin]]
-name = "biospy-cli"
-path = "src/main.rs"
-
 [dependencies]
 biospy-core = { workspace = true }
 clap        = { workspace = true }

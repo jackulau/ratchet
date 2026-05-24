@@ -15,7 +15,7 @@
 //
 // Reference: Atmel AT93C46 / AT93C66 datasheets.
 
-use crate::backends::{BackendError, Result};
+use crate::backends::Result;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MicrowirePart {

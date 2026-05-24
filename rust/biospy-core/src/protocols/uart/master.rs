@@ -117,9 +117,7 @@ pub fn encode_frame(byte: u8, cfg: UartConfig) -> Vec<bool> {
         StopBits::OnePointFive => 1,
         StopBits::Two => 2,
     };
-    for _ in 0..stop_count {
-        bits.push(true);
-    }
+    bits.resize(bits.len() + stop_count, true);
     bits
 }
 
@@ -165,6 +163,8 @@ impl<'b, B: UsbBus> Ch341aUart<'b, B> {
 // ─── CH347 native implementation ───────────────────────────────────────────
 
 pub struct Ch347Uart<'t, T: Ch347Transport> {
+    // Held to bind transport lifetime; real RX/TX path goes through `Ch347Raw` once hw lands.
+    #[allow(dead_code)]
     raw: Ch347Raw<'t, T>,
     pub cfg: UartConfig,
 }
@@ -248,8 +248,8 @@ mod tests {
         let bits = encode_frame(0x55, cfg);
         // start + 8 data + 1 parity + 1 stop = 11.
         assert_eq!(bits.len(), 11);
-        assert_eq!(bits[9], false); // parity bit
-        assert_eq!(bits[10], true); // stop bit
+        assert!(!bits[9]); // parity bit
+        assert!(bits[10]); // stop bit
     }
 
     #[test]
@@ -259,8 +259,8 @@ mod tests {
         let bits = encode_frame(0x00, cfg);
         // start + 8 data + 2 stop = 11.
         assert_eq!(bits.len(), 11);
-        assert_eq!(bits[9], true);
-        assert_eq!(bits[10], true);
+        assert!(bits[9]);
+        assert!(bits[10]);
     }
 
     #[test]

@@ -77,10 +77,9 @@ pub fn scan_idcode_chain<T: JtagTransport>(
     // We need raw shift without auto-exit; tap.shift_dr exits on last bit.
     // Implement directly: shift bits-1 with TMS=0, last with TMS=1.
     let mut tdo = Vec::with_capacity(bit_count);
-    for i in 0..bit_count {
+    for (i, &bit) in bits.iter().enumerate() {
         let last = i + 1 == bit_count;
-        let tms = last;
-        let sample = transport.pulse(tms, bits[i])?;
+        let sample = transport.pulse(last, bit)?;
         tdo.push(sample);
     }
 

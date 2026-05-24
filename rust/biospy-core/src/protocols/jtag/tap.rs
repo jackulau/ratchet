@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn shift_ir_clocks_data_then_exits() {
         let mut t = JtagMockTransport::new();
-        t.queue_tdo(&vec![false; 50]);
+        t.queue_tdo(&[false; 50]);
         let pulses_before;
         let last4: Vec<(bool, bool)>;
         let total_after;
@@ -297,10 +297,10 @@ mod tests {
             total_after = tap.transport.pulses.len();
             last4 = tap.transport.pulses[total_after - 4..].to_vec();
         }
-        assert_eq!(last4[0].1, true);
-        assert_eq!(last4[1].1, false);
-        assert_eq!(last4[2].1, true);
-        assert_eq!(last4[3].1, true);
+        assert!(last4[0].1);
+        assert!(!last4[1].1);
+        assert!(last4[2].1);
+        assert!(last4[3].1);
         assert!(last4.last().unwrap().0);
         assert!(total_after > pulses_before);
     }

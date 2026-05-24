@@ -187,7 +187,7 @@ pub fn synth_write(addr7: u8, data: &[u8]) -> Vec<LineSample> {
     let mut out = Vec::new();
     let mut t = 0u64;
 
-    let mut sample = |t: u64, scl, sda, out: &mut Vec<LineSample>| {
+    let sample = |t: u64, scl, sda, out: &mut Vec<LineSample>| {
         out.push(LineSample { t_us: t, scl, sda });
     };
 
@@ -201,7 +201,7 @@ pub fn synth_write(addr7: u8, data: &[u8]) -> Vec<LineSample> {
     sample(t, false, false, &mut out);
     t += 1;
 
-    let mut send_byte = |byte: u8, t: &mut u64, out: &mut Vec<LineSample>| {
+    let send_byte = |byte: u8, t: &mut u64, out: &mut Vec<LineSample>| {
         for i in 0..8 {
             let bit = (byte >> (7 - i)) & 1 != 0;
             // SCL low, SDA = bit

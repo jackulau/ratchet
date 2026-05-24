@@ -352,7 +352,7 @@ mod tests {
     fn extest_loads_ir_and_shifts_dr() {
         let d = parse_bsdl(SAMPLE_BSDL).unwrap();
         let mut t = JtagMockTransport::new();
-        t.queue_tdo(&vec![false; 100]);
+        t.queue_tdo(&[false; 100]);
         let mut bs = BoundaryScan::new(d, &mut t);
         let outputs = vec![true, false, true, false, true, false, true, false];
         let _ = bs.extest(&outputs).unwrap();

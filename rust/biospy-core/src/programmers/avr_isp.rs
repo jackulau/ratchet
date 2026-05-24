@@ -279,6 +279,9 @@ pub struct AvrMockTransport {
     pub eeprom: Vec<u8>,
     pub in_programming: bool,
     pub reset_high: bool,
+    // Page-write scratch buffer (load-program-memory-page commands fill this before commit_page).
+    // Read by the page commit logic only — never observed externally, hence dead_code.
+    #[allow(dead_code)]
     page_buf: std::collections::HashMap<u16, u8>,
     pub xfers: Vec<[u8; 4]>,
 }

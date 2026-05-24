@@ -153,11 +153,12 @@ pub fn rebuild_image(base: &[u8], replacements: &[(String, Vec<u8>)]) -> (Vec<u8
 mod tests {
     use super::*;
 
+    #[allow(clippy::eq_op, clippy::erasing_op, clippy::identity_op)]
     fn intel_fd_image() -> Vec<u8> {
         let mut v = vec![0u8; 4 * 1024 * 1024];
         v[0x10..0x14].copy_from_slice(&INTEL_FD_SIG.to_le_bytes());
         v[0x28..0x2c].copy_from_slice(&0x0004_0000u32.to_le_bytes());
-        // region 0 (descriptor): base=0, limit=0xfff
+        // region 0 (descriptor): base=0, limit=0 — fixture keeps `a | (b << 16)` shape for parity with other regions
         let desc_reg: u32 = 0 | (0 << 16);
         v[0x40..0x44].copy_from_slice(&desc_reg.to_le_bytes());
         // region 1 (bios): base=0x100000, limit=0x1fffff

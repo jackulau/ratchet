@@ -8,6 +8,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Expose mock transports/backends outside of test builds (useful for integration tests in downstream crates).
+mock = []
+
 [dependencies]
 biospy-usb = { workspace = true }
 serde      = { workspace = true }

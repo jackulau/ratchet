@@ -121,12 +121,7 @@ fn find_signature(data: &[u8], sig: &[u8], start: usize) -> Option<usize> {
         return None;
     }
     let last = data.len() - sig.len();
-    for i in start..=last {
-        if &data[i..i + sig.len()] == sig {
-            return Some(i);
-        }
-    }
-    None
+    (start..=last).find(|&i| &data[i..i + sig.len()] == sig)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -283,7 +278,7 @@ fn find_substring_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> Option<usize> 
     let last = hay.len() - needle.len();
     'outer: for i in 0..=last {
         for (j, &n) in needle.iter().enumerate() {
-            if hay[i + j].to_ascii_lowercase() != n.to_ascii_lowercase() {
+            if !hay[i + j].eq_ignore_ascii_case(&n) {
                 continue 'outer;
             }
         }
@@ -833,8 +828,7 @@ mod tests {
         assert!(a
             .regions
             .iter()
-            .find(|r| r.region_type == "uefi_fv")
-            .is_some());
+            .any(|r| r.region_type == "uefi_fv"));
         assert_eq!(a.file_size, 4096);
     }
 

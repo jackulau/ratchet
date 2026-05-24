@@ -151,7 +151,11 @@ mod tests {
     fn csw_default_for_word_access() {
         assert_eq!(CSW_DEFAULT_W32 & CSW_SIZE_32, CSW_SIZE_32);
         assert_eq!(CSW_DEFAULT_W32 & CSW_ADDR_INC_SINGLE, CSW_ADDR_INC_SINGLE);
-        assert!(CSW_DEFAULT_W32 & CSW_DBG_SW_ENABLE != 0);
+        assert_eq!(
+            CSW_DEFAULT_W32 & CSW_DBG_SW_ENABLE,
+            CSW_DBG_SW_ENABLE,
+            "DBG_SW_ENABLE bit must be set in CSW_DEFAULT_W32"
+        );
     }
 
     #[test]

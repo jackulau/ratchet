@@ -16,6 +16,8 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
 const SHT_SYMTAB: u32 = 2;
+// `SHT_STRTAB` (3) — kept for future BSDL/.debug_str expansion. Skip silenced via allow.
+#[allow(dead_code)]
 const SHT_STRTAB: u32 = 3;
 
 #[derive(Debug, Clone)]

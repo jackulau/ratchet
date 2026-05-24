@@ -159,16 +159,15 @@ pub fn parse_basic_flash_params(buf: &[u8]) -> Option<SfdpBasicFlashParams> {
     let fast_read_supported = ((dw1 >> 16) & 0x1) != 0;
     let fast_read_opcode = ((dw1 >> 8) & 0xff) as u8;
 
-    let density_bits: u64;
-    if dw2 & 0x8000_0000 != 0 {
-        let n = (dw2 & 0x7fff_ffff) as u32;
+    let density_bits: u64 = if dw2 & 0x8000_0000 != 0 {
+        let n = dw2 & 0x7fff_ffff;
         if n >= 32 {
             return None;
         }
-        density_bits = 1u64 << n;
+        1u64 << n
     } else {
-        density_bits = (dw2 as u64) + 1;
-    }
+        (dw2 as u64) + 1
+    };
     if density_bits == 0 {
         return None;
     }
@@ -192,7 +191,7 @@ pub fn parse_basic_flash_params(buf: &[u8]) -> Option<SfdpBasicFlashParams> {
     let mut page_size: u32 = 256;
     if buf.len() >= 44 {
         let dw11 = read_u32_le(buf, 40);
-        let page_size_bits = ((dw11 >> 4) & 0x0f) as u32;
+        let page_size_bits = (dw11 >> 4) & 0x0f;
         if page_size_bits > 0 && page_size_bits < 24 {
             page_size = 1u32 << page_size_bits;
         }

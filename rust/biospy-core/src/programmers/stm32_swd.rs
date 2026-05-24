@@ -207,6 +207,7 @@ mod tests {
     use super::*;
     use crate::debug::swd::{Swd, SwdMockTransport};
 
+    #[allow(dead_code)] // helper for upcoming flash-roundtrip tests
     fn make_flasher<'a>(t: &'a mut SwdMockTransport) -> Stm32SwdFlasher<'a, SwdMockTransport> {
         Stm32SwdFlasher::new(Adiv5::new(Swd::new(t)), Stm32Family::F4)
     }

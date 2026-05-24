@@ -149,7 +149,7 @@ pub fn build_command(direction: u8, cmd: u8, payload: &[u8], checksum: u32) -> V
 /// Sync packet payload: 0x07 0x07 0x12 0x20 + 32 × 0x55.
 pub fn sync_payload() -> Vec<u8> {
     let mut p = vec![0x07, 0x07, 0x12, 0x20];
-    p.extend(std::iter::repeat(0x55).take(32));
+    p.extend(std::iter::repeat_n(0x55, 32));
     p
 }
 
