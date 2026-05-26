@@ -5,6 +5,7 @@
 pub mod ch341a;
 pub mod ch347;
 pub mod errors;
+pub mod libusb_bus;
 pub mod mock;
 
 use crate::types::*;
