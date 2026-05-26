@@ -500,8 +500,7 @@ fn open_dyn() -> Box<dyn Backend + Send> {
     r.backend
 }
 
-/// Same as `open_dyn` but also returns the backend kind. Used by `status` (D5).
-#[allow(dead_code)]
+/// Same as `open_dyn` but also returns the backend kind. Used by `status`.
 fn open_dyn_with_kind() -> (Box<dyn Backend + Send>, BackendKind, Option<String>, bool) {
     let r = open_default();
     (r.backend, r.kind, r.warning, r.force_mock_env)
@@ -721,20 +720,28 @@ fn cmd_can(c: CanCmd) -> anyhow::Result<()> {
 // ─── Command impls ───────────────────────────────────────────────────────────
 
 fn cmd_status(json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+    let (mut m, kind, warning, force_mock_env) = open_dyn_with_kind();
     let info = m.detect_programmer()?;
+    let backend_str = kind.as_str();
     let env = AgentEnvelope::ok(
         "status",
         json!({
+            "backend": backend_str,
+            "force_mock_env": force_mock_env,
             "force_mock": force_mock(),
+            "warning": warning,
             "programmer": info,
         }),
     );
     emit_envelope(&env, json, || {
         println!("ratchet status");
-        println!("  programmer: {} ({})", info.description, info.kind);
-        println!("  connected:  {}", info.connected);
-        println!("  force_mock: {}", force_mock());
+        println!("  backend:        {backend_str}");
+        println!("  programmer:     {} ({})", info.description, info.kind);
+        println!("  connected:      {}", info.connected);
+        println!("  force_mock_env: {force_mock_env}");
+        if let Some(w) = &warning {
+            println!("  warning:        {w}");
+        }
     })
 }
 
