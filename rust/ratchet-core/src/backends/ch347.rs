@@ -780,7 +780,7 @@ mod tests {
     fn read_data_returns_payload_after_opcode_and_addr() {
         // SPI echo: 4-byte CH347 header + 1 opcode + 3 addr + N data
         let mut payload = vec![0u8; 4 + 1 + 3];
-        payload.extend((0..32u8).collect::<Vec<_>>());
+        payload.extend(0..32u8);
         let t = primed_transport(vec![payload, vec![0u8; 4]]);
         let mut p = Ch347Protocol::new(t);
         let out = p.read_data(0x10_0000, 32).unwrap();

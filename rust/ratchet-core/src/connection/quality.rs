@@ -192,25 +192,25 @@ pub fn compute_quality_score(data: &RawConnectionData) -> ConnectionQualityResul
             name: "Consistency".to_string(),
             score: consistency_s,
             weight: WEIGHT_CONSISTENCY,
-            diagnostic: consistency_d.clone(),
+            diagnostic: consistency_d,
         },
         CategoryScore {
             name: "JEDEC Validity".to_string(),
             score: jedec_s,
             weight: WEIGHT_JEDEC,
-            diagnostic: jedec_d.clone(),
+            diagnostic: jedec_d,
         },
         CategoryScore {
             name: "Timing Stability".to_string(),
             score: timing_s,
             weight: WEIGHT_TIMING,
-            diagnostic: timing_d.clone(),
+            diagnostic: timing_d,
         },
         CategoryScore {
             name: "Status Register".to_string(),
             score: status_s,
             weight: WEIGHT_STATUS,
-            diagnostic: status_d.clone(),
+            diagnostic: status_d,
         },
     ];
     let diagnostics: Vec<String> = categories
