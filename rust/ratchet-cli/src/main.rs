@@ -1,10 +1,12 @@
-// ratchet CLI  -  full subcommand surface (D18). Hardware ops are stubs that
-// honour RATCHET_FORCE_MOCK=1 by routing through the mock backend in
-// ratchet-core. Live USB I/O is wired up incrementally as backends mature.
+// ratchet CLI - full subcommand surface. Backend selection runs through
+// `ratchet_core::backends::open_default()`, which picks between mock, CH341A,
+// and CH347 based on `RATCHET_FORCE_MOCK` and USB device presence.
 
 use clap::{Parser, Subcommand};
 use ratchet_core::agent::envelope::AgentEnvelope;
+use ratchet_core::backends::{open_default, Backend, BackendKind};
 use serde_json::json;
+use std::sync::OnceLock;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -481,7 +483,27 @@ enum CanCmd {
 }
 
 fn force_mock() -> bool {
-    std::env::var("RATCHET_FORCE_MOCK").is_ok_and(|v| v == "1" || v == "true")
+    ratchet_core::backends::factory::force_mock_env_set()
+}
+
+/// Open the live-or-mock backend exactly once per process. Subsequent calls
+/// reuse the kind/warning info but get a fresh backend instance (state-free).
+/// Warning (if any) is printed to stderr on the first call only.
+fn open_dyn() -> Box<dyn Backend + Send> {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    let r = open_default();
+    if let Some(ref msg) = r.warning {
+        if WARNED.set(()).is_ok() {
+            eprintln!("ratchet: {msg}");
+        }
+    }
+    r.backend
+}
+
+/// Same as `open_dyn` but also returns the backend kind. Used by `status`.
+fn open_dyn_with_kind() -> (Box<dyn Backend + Send>, BackendKind, Option<String>, bool) {
+    let r = open_default();
+    (r.backend, r.kind, r.warning, r.force_mock_env)
 }
 
 /// Convenience: emit envelope as JSON if `json=true`, otherwise print human text.
@@ -698,27 +720,33 @@ fn cmd_can(c: CanCmd) -> anyhow::Result<()> {
 // ─── Command impls ───────────────────────────────────────────────────────────
 
 fn cmd_status(json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let (mut m, kind, warning, force_mock_env) = open_dyn_with_kind();
     let info = m.detect_programmer()?;
+    let backend_str = kind.as_str();
     let env = AgentEnvelope::ok(
         "status",
         json!({
+            "backend": backend_str,
+            "force_mock_env": force_mock_env,
             "force_mock": force_mock(),
+            "warning": warning,
             "programmer": info,
         }),
     );
     emit_envelope(&env, json, || {
         println!("ratchet status");
-        println!("  programmer: {} ({})", info.description, info.kind);
-        println!("  connected:  {}", info.connected);
-        println!("  force_mock: {}", force_mock());
+        println!("  backend:        {backend_str}");
+        println!("  programmer:     {} ({})", info.description, info.kind);
+        println!("  connected:      {}", info.connected);
+        println!("  force_mock_env: {force_mock_env}");
+        if let Some(w) = &warning {
+            println!("  warning:        {w}");
+        }
     })
 }
 
 fn cmd_detect(json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let info = m.detect_programmer()?;
     let env = AgentEnvelope::ok("detect", info.clone());
     emit_envelope(&env, json, || {
@@ -730,8 +758,7 @@ fn cmd_detect(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_identify(json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let info = m.identify_chip()?;
     let env = AgentEnvelope::ok("identify", info.clone());
     emit_envelope(&env, json, || match &info {
@@ -744,8 +771,7 @@ fn cmd_identify(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let r = m.read_chip(std::path::Path::new(output))?;
     let env = AgentEnvelope::ok("read", r.clone());
     emit_envelope(&env, json, || {
@@ -757,8 +783,8 @@ fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend, WriteOpts};
-    let mut m = MockBackend::default();
+    use ratchet_core::backends::WriteOpts;
+    let mut m = open_dyn();
     let r = m.write_chip(
         std::path::Path::new(input),
         WriteOpts {
@@ -776,16 +802,14 @@ fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> a
 }
 
 fn cmd_erase(json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let r = m.erase_chip()?;
     let env = AgentEnvelope::ok("erase", r.clone());
     emit_envelope(&env, json, || println!("erase ok ({}ms)", r.duration_ms))
 }
 
 fn cmd_verify(file: &str, json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let r = m.verify_chip(std::path::Path::new(file))?;
     let env = AgentEnvelope::ok("verify", r.clone());
     emit_envelope(&env, json, || println!("matches={}", r.matches))
@@ -943,8 +967,7 @@ fn cmd_voltage_reference(jedec_id: &str, json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_sfdp(json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let s = m.read_sfdp()?;
     let env = AgentEnvelope::ok("sfdp", s.clone());
     emit_envelope(&env, json, || {
@@ -957,8 +980,7 @@ fn cmd_sfdp(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_wp_status(json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let sr = m.read_status_registers()?;
     let wp = m.is_write_protected()?;
     let env = AgentEnvelope::ok(
@@ -969,10 +991,9 @@ fn cmd_wp_status(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_region_erase(start: &str, length: &str, json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
     let s = parse_addr(start)?;
     let l = parse_addr(length)?;
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let r = m.region_erase(s, l)?;
     let env = AgentEnvelope::ok("region-erase", r.clone());
     emit_envelope(&env, json, || {
@@ -981,9 +1002,14 @@ fn cmd_region_erase(start: &str, length: &str, json: bool) -> anyhow::Result<()>
 }
 
 fn cmd_blank_check(json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::mock::MockBackend;
-    let m = MockBackend::default();
-    let blank = m.flash_bytes().iter().all(|b| *b == 0xff);
+    let mut m = open_dyn();
+    // Read the whole chip into a temp file and check every byte. Same path on
+    // mock (instant) and real silicon (slow but accurate).
+    let tmp = std::env::temp_dir().join(format!("ratchet-blank-check-{}.bin", std::process::id()));
+    m.read_chip(&tmp)?;
+    let data = std::fs::read(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    let blank = data.iter().all(|b| *b == 0xff);
     let env = AgentEnvelope::ok("blank-check", json!({"blank": blank}));
     emit_envelope(&env, json, || println!("blank={blank}"))
 }
@@ -995,8 +1021,7 @@ fn cmd_repl() -> anyhow::Result<()> {
 }
 
 fn cmd_self_test(json: bool) -> anyhow::Result<()> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let mut errors: Vec<String> = Vec::new();
     if let Err(e) = m.detect_programmer() {
         errors.push(format!("detect: {e}"));
@@ -1028,6 +1053,11 @@ fn cmd_self_test(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> anyhow::Result<()> {
+    // `full-repair` runs through the workflows::pipeline framework, which
+    // expects a `PipelineBackend` (not the trait `Backend` open_default returns).
+    // Bridging the real CH341A/CH347 backends into PipelineBackend is its own
+    // multi-step refactor; until then this command stays mock-bridge-only and
+    // is explicitly marked as such in the JSON envelope.
     use ratchet_core::backends::mock::MockBackend;
     use ratchet_core::workflows::pipeline::{
         build_repair_pipeline, run_pipeline, ConnectionTestData, PipelineBackend, PipelineContext,

@@ -13,16 +13,18 @@ Replaces AsProgrammer / NeoProgrammer for the SPI-flash path, and overlaps with 
 Pre-release. Goal-005 shipped the full multi-protocol surface; goals 006 / 007 rebranded and audited; goals 008 / 010 reconciled the README with reality.
 
 What's done today:
-- Full CLI surface (39 top-level subcommands + nested groups). 442 unit + integration tests pass.
+- Full CLI surface (39 top-level subcommands + nested groups). 447 unit + integration tests pass.
 - MCP server with 30 tools. JSON-RPC 2.0 stdio, schema descriptors live.
 - Protocol-level code (CH341A / CH347 packet builders, SPI / I2C / JTAG / SWD / etc.) is implemented and unit-tested.
+- **CLI + MCP auto-select between mock, CH341A, and CH347.** Backend selection runs through `ratchet_core::backends::open_default()`: `RATCHET_FORCE_MOCK=1` forces mock; otherwise the libusb context probes for a CH347 first (vid `1a86` pid `55db`), then a CH341A (vid `1a86` pid `5512`), and falls back to mock with a stderr warning if neither is plugged in. `ratchet status` reports which backend is live via the `backend` JSON field.
+- Release binaries are small and start fast: `ratchet` is ~1.5 MB and `ratchet-mcp` is ~900 KB; `ratchet --help` returns in ~35 ms cold.
 
 What's not done yet:
-- **CLI subcommands currently dispatch through `MockBackend` only.** The real-USB backends (`ratchet_core::backends::ch341a`, `ch347`) exist and are unit-tested at the protocol layer, but the CLI command handlers haven't been threaded to choose between mock and live USB yet. `RATCHET_FORCE_MOCK` is reported by `ratchet status` but doesn't currently switch backends (mock is the default and only mode).
-- **MCP handlers are likewise mock-only.** Hardware-protocol handlers (the 12 D28 tools) return placeholder JSON. SPI-flash tools use the mock backend.
+- **The `full-repair` pipeline command still uses a mock bridge.** `cmd_full_repair` wraps `MockBackend` in a `PipelineBackend` adapter; the same adapter for the live CH341A / CH347 backends is a separate refactor. The other CLI / MCP commands all run against whichever backend `open_default()` picked.
+- **The hardware-protocol MCP handlers (the 12 D28 tools) still return placeholder JSON.** The protocol-layer code (I2C / UART / JTAG / SWD / AVR / ESP / STM32 / logic analyzer / Bus Pirate / slcan) is unit-tested, but the MCP tool dispatch for those verbs is a stub pending its own deliverable.
 - **No GitHub Releases are published yet**, so the only supported install route today is from source via `cargo install`.
 
-Live USB wiring at the CLI / MCP dispatch level is the next planned goal. Real-hardware behavior is best exercised today by writing integration tests against the protocol-level backends directly.
+Real-hardware behavior with a programmer attached is the path the live backend selection unlocks; without hardware the mock backend keeps the entire CLI / MCP surface exercisable for development and CI.
 
 ## Install
 

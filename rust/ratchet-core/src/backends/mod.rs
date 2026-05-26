@@ -5,7 +5,11 @@
 pub mod ch341a;
 pub mod ch347;
 pub mod errors;
+pub mod factory;
+pub mod libusb_bus;
 pub mod mock;
+
+pub use factory::{open_default, BackendKind, OpenResult};
 
 use crate::types::*;
 use std::path::Path;

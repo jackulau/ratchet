@@ -6,10 +6,26 @@
 // wiring lands; the dispatch surface, JSON-schema descriptors, and arg shapes
 // are real today.
 
+use ratchet_core::backends::{open_default, Backend};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::sync::OnceLock;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Open the live-or-mock backend. Warning (no-device, libusb-init failure,
+/// etc.) is logged once to stderr so MCP clients see the note in their server
+/// log without polluting every JSON-RPC response.
+fn open_dyn() -> Box<dyn Backend + Send> {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    let r = open_default();
+    if let Some(ref msg) = r.warning {
+        if WARNED.set(()).is_ok() {
+            eprintln!("ratchet-mcp: {msg}");
+        }
+    }
+    r.backend
+}
 
 fn main() -> anyhow::Result<()> {
     // `--list-tools` short-circuits the JSON-RPC loop and prints just the
@@ -458,38 +474,33 @@ fn call_hw_stub(name: &str) -> Value {
 // ─── Mock-backed tool impls ──────────────────────────────────────────────────
 
 fn call_detect() -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let info = m.detect_programmer().map_err(map_err)?;
     Ok(serde_json::to_value(&info).unwrap_or(Value::Null))
 }
 
 fn call_identify() -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let info = m.identify_chip().map_err(map_err)?;
     Ok(serde_json::to_value(&info).unwrap_or(Value::Null))
 }
 
 fn call_sfdp() -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let s = m.read_sfdp().map_err(map_err)?;
     Ok(serde_json::to_value(&s).unwrap_or(Value::Null))
 }
 
 fn call_wp_status() -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let sr = m.read_status_registers().map_err(map_err)?;
     let wp = m.is_write_protected().map_err(map_err)?;
     Ok(json!({"write_protected": wp, "sr1": sr.sr1, "sr2": sr.sr2, "sr3": sr.sr3}))
 }
 
 fn call_read_chip(args: &Value) -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
     let output = arg_str(args, "output")?;
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let r = m
         .read_chip(std::path::Path::new(&output))
         .map_err(map_err)?;
@@ -497,13 +508,13 @@ fn call_read_chip(args: &Value) -> Result<Value, (i32, String)> {
 }
 
 fn call_write_chip(args: &Value) -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::{mock::MockBackend, Backend, WriteOpts};
+    use ratchet_core::backends::WriteOpts;
     let input = arg_str(args, "input")?;
     let opts = WriteOpts {
         skip_backup: arg_bool(args, "skip_backup"),
         skip_verify: arg_bool(args, "skip_verify"),
     };
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let r = m
         .write_chip(std::path::Path::new(&input), opts)
         .map_err(map_err)?;
@@ -511,9 +522,8 @@ fn call_write_chip(args: &Value) -> Result<Value, (i32, String)> {
 }
 
 fn call_verify_chip(args: &Value) -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
     let file = arg_str(args, "file")?;
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let r = m
         .verify_chip(std::path::Path::new(&file))
         .map_err(map_err)?;
@@ -521,25 +531,29 @@ fn call_verify_chip(args: &Value) -> Result<Value, (i32, String)> {
 }
 
 fn call_erase_chip() -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let r = m.erase_chip().map_err(map_err)?;
     Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
 }
 
 fn call_region_erase(args: &Value) -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
     let start = arg_u64(args, "start")?;
     let length = arg_u64(args, "length")?;
-    let mut m = MockBackend::default();
+    let mut m = open_dyn();
     let r = m.region_erase(start, length).map_err(map_err)?;
     Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
 }
 
 fn call_blank_check() -> Result<Value, (i32, String)> {
-    use ratchet_core::backends::mock::MockBackend;
-    let m = MockBackend::default();
-    let blank = m.flash_bytes().iter().all(|b| *b == 0xff);
+    let mut m = open_dyn();
+    let tmp = std::env::temp_dir().join(format!(
+        "ratchet-mcp-blank-check-{}.bin",
+        std::process::id()
+    ));
+    m.read_chip(&tmp).map_err(map_err)?;
+    let data = std::fs::read(&tmp).map_err(|e| (-32000, e.to_string()))?;
+    let _ = std::fs::remove_file(&tmp);
+    let blank = data.iter().all(|b| *b == 0xff);
     Ok(json!({"blank": blank}))
 }
 
