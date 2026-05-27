@@ -16,12 +16,14 @@ What's done today:
 - Full CLI surface (39 top-level subcommands + nested groups). 447 unit + integration tests pass.
 - MCP server with 30 tools. JSON-RPC 2.0 stdio, schema descriptors live.
 - Protocol-level code (CH341A / CH347 packet builders, SPI / I2C / JTAG / SWD / etc.) is implemented and unit-tested.
-- **CLI + MCP auto-select between mock, CH341A, and CH347.** Backend selection runs through `ratchet_core::backends::open_default()`: `RATCHET_FORCE_MOCK=1` forces mock; otherwise the libusb context probes for a CH347 first (vid `1a86` pid `55db`), then a CH341A (vid `1a86` pid `5512`), and falls back to mock with a stderr warning if neither is plugged in. `ratchet status` reports which backend is live via the `backend` JSON field.
+- **CLI + MCP + `ratchet-node` all auto-select between mock, CH341A, and CH347.** Backend selection runs through `ratchet_core::backends::open_default()`: `RATCHET_FORCE_MOCK=1` forces mock; otherwise the libusb context probes for a CH347 first (vid `1a86` pid `55db`), then a CH341A (vid `1a86` pid `5512`), and falls back to mock with a stderr warning if neither is plugged in. `ratchet status` reports which backend is live via the `backend` JSON field. The `ratchet-node` napi bridge picks up live silicon automatically.
+- **`full-repair` runs against the live backend.** `cmd_full_repair` drives `BackendPipelineAdapter`, which wraps any `Backend` (mock or live CH341A / CH347) into the `PipelineBackend` trait — the SPI-flash backup + repair pipeline is no longer mock-only.
 - Release binaries are small and start fast: `ratchet` is ~1.5 MB and `ratchet-mcp` is ~900 KB; `ratchet --help` returns in ~35 ms cold.
 
 What's not done yet:
-- **The `full-repair` pipeline command still uses a mock bridge.** `cmd_full_repair` wraps `MockBackend` in a `PipelineBackend` adapter; the same adapter for the live CH341A / CH347 backends is a separate refactor. The other CLI / MCP commands all run against whichever backend `open_default()` picked.
-- **The hardware-protocol MCP handlers (the 12 D28 tools) still return placeholder JSON.** The protocol-layer code (I2C / UART / JTAG / SWD / AVR / ESP / STM32 / logic analyzer / Bus Pirate / slcan) is unit-tested, but the MCP tool dispatch for those verbs is a stub pending its own deliverable.
+- **The multi-protocol CLI verbs return placeholder JSON.** Every `i2c` / `uart` / `onewire` / `jtag` / `swd` / `avr` / `esp` / `stm32` / `eeprom` / `la` / `buspirate` / `can` subcommand in `ratchet-cli` routes through a `hw_stub` helper — the protocol-layer code is unit-tested in `ratchet-core`, but no CLI surface drives real silicon for these protocols yet. Wiring them requires per-protocol transport adapters (I2C bus, JTAG transport, SWD transport, UART master) sitting on top of CH341A / CH347 — that is a separate multi-deliverable epic.
+- **The hardware-protocol MCP handlers (the 12 D28 tools) likewise still return placeholder JSON**, for the same reason: the MCP tool dispatch fronts the same stub layer the CLI does.
+- **`full-backup` and `monitor` are envelope-only stubs.** They emit a valid JSON envelope but do not yet implement the underlying loop / save flow.
 - **No GitHub Releases are published yet**, so the only supported install route today is from source via `cargo install`.
 
 Real-hardware behavior with a programmer attached is the path the live backend selection unlocks; without hardware the mock backend keeps the entire CLI / MCP surface exercisable for development and CI.

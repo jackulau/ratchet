@@ -1053,78 +1053,12 @@ fn cmd_self_test(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> anyhow::Result<()> {
-    // `full-repair` runs through the workflows::pipeline framework, which
-    // expects a `PipelineBackend` (not the trait `Backend` open_default returns).
-    // Bridging the real CH341A/CH347 backends into PipelineBackend is its own
-    // multi-step refactor; until then this command stays mock-bridge-only and
-    // is explicitly marked as such in the JSON envelope.
-    use ratchet_core::backends::mock::MockBackend;
-    use ratchet_core::workflows::pipeline::{
-        build_repair_pipeline, run_pipeline, ConnectionTestData, PipelineBackend, PipelineContext,
-        ReadOutcome, VerifyOutcome, WriteOutcome,
-    };
+    use ratchet_core::workflows::pipeline::{build_repair_pipeline, run_pipeline, PipelineContext};
+    use ratchet_core::workflows::pipeline_adapter::BackendPipelineAdapter;
 
-    struct MockBridge {
-        m: MockBackend,
-    }
-    impl PipelineBackend for MockBridge {
-        fn connection_test(&mut self) -> Result<ConnectionTestData, String> {
-            use ratchet_core::backends::Backend;
-            let r = self.m.connection_test().map_err(|e| e.to_string())?;
-            Ok(ConnectionTestData {
-                stable: r.stable,
-                reads: r.reads,
-                matches: r.matches,
-                jedec_id: r.jedec_id,
-                timings: r.timings,
-                status_register: r.status_register,
-            })
-        }
-        fn identify_chip(&mut self) -> Result<Option<ratchet_core::types::ChipInfo>, String> {
-            use ratchet_core::backends::Backend;
-            self.m.identify_chip().map_err(|e| e.to_string())
-        }
-        fn read_chip_double_verify(&mut self) -> Result<ReadOutcome, String> {
-            let data: Vec<u8> = self.m.flash_bytes().to_vec();
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(&data);
-            let chk: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-            Ok(ReadOutcome {
-                success: true,
-                size_bytes: data.len() as u64,
-                checksum: chk,
-                data,
-                error: None,
-            })
-        }
-        fn write_chip(&mut self, _data: &[u8]) -> Result<WriteOutcome, String> {
-            Ok(WriteOutcome {
-                success: true,
-                verified: true,
-                error: None,
-                backup_path: None,
-            })
-        }
-        fn verify_chip(&mut self, _data: &[u8]) -> Result<VerifyOutcome, String> {
-            Ok(VerifyOutcome {
-                matches: true,
-                chip_checksum: String::new(),
-                file_checksum: String::new(),
-            })
-        }
-        fn is_write_protected(&mut self) -> Result<bool, String> {
-            Ok(false)
-        }
-        fn disable_write_protection(&mut self) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
-    let mut bridge = MockBridge {
-        m: MockBackend::default(),
-    };
-    let mut ctx = PipelineContext::new(&mut bridge);
+    let mut backend = open_dyn();
+    let mut adapter = BackendPipelineAdapter::new(&mut *backend);
+    let mut ctx = PipelineContext::new(&mut adapter);
     if let Some(r) = reference {
         ctx.reference_path = Some(std::path::PathBuf::from(r));
     }
