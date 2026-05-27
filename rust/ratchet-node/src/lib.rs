@@ -15,17 +15,20 @@
 // to call ratchet from JS without spawning a subprocess.
 
 use napi_derive::napi;
+use ratchet_core::backends::{open_default, Backend};
 
 #[napi]
 pub fn version() -> String {
     ratchet_core::version().to_string()
 }
 
+fn open_dyn() -> Box<dyn Backend + Send> {
+    open_default().backend
+}
+
 #[napi]
 pub fn detect() -> napi::Result<String> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
-    let info = m
+    let info = open_dyn()
         .detect_programmer()
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
     serde_json::to_string(&info).map_err(|e| napi::Error::from_reason(e.to_string()))
@@ -33,9 +36,7 @@ pub fn detect() -> napi::Result<String> {
 
 #[napi]
 pub fn identify() -> napi::Result<String> {
-    use ratchet_core::backends::{mock::MockBackend, Backend};
-    let mut m = MockBackend::default();
-    let info = m
+    let info = open_dyn()
         .identify_chip()
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
     serde_json::to_string(&info).map_err(|e| napi::Error::from_reason(e.to_string()))
