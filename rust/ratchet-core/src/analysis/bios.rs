@@ -492,7 +492,8 @@ pub fn extract_firmware(data: &[u8]) -> (Vec<u8>, ExtractResult) {
                 let me_limit = ((((me_reg >> 16) & 0x1fff) as usize) << 12) | 0xfff;
                 if me_limit > me_base {
                     warnings.push(
-                        "Intel ME region detected  -  this may be locked by the chipset".to_string(),
+                        "Intel ME region detected  -  this may be locked by the chipset"
+                            .to_string(),
                     );
                 }
             }
@@ -825,10 +826,7 @@ mod tests {
         let v = synthetic_uefi_image();
         let a = analyze_bytes(&v);
         assert!(a.is_uefi);
-        assert!(a
-            .regions
-            .iter()
-            .any(|r| r.region_type == "uefi_fv"));
+        assert!(a.regions.iter().any(|r| r.region_type == "uefi_fv"));
         assert_eq!(a.file_size, 4096);
     }
 

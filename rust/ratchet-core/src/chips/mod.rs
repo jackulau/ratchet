@@ -321,7 +321,8 @@ pub fn get_chip_recommendations(chip: &Chip) -> ChipRecommendation {
     };
 
     let erase_strategy = if chip.size_bytes <= 1024 * 1024 {
-        "Sector erase (4KB) recommended  -  chip is small enough for fast targeted erase".to_string()
+        "Sector erase (4KB) recommended  -  chip is small enough for fast targeted erase"
+            .to_string()
     } else if chip.size_bytes <= 16 * 1024 * 1024 {
         "Block erase (64KB) for bulk operations, sector erase (4KB) for targeted updates"
             .to_string()

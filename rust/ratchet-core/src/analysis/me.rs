@@ -101,7 +101,7 @@ pub fn parse_me_region(data: &[u8], region_offset: u64) -> IntelMeInfo {
                     region_size: data.len() as u64,
                     partitions: vec![],
                     warnings: vec![
-                        "ME region is blank (all 0xFF)  -  ME disabled or not present".to_string()
+                        "ME region is blank (all 0xFF)  -  ME disabled or not present".to_string(),
                     ],
                 };
             }

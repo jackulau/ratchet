@@ -114,7 +114,9 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
             checks.push(HealthCheck {
                 name: "Content check".to_string(),
                 status: CheckStatus::Warn,
-                detail: format!("{ff_pct:.1}% empty (0xFF)  -  partially erased or minimal firmware"),
+                detail: format!(
+                    "{ff_pct:.1}% empty (0xFF)  -  partially erased or minimal firmware"
+                ),
             });
         } else {
             checks.push(HealthCheck {
@@ -157,7 +159,8 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
         checks.push(HealthCheck {
             name: "Intel Flash Descriptor".to_string(),
             status: CheckStatus::Warn,
-            detail: "No Intel Flash Descriptor  -  raw BIOS image or non-Intel platform".to_string(),
+            detail: "No Intel Flash Descriptor  -  raw BIOS image or non-Intel platform"
+                .to_string(),
         });
     }
 
@@ -184,14 +187,16 @@ pub fn analyze_bios_health_from_buffer(data: &[u8]) -> BiosHealthReport {
             checks.push(HealthCheck {
                 name: "PEI phase".to_string(),
                 status: CheckStatus::Warn,
-                detail: "No PEI firmware volume detected  -  may be compressed or nested".to_string(),
+                detail: "No PEI firmware volume detected  -  may be compressed or nested"
+                    .to_string(),
             });
         }
         if !has_dxe {
             checks.push(HealthCheck {
                 name: "DXE phase".to_string(),
                 status: CheckStatus::Warn,
-                detail: "No DXE firmware volume detected  -  may be compressed or nested".to_string(),
+                detail: "No DXE firmware volume detected  -  may be compressed or nested"
+                    .to_string(),
             });
         }
     } else if data.len() >= 16 && data[data.len() - 1] == 0xea {
@@ -381,8 +386,9 @@ fn suggest_recovery_strategy(checks: &[HealthCheck]) -> Vec<RecoveryStep> {
         if nv.detail.contains("deleted") {
             steps.push(RecoveryStep {
                 order,
-                action: "NVRAM has many deleted variables  -  clear CMOS or reflash to rebuild NVRAM"
-                    .to_string(),
+                action:
+                    "NVRAM has many deleted variables  -  clear CMOS or reflash to rebuild NVRAM"
+                        .to_string(),
                 command: "Clear CMOS jumper on motherboard, or reflash clean BIOS".to_string(),
                 risk: Risk::Low,
             });

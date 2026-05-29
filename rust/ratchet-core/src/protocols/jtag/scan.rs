@@ -141,7 +141,7 @@ mod tests {
         // + 1 BYPASS marker bit (=0) for remaining devices.
         let max_devices = 2;
         let bit_count = max_devices * 32 + 1;
-        // The reset (5) + goto (≤4) pulses don't consume TDO meaningfully  - 
+        // The reset (5) + goto (≤4) pulses don't consume TDO meaningfully  -
         // mock returns false by default. Queue ID bits then trailing zeros.
         let mut tdo = idcode_bits(id);
         while tdo.len() < bit_count {

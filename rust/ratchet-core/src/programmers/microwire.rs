@@ -130,7 +130,7 @@ impl<'t, T: MicrowireTransport> Microwire<'t, T> {
         self.t
             .shift_out(data & ((1u32 << data_bits) - 1), data_bits)?;
         self.t.set_cs(false)?;
-        // Datasheet specifies waiting for DO high after CS rises. Skipped here  - 
+        // Datasheet specifies waiting for DO high after CS rises. Skipped here  -
         // synchronous bit-bang completes within the write delay budget.
         Ok(())
     }

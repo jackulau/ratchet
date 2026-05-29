@@ -145,7 +145,9 @@ impl<'t, T: OneWireTransport> OneWireMaster<'t, T> {
                         let byte_idx = ((id_bit_number - 1) / 8) as usize;
                         let bit_idx = (id_bit_number - 1) % 8;
                         search_bit = rom_no[byte_idx] & (1 << bit_idx) != 0;
-                    } else { search_bit = id_bit_number == last_discrepancy; }
+                    } else {
+                        search_bit = id_bit_number == last_discrepancy;
+                    }
                     if !search_bit {
                         last_zero = id_bit_number;
                     }
