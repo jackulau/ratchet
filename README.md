@@ -2,7 +2,7 @@
 
 Multi-protocol **hardware debug + programming toolkit** built on **CH341A / CH347** USB programmers.
 
-SPI flash programming + BIOS analysis was the starting point. The current surface adds **I2C / UART / 1-Wire / passive SPI sniff / JTAG / SWD / CAN**, target-MCU programmers (**AVR ISP, STK500 / Arduino bootloader, 24Cxx EEPROM, 93xxx Microwire EEPROM, ESP32 / ESP8266 esptool, STM32 SWD, STM32 UART AN3155**), ARM debug (**ADIv5, Cortex-M halt/resume/step, ELF symbol-aware peek**), JTAG IDCODE chain + BSDL boundary scan, multi-channel logic analyzer with Saleae / sigrok export, and bridges for **Bus Pirate** + **slcan CAN**.
+SPI flash programming + BIOS analysis is the part that drives live silicon end to end today. On top of that sits a unit-tested protocol layer for **I2C / UART / 1-Wire / passive SPI sniff / JTAG / SWD / CAN**, target-MCU programmers (**AVR ISP, STK500 / Arduino bootloader, 24Cxx EEPROM, 93xxx Microwire EEPROM, ESP32 / ESP8266 esptool, STM32 SWD, STM32 UART AN3155**), ARM debug (**ADIv5, Cortex-M halt/resume/step, ELF symbol-aware peek**), JTAG IDCODE chain + BSDL boundary scan, a multi-channel logic-analyzer model with Saleae / sigrok export, and bridges for **Bus Pirate** + **slcan CAN**. The subset wired to live hardware from the CLI/MCP today is called out precisely in [Status](#status); commands without a live transport fail honestly rather than faking success.
 
 **Rust-first.** Single self-contained binary, custom libusb FFI, custom JSON-RPC MCP server, no Node runtime required.
 
@@ -10,23 +10,22 @@ Replaces AsProgrammer / NeoProgrammer for the SPI-flash path, and overlaps with 
 
 ## Status
 
-Pre-release. Goal-005 shipped the full multi-protocol surface; goals 006 / 007 rebranded and audited; goals 008 / 010 reconciled the README with reality.
+Pre-release. Goal-005 shipped the multi-protocol scaffolding; goals 006 / 007 rebranded and audited; goals 008 / 010 reconciled the README with reality; goal 014 wired the genuinely-wireable protocol verbs to live hardware and made every remaining verb fail honestly instead of faking success.
 
-What's done today:
-- Full CLI surface (39 top-level subcommands + nested groups). 447 unit + integration tests pass.
-- MCP server with 30 tools. JSON-RPC 2.0 stdio, schema descriptors live.
-- Protocol-level code (CH341A / CH347 packet builders, SPI / I2C / JTAG / SWD / etc.) is implemented and unit-tested.
-- **CLI + MCP + `ratchet-node` all auto-select between mock, CH341A, and CH347.** Backend selection runs through `ratchet_core::backends::open_default()`: `RATCHET_FORCE_MOCK=1` forces mock; otherwise the libusb context probes for a CH347 first (vid `1a86` pid `55db`), then a CH341A (vid `1a86` pid `5512`), and falls back to mock with a stderr warning if neither is plugged in. `ratchet status` reports which backend is live via the `backend` JSON field. The `ratchet-node` napi bridge picks up live silicon automatically.
-- **`full-repair` runs against the live backend.** `cmd_full_repair` drives `BackendPipelineAdapter`, which wraps any `Backend` (mock or live CH341A / CH347) into the `PipelineBackend` trait — the SPI-flash backup + repair pipeline is no longer mock-only.
-- Release binaries are small and start fast: `ratchet` is ~1.5 MB and `ratchet-mcp` is ~900 KB; `ratchet --help` returns in ~35 ms cold.
+What drives live hardware today (CLI + MCP):
+- **SPI flash + BIOS path, end to end.** `status`, `detect`, `identify`, `read`, `write`, `verify`, `erase`, `region-erase`, `blank-check`, `sfdp`, `wp-status`, `full-repair`, `full-backup` all run against the live backend. `full-repair` drives `BackendPipelineAdapter`; `full-backup` is a full-chip read to a named file.
+- **I2C, over CH341A bit-bang or CH347 native.** `i2c scan`, `i2c read`, `i2c write`, and `eeprom-i2c read/write` (24Cxx) construct the real `Ch341aI2c` / `Ch347I2c` master over the live bus.
+- **JTAG IDCODE scan, over the CH347 JTAG engine.** `jtag idcode-scan` drives the real `Ch347Jtag` adapter (CH347 only; CH341A has no JTAG engine).
+- **Backend auto-select.** `RATCHET_FORCE_MOCK=1` forces mock; otherwise `open_default()` probes CH347 (`1a86:55db`) then CH341A (`1a86:5512`), falling back to mock with a stderr warning. Protocol verbs use `open_raw_bus()`, which returns an honest error (never a silent mock fallback) when no device is present. `ratchet status` reports the live backend via the `backend` JSON field; `ratchet-node` picks up live silicon automatically.
 
-What's not done yet:
-- **The multi-protocol CLI verbs return placeholder JSON.** Every `i2c` / `uart` / `onewire` / `jtag` / `swd` / `avr` / `esp` / `stm32` / `eeprom` / `la` / `buspirate` / `can` subcommand in `ratchet-cli` routes through a `hw_stub` helper — the protocol-layer code is unit-tested in `ratchet-core`, but no CLI surface drives real silicon for these protocols yet. Wiring them requires per-protocol transport adapters (I2C bus, JTAG transport, SWD transport, UART master) sitting on top of CH341A / CH347 — that is a separate multi-deliverable epic.
-- **The hardware-protocol MCP handlers (the 12 D28 tools) likewise still return placeholder JSON**, for the same reason: the MCP tool dispatch fronts the same stub layer the CLI does.
-- **`full-backup` and `monitor` are envelope-only stubs.** They emit a valid JSON envelope but do not yet implement the underlying loop / save flow.
+Offline tools that need no hardware:
+- `i2c sniff <trace.json>` decodes a captured (t_us, scl, sda) trace; `jtag bsdl-scan <file.bsdl>` parses a BSDL file and reports its boundary register; `la export <capture.json> <out> --format csv|jsonl` converts a capture; `serial-list` enumerates serial ports (POSIX); `repl` is a working stdin REPL over the SPI backend; plus all the pure analysis verbs (`analyze`, `diff`, `checksum`, `chip-info`, `search`, `post-decode`, `voltage-reference`).
+
+What is NOT wired to live hardware yet (these fail honestly: non-zero exit / JSON-RPC error, never a fake success):
+- `uart open/sniff`, `onewire scan/temp`, `swd connect/halt/resume/step/dump`, `avr signature/program/fuses/erase`, `eeprom-microwire read/write`, `esp detect/flash`, `stm32 swd-flash/uart-flash`, `la capture`, `buspirate bridge/probe`, `can sniff/send`. The protocol logic for each is implemented and unit-tested against a mock, but no live CH341A/CH347 transport adapter is wired (SWD/1-Wire/AVR-ISP/Microwire bit-bang, native UART RX, external serial/CAN devices). `monitor`, `serial` connect, and `failure-search` likewise return honest errors rather than placeholder envelopes.
 - **No GitHub Releases are published yet**, so the only supported install route today is from source via `cargo install`.
 
-Real-hardware behavior with a programmer attached is the path the live backend selection unlocks; without hardware the mock backend keeps the entire CLI / MCP surface exercisable for development and CI.
+458 unit + integration tests pass. Without hardware, the mock backend keeps the SPI-flash surface exercisable for development and CI; protocol verbs report honestly that a device is required.
 
 ## Install
 
@@ -111,49 +110,55 @@ ratchet verify new_bios.bin
 
 ## Quick Start - multi-protocol
 
-```bash
-# I2C bus scan + read
-ratchet i2c scan
-ratchet i2c read 0x50 0x00 256
+These drive live hardware today (or run offline where noted). Each returns a
+non-zero exit and an honest message if no device is present.
 
-# JTAG IDCODE chain on unknown board
+```bash
+# I2C bus scan + register read (live CH341A / CH347)
+ratchet i2c scan
+ratchet i2c read --addr 0x50 --reg 0x00 --len 256
+
+# 24Cxx I2C EEPROM dump / restore (live)
+ratchet eeprom-i2c read --addr 0x50 --part 24c256 dump.bin
+ratchet eeprom-i2c write --addr 0x50 --part 24c256 dump.bin
+
+# JTAG IDCODE chain (live, CH347 only)
 ratchet jtag idcode-scan
 
-# SWD: halt Cortex-M and dump RAM
-ratchet swd connect
-ratchet swd halt
-ratchet swd dump --addr 0x20000000 --len 0x1000
+# Offline: decode a captured I2C trace / parse a BSDL file / convert a capture
+ratchet i2c sniff trace.json
+ratchet jtag bsdl-scan part.bsdl
+ratchet la export capture.json out.csv --format csv
 
-# Program ATmega328P via ISP
-ratchet avr program firmware.hex
-
-# Flash STM32 over SWD
-ratchet stm32 swd-flash firmware.bin --addr 0x08000000
-
-# Multi-channel logic capture, save Saleae .sal
-ratchet la capture --channels 0,1,2,3 --rate 1M --duration 5s -o trace.sal
-
-# CAN sniffing via slcan adapter
-ratchet can sniff /dev/tty.usbmodem*
+# Enumerate serial ports (POSIX)
+ratchet serial-list
 ```
+
+Verbs whose live transport is not yet wired (`uart`, `onewire`, `swd`, `avr`,
+`eeprom-microwire`, `esp`, `stm32`, `la capture`, `buspirate`, `can`) exit
+non-zero with an explanation; they never print a fake success. See
+[Status](#status).
 
 ## Commands
 
-`ratchet --help` exposes 39 top-level subcommands plus `help`. Groups:
+`ratchet --help` exposes 39 top-level subcommands plus `help`. Status legend:
+**[live]** drives hardware (honest error if no device), **[offline]** needs no
+hardware, **[n/w]** not wired to a live transport yet (exits non-zero, never
+fakes success).
 
 | Group | Commands |
 |-------|----------|
-| Hardware | `status`, `detect`, `identify`, `monitor` |
-| Chip ops | `read`, `write`, `verify`, `erase`, `region-erase`, `blank-check`, `sfdp`, `wp-status` |
-| Analysis | `analyze`, `diff`, `checksum` |
-| Knowledge base | `search`, `chip-info`, `post-decode`, `failure-search`, `voltage-reference` |
-| Serial | `serial`, `serial-list` |
-| Repair | `full-repair`, `full-backup`, `repl` |
-| Self-test | `self-test` (also exposed as `--self-test` top-level flag) |
-| I2C / UART / 1-Wire | `i2c scan/read/write/sniff`, `uart open/sniff`, `onewire scan` |
-| JTAG / SWD | `jtag idcode-scan/bsdl-scan`, `swd connect/halt/dump` |
-| Programmers | `avr signature/program/fuses/erase` (ISP + Arduino STK500 bootloader), `eeprom-i2c read/write`, `eeprom-microwire read/write`, `esp flash`, `stm32 swd-flash/uart-flash` |
-| Instruments | `la capture/export`, `buspirate bridge`, `can sniff` |
+| Hardware | `status` [live], `detect` [live], `identify` [live], `monitor` [n/w] |
+| Chip ops | `read` `write` `verify` `erase` `region-erase` `blank-check` `sfdp` `wp-status` [live] |
+| Analysis | `analyze` `diff` `checksum` [offline] |
+| Knowledge base | `search` `chip-info` `post-decode` `voltage-reference` [offline]; `failure-search` [n/w] |
+| Serial | `serial-list` [offline]; `serial` connect [n/w] |
+| Repair | `full-repair` [live], `full-backup` [live], `repl` [live] |
+| Self-test | `self-test` (also `--self-test` flag) [offline, mock] |
+| I2C | `i2c scan/read/write` [live], `i2c sniff` [offline], `eeprom-i2c read/write` [live] |
+| JTAG | `jtag idcode-scan` [live, CH347], `jtag bsdl-scan` [offline] |
+| Instruments | `la export` [offline]; `la capture` [n/w] |
+| Not wired yet | `uart open/sniff`, `onewire scan/temp`, `swd connect/halt/resume/step/dump`, `avr signature/program/fuses/erase`, `eeprom-microwire read/write`, `esp detect/flash`, `stm32 swd-flash/uart-flash`, `buspirate bridge/probe`, `can sniff/send` [n/w] |
 
 Every inspection command supports `--json` for AgentEnvelope output:
 `{ok, command, data?|error, nextAction?}`. Long-running commands also accept
@@ -168,10 +173,10 @@ ratchet read backup.bin --ndjson
 
 ## Agent Interface (MCP)
 
-ratchet ships a built-in **MCP server** (`ratchet-mcp`) so AI agents (Claude Desktop, mcp-cli, custom SDK clients) can connect to the tool surface over stdio. Hand-rolled JSON-RPC 2.0. **30 tools total**: 18 SPI-flash / BIOS analysis tools + 12 multi-protocol hardware tools. All tool handlers currently run against the mock backend (see [Status](#status)); the JSON-RPC dispatch, schema descriptors, and argument shapes are real.
+ratchet ships a built-in **MCP server** (`ratchet-mcp`) so AI agents (Claude Desktop, mcp-cli, custom SDK clients) can connect to the tool surface over stdio. Hand-rolled JSON-RPC 2.0. **30 tools total**: 18 SPI-flash / BIOS analysis tools + 12 hardware-protocol tools. The SPI-flash/BIOS tools and `i2c_scan` / `i2c_read` / `i2c_write` / `jtag_idcode_scan` run against the live backend (or an honest JSON-RPC error when no device is present); the remaining hardware tools return an honest JSON-RPC error until their transport is wired (they never return a fake success). The JSON-RPC dispatch, schema descriptors, and argument shapes are real.
 
 ```bash
-ratchet-mcp                              # start the server (stdio, mock backend today)
+ratchet-mcp                              # start the server (stdio; live backend, mock fallback)
 ratchet-mcp --list-tools                 # dump tool surface (one name per line)
 ```
 
@@ -197,13 +202,13 @@ Register with Claude Desktop (`~/Library/Application Support/Claude/claude_deskt
 | `analyze_image` / `bios_regions` / `nvram_vars` | BIOS image inspection |
 | `search_chips` / `chip_info` | 806-chip database |
 | `post_decode` / `failure_search` / `voltage_reference` | Diagnostics knowledge base |
-| `i2c_scan` / `i2c_read` / `i2c_write` | I2C bus ops |
-| `uart_capture` | Two-channel UART sniff |
-| `jtag_idcode_scan` | JTAG chain forensics |
-| `swd_dump_ram` | ARM RAM dump over SWD |
-| `avr_program` / `esp_flash` / `stm32_swd_flash` | Target-MCU programmers |
-| `la_capture` | Multi-channel logic analyzer |
-| `bus_pirate_proxy` / `can_sniff` | External-device bridges |
+| `i2c_scan` / `i2c_read` / `i2c_write` | I2C bus ops (live) |
+| `jtag_idcode_scan` | JTAG chain forensics (live, CH347) |
+| `uart_capture` | Two-channel UART sniff (not wired; honest error) |
+| `swd_dump_ram` | ARM RAM dump over SWD (not wired; honest error) |
+| `avr_program` / `esp_flash` / `stm32_swd_flash` | Target-MCU programmers (not wired; honest error) |
+| `la_capture` | Multi-channel logic analyzer (not wired; honest error) |
+| `bus_pirate_proxy` / `can_sniff` | External-device bridges (not wired; honest error) |
 
 ## Safety Features
 
@@ -265,7 +270,7 @@ Winbond, Macronix, GigaDevice, SST / Microchip, EON, Spansion / Cypress / Infine
 
 ## History
 
-This repo started life as `biosMCP`, a CH341A-focused BIOS chip programmer that replaced AsProgrammer / NeoProgrammer. The TypeScript prototype was fully replaced by a native Rust workspace in goal 004 (the `ts-final` git tag preserves the prior state). Goal 005 expanded the scope from SPI-flash-only into the multi-protocol hardware toolkit; goal 006 rebranded the project to `ratchet` to reflect the broader surface; goal 007 audited the full capability matrix; goal 008 added the LICENSE file and reconciled README claims with reality.
+This repo started life as `biosMCP`, a CH341A-focused BIOS chip programmer that replaced AsProgrammer / NeoProgrammer. The TypeScript prototype was fully replaced by a native Rust workspace in goal 004 (the `ts-final` git tag preserves the prior state). Goal 005 expanded the scope from SPI-flash-only into the multi-protocol hardware toolkit; goal 006 rebranded the project to `ratchet` to reflect the broader surface; goal 007 audited the full capability matrix; goal 008 added the LICENSE file and reconciled README claims with reality; goal 014 wired the genuinely-wireable protocol verbs (I2C, I2C EEPROM, JTAG IDCODE, plus offline trace/BSDL/capture tools and a working REPL) to live hardware, replaced every remaining fake-success stub with an honest non-zero failure, and tightened the read/repair/scan hot paths.
 
 ## License
 
