@@ -6,7 +6,7 @@
 // wiring lands; the dispatch surface, JSON-schema descriptors, and arg shapes
 // are real today.
 
-use ratchet_core::backends::{open_default, Backend};
+use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::OnceLock;
@@ -422,19 +422,32 @@ fn tool_call(params: &Value) -> Result<Value, (i32, String)> {
         "post_decode" => call_post_decode(&args)?,
         "failure_search" => call_failure_search(&args)?,
         "voltage_reference" => call_voltage_reference(&args)?,
-        // D28 hardware-capability tools (stubs until live USB wiring lands).
-        "i2c_scan" => call_hw_stub("i2c_scan"),
-        "i2c_read" => call_hw_stub("i2c_read"),
-        "i2c_write" => call_hw_stub("i2c_write"),
-        "uart_capture" => call_hw_stub("uart_capture"),
-        "jtag_idcode_scan" => call_hw_stub("jtag_idcode_scan"),
-        "swd_dump_ram" => call_hw_stub("swd_dump_ram"),
-        "avr_program" => call_hw_stub("avr_program"),
-        "esp_flash" => call_hw_stub("esp_flash"),
-        "stm32_swd_flash" => call_hw_stub("stm32_swd_flash"),
-        "la_capture" => call_hw_stub("la_capture"),
-        "bus_pirate_proxy" => call_hw_stub("bus_pirate_proxy"),
-        "can_sniff" => call_hw_stub("can_sniff"),
+        // Hardware-protocol tools. i2c_* and jtag_idcode_scan run the real
+        // protocol over a live CH341A/CH347 (honest error when none present);
+        // the rest fail honestly until their transport adapter is wired.
+        "i2c_scan" => call_i2c_scan()?,
+        "i2c_read" => call_i2c_read(&args)?,
+        "i2c_write" => call_i2c_write(&args)?,
+        "jtag_idcode_scan" => call_jtag_idcode_scan(&args)?,
+        "uart_capture" => hw_unavailable_mcp(
+            "uart_capture",
+            "live capture needs a sampler backend (none wired)",
+        )?,
+        "swd_dump_ram" => {
+            hw_unavailable_mcp("swd_dump_ram", "SWD needs a SWDIO/SWCLK bit-bang adapter")?
+        }
+        "avr_program" => hw_unavailable_mcp("avr_program", "AVR ISP needs a SPI+RESET adapter")?,
+        "esp_flash" => hw_unavailable_mcp("esp_flash", "esptool protocol needs a live UART")?,
+        "stm32_swd_flash" => hw_unavailable_mcp("stm32_swd_flash", "needs a live SWD transport")?,
+        "la_capture" => hw_unavailable_mcp("la_capture", "live sampling needs a sampler backend")?,
+        "bus_pirate_proxy" => hw_unavailable_mcp(
+            "bus_pirate_proxy",
+            "needs an external USB-CDC serial transport",
+        )?,
+        "can_sniff" => hw_unavailable_mcp(
+            "can_sniff",
+            "slcan needs an external USBtin/CANable adapter",
+        )?,
         other => return Err((-32601, format!("Unknown tool: {other}"))),
     };
     Ok(json!({
@@ -460,15 +473,124 @@ fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-// ─── Hardware-capability stub (D28) ─────────────────────────────────────────
+// ─── Hardware-protocol tools ────────────────────────────────────────────────
 
-fn call_hw_stub(name: &str) -> Value {
-    json!({
-        "ok": true,
-        "stub": true,
-        "tool": name,
-        "note": "registered; live USB wiring lands in a follow-up goal"
-    })
+/// Honest failure for a tool whose protocol logic exists and is unit-tested,
+/// but which has no live CH341A/CH347 transport wired yet. Returns a JSON-RPC
+/// error so the client sees a failure, never a fake success.
+fn hw_unavailable_mcp(tool: &str, reason: &str) -> Result<Value, (i32, String)> {
+    Err((
+        -32000,
+        format!(
+            "{tool}: not available: {reason}. The protocol is implemented and unit-tested, \
+             but no live CH341A/CH347 transport is wired for it yet"
+        ),
+    ))
+}
+
+/// Run an I2C action against whichever live backend is present (mirrors the
+/// CLI's `run_i2c`): both real masters run behind a `&mut dyn I2cMaster`.
+fn run_i2c_mcp<R>(
+    f: impl FnOnce(
+        &mut dyn ratchet_core::protocols::i2c::I2cMaster,
+    ) -> ratchet_core::backends::Result<R>,
+) -> Result<R, (i32, String)> {
+    use ratchet_core::protocols::i2c::{Ch341aI2c, Ch347I2c};
+    let raw = open_raw_bus().map_err(map_err)?;
+    let mut bus = raw.bus;
+    let out = match raw.kind {
+        BackendKind::Ch347 => {
+            let mut m = Ch347I2c::new(&mut bus);
+            f(&mut m)
+        }
+        BackendKind::Ch341a => {
+            let mut m = Ch341aI2c::new(&mut bus).map_err(map_err)?;
+            f(&mut m)
+        }
+        BackendKind::Mock => unreachable!("open_raw_bus never yields Mock"),
+    };
+    out.map_err(map_err)
+}
+
+fn call_i2c_scan() -> Result<Value, (i32, String)> {
+    let addrs = run_i2c_mcp(|m| m.scan_bus())?;
+    let hex: Vec<String> = addrs.iter().map(|a| format!("0x{a:02x}")).collect();
+    Ok(json!({ "addresses": hex, "count": addrs.len() }))
+}
+
+fn call_i2c_read(args: &Value) -> Result<Value, (i32, String)> {
+    let addr = arg_u64(args, "addr")? as u8;
+    let reg = arg_u64(args, "reg")? as u8;
+    let len = arg_u64(args, "len")? as usize;
+    let data = run_i2c_mcp(|m| m.write_then_read(addr, &[reg], len))?;
+    let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(json!({ "addr": format!("0x{addr:02x}"), "reg": format!("0x{reg:02x}"), "data": hex }))
+}
+
+fn call_i2c_write(args: &Value) -> Result<Value, (i32, String)> {
+    let addr = arg_u64(args, "addr")? as u8;
+    let data_hex = arg_str(args, "data_hex")?;
+    let bytes = decode_hex(&data_hex)?;
+    let n = bytes.len();
+    run_i2c_mcp(|m| m.write(addr, &bytes))?;
+    Ok(json!({ "addr": format!("0x{addr:02x}"), "bytes_written": n }))
+}
+
+fn call_jtag_idcode_scan(args: &Value) -> Result<Value, (i32, String)> {
+    use ratchet_core::protocols::jtag::{scan_idcode_chain, Ch347Jtag};
+    let max_devices = args
+        .get("max_devices")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8) as usize;
+    let raw = open_raw_bus().map_err(map_err)?;
+    if raw.kind != BackendKind::Ch347 {
+        return Err((
+            -32000,
+            format!(
+                "jtag_idcode_scan requires a CH347 (detected {}; CH341A has no JTAG engine)",
+                raw.kind.as_str()
+            ),
+        ));
+    }
+    let mut bus = raw.bus;
+    let mut jtag = Ch347Jtag::new(&mut bus);
+    let chain = scan_idcode_chain(&mut jtag, max_devices).map_err(map_err)?;
+    let entries: Vec<Value> = chain
+        .entries
+        .iter()
+        .map(|e| {
+            json!({
+                "idcode": format!("0x{:08x}", e.idcode),
+                "manufacturer": format!("0x{:03x}", e.manufacturer),
+                "part": format!("0x{:04x}", e.part),
+                "version": e.version,
+            })
+        })
+        .collect();
+    Ok(json!({ "devices": entries.len(), "chain": entries }))
+}
+
+/// Decode a hex string ("dead beef", "0xde,0xad") into bytes for tool args.
+fn decode_hex(s: &str) -> Result<Vec<u8>, (i32, String)> {
+    let cleaned: String = s
+        .replace("0x", "")
+        .replace("0X", "")
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+    if cleaned.len() % 2 != 0 {
+        return Err((
+            -32602,
+            "data_hex must have an even number of hex digits".into(),
+        ));
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&cleaned[i..i + 2], 16)
+                .map_err(|e| (-32602, format!("invalid hex byte: {e}")))
+        })
+        .collect()
 }
 
 // ─── Mock-backed tool impls ──────────────────────────────────────────────────
