@@ -218,11 +218,20 @@ impl<B: UsbBus> CH341ABackend<B> {
         let bus = self.bus.as_mut().ok_or(BackendError::NotConnected)?;
         bus.bulk_write(&cs_assert_packet())?;
         let mut rx = Vec::with_capacity(cmd.len());
-        for packet in spi_stream_chunks(cmd) {
-            let chunk_data_len = packet.len() - 1;
+        // Chunk inline with a single reused packet buffer: only the payload bytes
+        // change per chunk, so we avoid building a fresh Vec<Vec<u8>> of sub-packets.
+        let max_payload = MAX_XFER - 1; // 31 SPI bytes per USB packet
+        let mut packet: Vec<u8> = Vec::with_capacity(max_payload + 1);
+        let mut offset = 0;
+        while offset < cmd.len() {
+            let chunk_len = (cmd.len() - offset).min(max_payload);
+            packet.clear();
+            packet.push(CMD_SPI_STREAM);
+            packet.extend_from_slice(&cmd[offset..offset + chunk_len]);
             bus.bulk_write(&packet)?;
-            let r = bus.bulk_read(chunk_data_len)?;
+            let r = bus.bulk_read(chunk_len)?;
             rx.extend_from_slice(&r);
+            offset += chunk_len;
         }
         bus.bulk_write(&cs_deassert_packet())?;
         Ok(rx)
@@ -339,7 +348,7 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
             block_size_64kb: true,
             supports_4byte_addr: false,
             fast_read_supported: true,
-            raw_header: hdr.iter().map(|b| format!("{:02x}", b)).collect(),
+            raw_header: hex_encode(hdr),
         }))
     }
     fn read_chip(&mut self, output_path: &Path) -> Result<ReadResult> {
@@ -351,21 +360,26 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         }
         let mut buf = Vec::with_capacity(size);
         let chunk_size = 1024;
+        let addr_len = if self.use_4byte_addr { 4 } else { 3 };
+        let data_start = 1 + addr_len;
+        // Reused command buffer: only the opcode + address header changes per chunk,
+        // so we rewrite the header in place instead of allocating ~1KB per chunk.
+        let mut cmd: Vec<u8> = Vec::with_capacity(data_start + chunk_size);
         let mut addr: u64 = 0;
         while (addr as usize) < size {
             let n = chunk_size.min(size - addr as usize);
-            let mut cmd = vec![SPI_READ];
+            cmd.clear();
+            cmd.push(SPI_READ);
             cmd.extend(address_bytes(addr, self.use_4byte_addr));
-            cmd.extend(std::iter::repeat_n(0u8, n));
+            cmd.resize(data_start + n, 0u8);
             let rx = self.spi_command(&cmd)?;
-            let data_start = 1 + if self.use_4byte_addr { 4 } else { 3 };
             buf.extend_from_slice(&rx[data_start..data_start + n]);
             addr += n as u64;
         }
         std::fs::write(output_path, &buf)?;
         let mut h = Sha256::new();
         h.update(&buf);
-        let checksum: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+        let checksum: String = hex_encode(&h.finalize());
         let all_ff = buf.iter().all(|&b| b == 0xff);
         let all_zero = buf.iter().all(|&b| b == 0x00);
         Ok(ReadResult {

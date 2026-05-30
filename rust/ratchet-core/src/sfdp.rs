@@ -197,13 +197,16 @@ pub fn parse_basic_flash_params(buf: &[u8]) -> Option<SfdpBasicFlashParams> {
         }
     }
 
-    let mut sorted_erase = erase_types.clone();
-    sorted_erase.sort_by_key(|e| e.size_bytes);
-    let sector_size = sorted_erase
-        .first()
+    let sector_size = erase_types
+        .iter()
         .map(|e| e.size_bytes)
+        .min()
         .unwrap_or(if erase_size_4kb { 4096 } else { 65536 });
-    let block_size = sorted_erase.last().map(|e| e.size_bytes).unwrap_or(65536);
+    let block_size = erase_types
+        .iter()
+        .map(|e| e.size_bytes)
+        .max()
+        .unwrap_or(65536);
 
     let needs_4byte_addr = density_bytes > 16 * 1024 * 1024;
 

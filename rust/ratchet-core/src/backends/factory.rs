@@ -18,6 +18,7 @@ use crate::backends::{
     Backend,
 };
 use ratchet_usb::Context;
+use std::fmt;
 
 // CH341A constants matching the existing backend module. EPs aren't re-exported
 // from ch341a so we declare them here; values must stay in lockstep with
@@ -108,6 +109,93 @@ pub fn open_default() -> OpenResult {
     }
 }
 
+/// A live USB bus for protocol drivers (I2C / JTAG / UART), plus the chip it is.
+///
+/// `open_default` wraps the bus inside the SPI-flash `Backend` and hides it.
+/// Protocol drivers (`Ch341aI2c`, `Ch347I2c`, the JTAG adapter, …) need the raw
+/// bus instead: `LibusbBus` implements both `ch341a::UsbBus` and `ch347::Transport`,
+/// so the caller selects the right driver from `kind`.
+pub struct RawBus {
+    pub bus: LibusbBus,
+    /// `Ch341a` or `Ch347` — never `Mock` (the mock only models SPI flash).
+    pub kind: BackendKind,
+}
+
+/// Why a live protocol bus could not be opened. Every variant is an honest,
+/// caller-surfaceable reason — protocol verbs must fail loudly rather than
+/// pretend success when no real device is present.
+#[derive(Debug)]
+pub enum RawBusError {
+    /// `RATCHET_FORCE_MOCK` is set — there is no live bus to hand out, and the
+    /// mock backend models only SPI flash (no I2C/JTAG/UART transport).
+    ForcedMock,
+    /// libusb failed to initialize.
+    LibusbInit(String),
+    /// A device was detected but its interface could not be claimed.
+    ClaimFailed(String),
+    /// No CH341A or CH347 device detected.
+    NoDevice,
+}
+
+impl fmt::Display for RawBusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RawBusError::ForcedMock => write!(
+                f,
+                "RATCHET_FORCE_MOCK is set: protocol commands need real hardware \
+                 (the mock backend models SPI flash only)"
+            ),
+            RawBusError::LibusbInit(e) => write!(f, "libusb init failed: {e}"),
+            RawBusError::ClaimFailed(e) => write!(f, "device interface claim failed: {e}"),
+            RawBusError::NoDevice => write!(
+                f,
+                "no CH341A or CH347 USB device detected; plug in a programmer to use \
+                 protocol commands"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RawBusError {}
+
+/// Open the live USB bus that protocol drivers (I2C, JTAG, UART) require.
+///
+/// Selection mirrors [`open_default`] (CH347 preferred over CH341A) but returns
+/// the raw [`LibusbBus`] instead of the SPI-flash `Backend` wrapper. Returns an
+/// honest [`RawBusError`] when no usable device is present — protocol verbs
+/// cannot run against the mock backend, so this never silently falls back.
+pub fn open_raw_bus() -> std::result::Result<RawBus, RawBusError> {
+    if force_mock_env_set() {
+        return Err(RawBusError::ForcedMock);
+    }
+
+    let ctx = Context::new().map_err(|e| RawBusError::LibusbInit(e.to_string()))?;
+
+    if let Ok(handle) = ctx.find_by_ids(CH347_VID, CH347_PID) {
+        handle.claim_interface(CH347_SPI_INTERFACE).map_err(|e| {
+            RawBusError::ClaimFailed(format!("CH347 interface {CH347_SPI_INTERFACE}: {e}"))
+        })?;
+        let bus = LibusbBus::new(handle, CH347_EP_IN, CH347_EP_OUT);
+        return Ok(RawBus {
+            bus,
+            kind: BackendKind::Ch347,
+        });
+    }
+
+    if let Ok(handle) = ctx.find_by_ids(CH341A_VID, CH341A_PID) {
+        handle.claim_interface(CH341A_INTERFACE).map_err(|e| {
+            RawBusError::ClaimFailed(format!("CH341A interface {CH341A_INTERFACE}: {e}"))
+        })?;
+        let bus = LibusbBus::new(handle, CH341A_EP_IN, CH341A_EP_OUT);
+        return Ok(RawBus {
+            bus,
+            kind: BackendKind::Ch341a,
+        });
+    }
+
+    Err(RawBusError::NoDevice)
+}
+
 fn try_open_ch347(ctx: &Context) -> Option<OpenResult> {
     let handle = ctx.find_by_ids(CH347_VID, CH347_PID).ok()?;
     if let Err(e) = handle.claim_interface(CH347_SPI_INTERFACE) {
@@ -175,6 +263,39 @@ mod tests {
         assert_eq!(BackendKind::Mock.as_str(), "mock");
         assert_eq!(BackendKind::Ch341a.as_str(), "ch341a");
         assert_eq!(BackendKind::Ch347.as_str(), "ch347");
+    }
+
+    #[test]
+    fn open_raw_bus_forced_mock_errors_honestly() {
+        // Protocol verbs must NOT silently fall back to mock — force-mock yields
+        // an explicit error the caller surfaces, never a fake success.
+        let prev = std::env::var(FORCE_MOCK_ENV).ok();
+        std::env::set_var(FORCE_MOCK_ENV, "1");
+        let r = open_raw_bus();
+        assert!(matches!(r, Err(RawBusError::ForcedMock)));
+        match prev {
+            Some(v) => std::env::set_var(FORCE_MOCK_ENV, v),
+            None => std::env::remove_var(FORCE_MOCK_ENV),
+        }
+    }
+
+    #[test]
+    fn raw_bus_error_messages_are_honest() {
+        // No "stub"/"ok"/"registered" language — these are real failure reasons.
+        for e in [
+            RawBusError::ForcedMock,
+            RawBusError::NoDevice,
+            RawBusError::LibusbInit("x".into()),
+            RawBusError::ClaimFailed("y".into()),
+        ] {
+            let msg = e.to_string();
+            assert!(!msg.is_empty());
+            assert!(!msg.contains("stub"));
+            assert!(!msg.contains("registered"));
+        }
+        assert!(RawBusError::NoDevice
+            .to_string()
+            .contains("no CH341A or CH347"));
     }
 
     #[test]

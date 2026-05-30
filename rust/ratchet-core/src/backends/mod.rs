@@ -9,7 +9,7 @@ pub mod factory;
 pub mod libusb_bus;
 pub mod mock;
 
-pub use factory::{open_default, BackendKind, OpenResult};
+pub use factory::{open_default, open_raw_bus, BackendKind, OpenResult, RawBus, RawBusError};
 
 use crate::types::*;
 use std::path::Path;

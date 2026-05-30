@@ -36,7 +36,7 @@ pub struct CaptureConfig {
     pub trigger: Trigger,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct CaptureFrame {
     /// One byte per sample; bit i = level on channel i.
     pub samples: Vec<u8>,

@@ -6,7 +6,9 @@
 // both satisfy the trait  -  CH341A via raw bit-bang packets, CH347 via the
 // native JTAG-bit-bang command (0xD1) exposed in `hw::ch347_raw`.
 
+use crate::backends::ch347::Transport;
 use crate::backends::Result;
+use crate::hw::ch347_raw::Ch347Raw;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TapState {
@@ -114,6 +116,40 @@ pub trait JtagTransport {
             out.push(self.pulse(*tms, *tdi)?);
         }
         Ok(out)
+    }
+}
+
+/// Live JTAG transport over a CH347's native JTAG bit-bang engine (command
+/// 0xD1, exposed by `hw::ch347_raw::Ch347Raw::jtag_pulses`). Batches every
+/// TCK cycle into one USB transfer via the overridden `pulses`, so a full
+/// IDCODE scan is a handful of transfers rather than one per clock.
+///
+/// CH341A has no JTAG engine — there is no `Ch341aJtag`; the CLI reports that
+/// honestly rather than pretending.
+pub struct Ch347Jtag<'t, T: Transport> {
+    raw: Ch347Raw<'t, T>,
+}
+
+impl<'t, T: Transport> Ch347Jtag<'t, T> {
+    pub fn new(transport: &'t mut T) -> Self {
+        Self {
+            raw: Ch347Raw::new(transport),
+        }
+    }
+}
+
+impl<T: Transport> JtagTransport for Ch347Jtag<'_, T> {
+    fn pulse(&mut self, tms: bool, tdi: bool) -> Result<bool> {
+        Ok(self
+            .raw
+            .jtag_pulses(&[(tms, tdi)])?
+            .first()
+            .copied()
+            .unwrap_or(false))
+    }
+
+    fn pulses(&mut self, ops: &[(bool, bool)]) -> Result<Vec<bool>> {
+        self.raw.jtag_pulses(ops)
     }
 }
 
@@ -252,6 +288,19 @@ impl JtagTransport for JtagMockTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ch347_jtag_adapter_passthrough() {
+        // The adapter is a thin bridge to Ch347Raw::jtag_pulses; verify it
+        // satisfies JtagTransport and round-trips an empty batch deterministically.
+        use crate::backends::ch347::CapturingTransport;
+        let mut t = CapturingTransport::default();
+        let mut jtag = Ch347Jtag::new(&mut t);
+        let tdo = jtag.pulses(&[]).expect("empty batch ok");
+        assert!(tdo.is_empty());
+        fn _assert_is_transport<J: JtagTransport>(_: &J) {}
+        _assert_is_transport(&jtag);
+    }
 
     #[test]
     fn state_machine_transitions() {

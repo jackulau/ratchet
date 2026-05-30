@@ -4,7 +4,7 @@
 
 use clap::{Parser, Subcommand};
 use ratchet_core::agent::envelope::AgentEnvelope;
-use ratchet_core::backends::{open_default, Backend, BackendKind};
+use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind, RawBus};
 use serde_json::json;
 use std::sync::OnceLock;
 
@@ -595,125 +595,435 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ─── Hardware-capability command handlers (D27) ───────────────────────────
+// ─── Hardware-capability command handlers ──────────────────────────────────
 //
-// These print a structured "not yet wired to live hardware" envelope and
-// exit 0 so smoke tests can verify the CLI surface without real devices.
-// Real-hardware integration follows in D28 + future goals.
+// Verbs whose protocol logic exists and is unit-tested against a mock, but
+// which have no live CH341A/CH347 transport wired yet, fail HONESTLY: they exit
+// non-zero with an accurate reason. They never print a fake success; a command
+// that cannot perform its action must not claim it did.
 
-fn hw_stub(verb: &str, action: &str, json: bool) -> anyhow::Result<()> {
-    let env = AgentEnvelope::<serde_json::Value>::ok(
-        format!("{verb} {action}"),
-        json!({
-            "stub": true,
-            "note": "hardware capability registered; live-hardware wiring follows in subsequent goals",
-        }),
-    );
-    if json {
-        println!("{}", serde_json::to_string(&env)?);
-    } else {
-        println!(
-            "{verb} {action}: registered (stub  -  live hardware path lands in a follow-up goal)"
-        );
-    }
-    Ok(())
+fn hw_unavailable(verb: &str, action: &str, reason: &str) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "{verb} {action}: not available: {reason}. \
+         The protocol is implemented and unit-tested, but no live CH341A/CH347 \
+         transport is wired for it yet"
+    )
+}
+
+/// Run an I2C action against whichever live backend is present. The two real
+/// masters (`Ch341aI2c` over `UsbBus`, `Ch347I2c` over the CH347 transport) are
+/// different generic types, so the action runs against a `&mut dyn I2cMaster`
+/// trait object to avoid duplicating the per-action logic per backend.
+fn run_i2c<R>(
+    raw: RawBus,
+    f: impl FnOnce(
+        &mut dyn ratchet_core::protocols::i2c::I2cMaster,
+    ) -> ratchet_core::backends::Result<R>,
+) -> anyhow::Result<R> {
+    use ratchet_core::protocols::i2c::{Ch341aI2c, Ch347I2c};
+    let mut bus = raw.bus;
+    let out = match raw.kind {
+        BackendKind::Ch347 => {
+            let mut m = Ch347I2c::new(&mut bus);
+            f(&mut m)
+        }
+        BackendKind::Ch341a => {
+            let mut m = Ch341aI2c::new(&mut bus)?;
+            f(&mut m)
+        }
+        BackendKind::Mock => unreachable!("open_raw_bus never yields Mock"),
+    };
+    Ok(out?)
 }
 
 fn cmd_i2c(c: I2cCmd) -> anyhow::Result<()> {
     match c {
-        I2cCmd::Scan { json } => hw_stub("i2c", "scan", json),
-        I2cCmd::Read { json, .. } => hw_stub("i2c", "read", json),
-        I2cCmd::Write { json, .. } => hw_stub("i2c", "write", json),
-        I2cCmd::Sniff { json, .. } => hw_stub("i2c", "sniff", json),
+        I2cCmd::Scan { json } => {
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let addrs = run_i2c(raw, |m| m.scan_bus())?;
+            let hex: Vec<String> = addrs.iter().map(|a| format!("0x{a:02x}")).collect();
+            let env = AgentEnvelope::ok(
+                "i2c scan",
+                json!({ "addresses": hex, "count": addrs.len() }),
+            );
+            emit_envelope(&env, json, || {
+                if addrs.is_empty() {
+                    println!("i2c scan: no devices responded");
+                } else {
+                    println!("i2c devices: {}", hex.join(" "));
+                }
+            })
+        }
+        I2cCmd::Read {
+            addr,
+            reg,
+            len,
+            json,
+        } => {
+            let addr7 = parse_addr(&addr)? as u8;
+            let reg_b = parse_addr(&reg)? as u8;
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let data = run_i2c(raw, |m| m.write_then_read(addr7, &[reg_b], len as usize))?;
+            let hex: Vec<String> = data.iter().map(|b| format!("{b:02x}")).collect();
+            let env = AgentEnvelope::ok(
+                "i2c read",
+                json!({ "addr": format!("0x{addr7:02x}"), "reg": format!("0x{reg_b:02x}"), "data": hex.join("") }),
+            );
+            emit_envelope(&env, json, || println!("{}", hex.join(" ")))
+        }
+        I2cCmd::Write { addr, data, json } => {
+            let addr7 = parse_addr(&addr)? as u8;
+            let bytes = parse_hex_bytes(&data)?;
+            let n = bytes.len();
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            run_i2c(raw, |m| m.write(addr7, &bytes))?;
+            let env = AgentEnvelope::ok(
+                "i2c write",
+                json!({ "addr": format!("0x{addr7:02x}"), "bytes_written": n }),
+            );
+            emit_envelope(&env, json, || {
+                println!("i2c write: {n} byte(s) → 0x{addr7:02x}")
+            })
+        }
+        I2cCmd::Sniff { input, json } => {
+            // Offline decode of a captured (t_us, scl, sda) trace; no hardware.
+            let raw_json = std::fs::read_to_string(&input)
+                .map_err(|e| anyhow::anyhow!("read trace {input}: {e}"))?;
+            let samples: Vec<ratchet_core::protocols::i2c::LineSample> =
+                serde_json::from_str(&raw_json)
+                    .map_err(|e| anyhow::anyhow!("parse trace {input}: {e}"))?;
+            let events = ratchet_core::protocols::i2c::decode_trace(&samples);
+            let env = AgentEnvelope::ok(
+                "i2c sniff",
+                json!({ "samples": samples.len(), "events": events }),
+            );
+            emit_envelope(&env, json, || {
+                println!(
+                    "i2c sniff: {} event(s) from {} samples",
+                    events.len(),
+                    samples.len()
+                )
+            })
+        }
     }
 }
 
 fn cmd_uart(c: UartCmd) -> anyhow::Result<()> {
     match c {
-        UartCmd::Open { .. } => hw_stub("uart", "open", false),
-        UartCmd::Sniff { .. } => hw_stub("uart", "sniff", false),
+        UartCmd::Open { .. } => hw_unavailable(
+            "uart",
+            "open",
+            "the CH347 native UART path is incomplete and CH341A is bit-bang TX-only",
+        ),
+        UartCmd::Sniff { .. } => hw_unavailable(
+            "uart",
+            "sniff",
+            "live capture needs a sampler backend (none wired); the decoder is reachable only via library APIs",
+        ),
     }
 }
 
 fn cmd_onewire(c: OnewireCmd) -> anyhow::Result<()> {
     match c {
-        OnewireCmd::Scan { json } => hw_stub("onewire", "scan", json),
-        OnewireCmd::Temp { json } => hw_stub("onewire", "temp", json),
+        OnewireCmd::Scan { .. } => hw_unavailable(
+            "onewire",
+            "scan",
+            "1-Wire needs a timed pin bit-bang adapter",
+        ),
+        OnewireCmd::Temp { .. } => hw_unavailable(
+            "onewire",
+            "temp",
+            "1-Wire needs a timed pin bit-bang adapter",
+        ),
     }
 }
 
 fn cmd_jtag(c: JtagCmd) -> anyhow::Result<()> {
     match c {
-        JtagCmd::IdcodeScan { json, .. } => hw_stub("jtag", "idcode-scan", json),
-        JtagCmd::BsdlScan { json, .. } => hw_stub("jtag", "bsdl-scan", json),
+        JtagCmd::IdcodeScan { max_devices, json } => {
+            use ratchet_core::protocols::jtag::{scan_idcode_chain, Ch347Jtag};
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Only the CH347 has a JTAG engine; CH341A cannot drive JTAG.
+            if raw.kind != BackendKind::Ch347 {
+                anyhow::bail!(
+                    "jtag idcode-scan requires a CH347 (detected {}; CH341A has no JTAG engine)",
+                    raw.kind.as_str()
+                );
+            }
+            let mut bus = raw.bus;
+            let mut jtag = Ch347Jtag::new(&mut bus);
+            let chain = scan_idcode_chain(&mut jtag, max_devices)?;
+            let entries: Vec<_> = chain
+                .entries
+                .iter()
+                .map(|e| {
+                    json!({
+                        "idcode": format!("0x{:08x}", e.idcode),
+                        "manufacturer": format!("0x{:03x}", e.manufacturer),
+                        "part": format!("0x{:04x}", e.part),
+                        "version": e.version,
+                    })
+                })
+                .collect();
+            let env = AgentEnvelope::ok(
+                "jtag idcode-scan",
+                json!({ "devices": entries.len(), "chain": entries }),
+            );
+            emit_envelope(&env, json, || {
+                println!("jtag chain: {} device(s)", chain.entries.len());
+                for e in &chain.entries {
+                    println!(
+                        "  idcode=0x{:08x} mfg=0x{:03x} part=0x{:04x} ver={}",
+                        e.idcode, e.manufacturer, e.part, e.version
+                    );
+                }
+            })
+        }
+        JtagCmd::BsdlScan { bsdl, json } => {
+            // Offline BSDL parse + report. Live EXTEST drive needs a JTAG
+            // transport adapter that is not yet wired; this validates the file
+            // and surfaces its boundary register without claiming a live scan.
+            let text =
+                std::fs::read_to_string(&bsdl).map_err(|e| anyhow::anyhow!("read {bsdl}: {e}"))?;
+            let desc = ratchet_core::debug::boundary_scan::parse_bsdl(&text)
+                .map_err(|e| anyhow::anyhow!("parse BSDL: {e}"))?;
+            let instrs: Vec<&String> = desc.instructions.keys().collect();
+            let env = AgentEnvelope::ok(
+                "jtag bsdl-scan",
+                json!({
+                    "entity": desc.entity,
+                    "boundary_length": desc.boundary_length,
+                    "boundary_cells": desc.boundary.len(),
+                    "instructions": instrs,
+                    "note": "offline BSDL parse; live EXTEST drive not yet wired",
+                }),
+            );
+            emit_envelope(&env, json, || {
+                println!(
+                    "BSDL {}: boundary_length={} cells={} instructions={}",
+                    desc.entity,
+                    desc.boundary_length,
+                    desc.boundary.len(),
+                    desc.instructions.len()
+                );
+            })
+        }
     }
 }
 
 fn cmd_swd(c: SwdCmd) -> anyhow::Result<()> {
     match c {
-        SwdCmd::Connect { json } => hw_stub("swd", "connect", json),
-        SwdCmd::Halt { json } => hw_stub("swd", "halt", json),
-        SwdCmd::Resume { json } => hw_stub("swd", "resume", json),
-        SwdCmd::Step { json } => hw_stub("swd", "step", json),
-        SwdCmd::Dump { .. } => hw_stub("swd", "dump", false),
+        SwdCmd::Connect { .. } => {
+            hw_unavailable("swd", "connect", "SWD needs a SWDIO/SWCLK bit-bang adapter")
+        }
+        SwdCmd::Halt { .. } => {
+            hw_unavailable("swd", "halt", "SWD needs a SWDIO/SWCLK bit-bang adapter")
+        }
+        SwdCmd::Resume { .. } => {
+            hw_unavailable("swd", "resume", "SWD needs a SWDIO/SWCLK bit-bang adapter")
+        }
+        SwdCmd::Step { .. } => {
+            hw_unavailable("swd", "step", "SWD needs a SWDIO/SWCLK bit-bang adapter")
+        }
+        SwdCmd::Dump { .. } => {
+            hw_unavailable("swd", "dump", "SWD needs a SWDIO/SWCLK bit-bang adapter")
+        }
     }
 }
 
 fn cmd_avr(c: AvrCmd) -> anyhow::Result<()> {
     match c {
-        AvrCmd::Signature { json } => hw_stub("avr", "signature", json),
-        AvrCmd::Program { json, .. } => hw_stub("avr", "program", json),
-        AvrCmd::Fuses { json } => hw_stub("avr", "fuses", json),
-        AvrCmd::Erase { json } => hw_stub("avr", "erase", json),
+        AvrCmd::Signature { .. } => {
+            hw_unavailable("avr", "signature", "AVR ISP needs a SPI+RESET adapter")
+        }
+        AvrCmd::Program { .. } => {
+            hw_unavailable("avr", "program", "AVR ISP needs a SPI+RESET adapter")
+        }
+        AvrCmd::Fuses { .. } => hw_unavailable("avr", "fuses", "AVR ISP needs a SPI+RESET adapter"),
+        AvrCmd::Erase { .. } => hw_unavailable("avr", "erase", "AVR ISP needs a SPI+RESET adapter"),
     }
 }
 
+/// Map a 24Cxx part string ("24c256", "24C02", …) to its `EepromSize`.
+fn parse_eeprom_part(s: &str) -> anyhow::Result<ratchet_core::programmers::i2c_eeprom::EepromSize> {
+    use ratchet_core::programmers::i2c_eeprom::EepromSize::*;
+    let k = s.trim().to_ascii_uppercase().replace('-', "");
+    Ok(match k.as_str() {
+        "24C01" => Kbit1,
+        "24C02" => Kbit2,
+        "24C04" => Kbit4,
+        "24C08" => Kbit8,
+        "24C16" => Kbit16,
+        "24C32" => Kbit32,
+        "24C64" => Kbit64,
+        "24C128" => Kbit128,
+        "24C256" => Kbit256,
+        "24C512" => Kbit512,
+        "24C1024" | "24C1025" => Mbit1,
+        _ => anyhow::bail!("unknown 24Cxx part '{s}' (try 24c01 .. 24c1024)"),
+    })
+}
+
 fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
+    use ratchet_core::programmers::i2c_eeprom::I2cEeprom;
     match c {
-        EepromI2cCmd::Read { .. } => hw_stub("eeprom-i2c", "read", false),
-        EepromI2cCmd::Write { .. } => hw_stub("eeprom-i2c", "write", false),
+        EepromI2cCmd::Read { addr, part, output } => {
+            let address = parse_addr(&addr)? as u8;
+            let size = parse_eeprom_part(&part)?;
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let data = run_i2c(raw, |m| {
+                let mut ee = I2cEeprom::new(m, address, size);
+                ee.read(0, size.bytes())
+            })?;
+            std::fs::write(&output, &data).map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
+            let env = AgentEnvelope::ok(
+                "eeprom-i2c read",
+                json!({ "part": size.name(), "addr": format!("0x{address:02x}"), "bytes": data.len(), "output": output }),
+            );
+            emit_envelope(&env, false, || {
+                println!(
+                    "eeprom-i2c read {} bytes ({}) -> {}",
+                    data.len(),
+                    size.name(),
+                    output
+                )
+            })
+        }
+        EepromI2cCmd::Write { addr, part, input } => {
+            let address = parse_addr(&addr)? as u8;
+            let size = parse_eeprom_part(&part)?;
+            let data = std::fs::read(&input).map_err(|e| anyhow::anyhow!("read {input}: {e}"))?;
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let verified = run_i2c(raw, |m| {
+                let mut ee = I2cEeprom::new(m, address, size);
+                ee.write(0, &data)?;
+                ee.verify(0, &data)
+            })?;
+            let env = AgentEnvelope::ok(
+                "eeprom-i2c write",
+                json!({ "part": size.name(), "addr": format!("0x{address:02x}"), "bytes": data.len(), "verified": verified }),
+            );
+            emit_envelope(&env, false, || {
+                println!(
+                    "eeprom-i2c write {} bytes ({}) verified={}",
+                    data.len(),
+                    size.name(),
+                    verified
+                )
+            })
+        }
     }
 }
 
 fn cmd_eeprom_microwire(c: EepromMicrowireCmd) -> anyhow::Result<()> {
     match c {
-        EepromMicrowireCmd::Read { .. } => hw_stub("eeprom-microwire", "read", false),
-        EepromMicrowireCmd::Write { .. } => hw_stub("eeprom-microwire", "write", false),
+        EepromMicrowireCmd::Read { .. } => hw_unavailable(
+            "eeprom-microwire",
+            "read",
+            "93xx Microwire needs a 3-wire bit-bang adapter",
+        ),
+        EepromMicrowireCmd::Write { .. } => hw_unavailable(
+            "eeprom-microwire",
+            "write",
+            "93xx Microwire needs a 3-wire bit-bang adapter",
+        ),
     }
 }
 
 fn cmd_esp(c: EspCmd) -> anyhow::Result<()> {
     match c {
-        EspCmd::Detect { json } => hw_stub("esp", "detect", json),
-        EspCmd::Flash { .. } => hw_stub("esp", "flash", false),
+        EspCmd::Detect { .. } => hw_unavailable(
+            "esp",
+            "detect",
+            "esptool protocol needs a live UART transport",
+        ),
+        EspCmd::Flash { .. } => hw_unavailable(
+            "esp",
+            "flash",
+            "esptool protocol needs a live UART transport",
+        ),
     }
 }
 
 fn cmd_stm32(c: Stm32Cmd) -> anyhow::Result<()> {
     match c {
-        Stm32Cmd::SwdFlash { .. } => hw_stub("stm32", "swd-flash", false),
-        Stm32Cmd::UartFlash { .. } => hw_stub("stm32", "uart-flash", false),
+        Stm32Cmd::SwdFlash { .. } => {
+            hw_unavailable("stm32", "swd-flash", "needs a live SWD transport (see swd)")
+        }
+        Stm32Cmd::UartFlash { .. } => {
+            hw_unavailable("stm32", "uart-flash", "needs a live UART transport")
+        }
     }
 }
 
 fn cmd_la(c: LaCmd) -> anyhow::Result<()> {
     match c {
-        LaCmd::Capture { .. } => hw_stub("la", "capture", false),
-        LaCmd::Export { .. } => hw_stub("la", "export", false),
+        LaCmd::Capture { .. } => hw_unavailable(
+            "la",
+            "capture",
+            "live sampling needs a sampler backend; use 'la export' to convert an existing capture",
+        ),
+        LaCmd::Export {
+            input,
+            output,
+            format,
+        } => {
+            use ratchet_core::instruments::logic_analyzer::CaptureFrame;
+            // Offline format conversion of an existing capture; no hardware.
+            let raw = std::fs::read_to_string(&input)
+                .map_err(|e| anyhow::anyhow!("read capture {input}: {e}"))?;
+            let frame: CaptureFrame = serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("parse capture {input}: {e}"))?;
+            // Channel count: highest bit set across samples (1..=8).
+            let used = frame.samples.iter().fold(0u8, |acc, b| acc | b);
+            let channels = (8 - used.leading_zeros() as u8).max(1);
+            let body = match format.to_ascii_lowercase().as_str() {
+                "csv" => ratchet_core::instruments::export::write_csv(&frame, channels),
+                "jsonl" => ratchet_core::instruments::export::write_jsonl(&frame, channels),
+                other => {
+                    anyhow::bail!("unsupported export format '{other}' (supported: csv, jsonl)")
+                }
+            };
+            std::fs::write(&output, &body).map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
+            println!(
+                "la export: {} sample(s), {} channel(s) -> {} ({})",
+                frame.samples.len(),
+                channels,
+                output,
+                format
+            );
+            Ok(())
+        }
     }
 }
 
 fn cmd_buspirate(c: BpCmd) -> anyhow::Result<()> {
     match c {
-        BpCmd::Bridge { .. } => hw_stub("buspirate", "bridge", false),
-        BpCmd::Probe { .. } => hw_stub("buspirate", "probe", false),
+        BpCmd::Bridge { .. } => hw_unavailable(
+            "buspirate",
+            "bridge",
+            "Bus Pirate is an external USB-CDC device; a serial transport is not wired",
+        ),
+        BpCmd::Probe { .. } => hw_unavailable(
+            "buspirate",
+            "probe",
+            "Bus Pirate is an external USB-CDC device; a serial transport is not wired",
+        ),
     }
 }
 
 fn cmd_can(c: CanCmd) -> anyhow::Result<()> {
     match c {
-        CanCmd::Sniff { .. } => hw_stub("can", "sniff", false),
-        CanCmd::Send { .. } => hw_stub("can", "send", false),
+        CanCmd::Sniff { .. } => hw_unavailable(
+            "can",
+            "sniff",
+            "slcan targets an external USBtin/CANable adapter; a serial transport is not wired",
+        ),
+        CanCmd::Send { .. } => hw_unavailable(
+            "can",
+            "send",
+            "slcan targets an external USBtin/CANable adapter; a serial transport is not wired",
+        ),
     }
 }
 
@@ -875,26 +1185,54 @@ fn cmd_search(query: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_serial(port: &str, baud: u32, json: bool) -> anyhow::Result<()> {
-    let env = AgentEnvelope::ok(
-        "serial",
-        json!({
-            "port": port, "baud": baud,
-            "note": "live serial connect requires the live POSIX/Win32 driver wired in D22+; mock returns config only"
-        }),
-    );
-    emit_envelope(&env, json, || {
-        println!("serial: would connect to {port} @ {baud} baud (live impl pending)");
-    })
+fn cmd_serial(port: &str, _baud: u32, _json: bool) -> anyhow::Result<()> {
+    // No live POSIX/Win32 serial driver is wired; do not pretend to connect.
+    anyhow::bail!(
+        "serial: live connect to {port} not implemented (no serial driver wired); \
+         use 'serial-list' to enumerate ports"
+    )
+}
+
+/// Best-effort serial-port enumeration. POSIX: scans /dev for the usual
+/// USB-serial / tty device names. A real read-only scan, not a stub.
+#[cfg(unix)]
+fn enumerate_serial_ports() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/dev") {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("cu.")
+                || name.starts_with("tty.")
+                || name.starts_with("ttyUSB")
+                || name.starts_with("ttyACM")
+            {
+                out.push(format!("/dev/{name}"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(not(unix))]
+fn enumerate_serial_ports() -> Vec<String> {
+    Vec::new()
 }
 
 fn cmd_serial_list(json: bool) -> anyhow::Result<()> {
+    let ports = enumerate_serial_ports();
     let env = AgentEnvelope::ok(
         "serial-list",
-        json!({"ports": serde_json::Value::Array(vec![])}),
+        json!({ "ports": ports, "count": ports.len() }),
     );
     emit_envelope(&env, json, || {
-        println!("no ports (live enumeration deferred)")
+        if ports.is_empty() {
+            println!("no serial ports found");
+        } else {
+            for p in &ports {
+                println!("{p}");
+            }
+        }
     })
 }
 
@@ -943,15 +1281,11 @@ fn cmd_post_decode(code: &str, standard: Option<&str>, json: bool) -> anyhow::Re
     Ok(())
 }
 
-fn cmd_failure_search(query: &str, json: bool) -> anyhow::Result<()> {
-    let env = AgentEnvelope::ok(
-        "failure-search",
-        json!({
-            "query": query, "results": serde_json::Value::Array(vec![]),
-            "note": "failure-pattern KB ported via include_str! is pending (deferred to follow-up)"
-        }),
-    );
-    emit_envelope(&env, json, || println!("failure-search: KB port deferred"))
+fn cmd_failure_search(_query: &str, _json: bool) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "failure-search: not available: the failure-pattern knowledge base is not bundled in \
+         this build"
+    )
 }
 
 fn cmd_voltage_reference(jedec_id: &str, json: bool) -> anyhow::Result<()> {
@@ -1015,8 +1349,72 @@ fn cmd_blank_check(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_repl() -> anyhow::Result<()> {
+    use ratchet_core::repl::{parse_line, ReplCommand};
+    use std::io::Write as _;
+    use std::path::Path;
+
     println!("ratchet REPL  -  type 'help' or 'quit'");
-    println!("(non-interactive build; live rustyline TTY loop pending)");
+    let mut backend = open_dyn();
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("ratchet> ");
+        std::io::stdout().flush().ok();
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 {
+            break; // EOF (piped input or Ctrl-D)
+        }
+        match parse_line(&line) {
+            ReplCommand::Quit => break,
+            ReplCommand::Help => println!(
+                "commands: identify jedec status read <f> write <f> erase \
+                 sector-erase <addr> reset quit"
+            ),
+            ReplCommand::Identify => match backend.identify_chip() {
+                Ok(Some(c)) => println!("{} ({}) {}", c.name, c.vendor_name, c.size_human),
+                Ok(None) => println!("no chip detected"),
+                Err(e) => println!("error: {e}"),
+            },
+            ReplCommand::Jedec => match backend.read_jedec_id() {
+                Ok(id) => println!("jedec={}", id.to_hex()),
+                Err(e) => println!("error: {e}"),
+            },
+            ReplCommand::Status => match backend.read_status_registers() {
+                Ok(sr) => println!(
+                    "sr1=0x{:02x} sr2=0x{:02x} sr3=0x{:02x}",
+                    sr.sr1, sr.sr2, sr.sr3
+                ),
+                Err(e) => println!("error: {e}"),
+            },
+            ReplCommand::Read { path } => match backend.read_chip(Path::new(&path)) {
+                Ok(r) => println!("read {} bytes -> {}", r.size_bytes, r.file_path),
+                Err(e) => println!("error: {e}"),
+            },
+            ReplCommand::Write { path } => {
+                match backend.write_chip(Path::new(&path), Default::default()) {
+                    Ok(r) => println!("write success={} verified={}", r.success, r.verified),
+                    Err(e) => println!("error: {e}"),
+                }
+            }
+            ReplCommand::Erase => match backend.erase_chip() {
+                Ok(r) => println!("erase success={}", r.success),
+                Err(e) => println!("error: {e}"),
+            },
+            ReplCommand::SectorErase { address } => match backend.sector_erase(address as u64) {
+                Ok(r) => println!("sector-erase success={}", r.success),
+                Err(e) => println!("error: {e}"),
+            },
+            ReplCommand::Reset => match backend.reset_chip() {
+                Ok(()) => println!("reset ok"),
+                Err(e) => println!("error: {e}"),
+            },
+            ReplCommand::Macro { .. } | ReplCommand::Plugin { .. } => {
+                println!("macros/plugins are not available in this REPL")
+            }
+            ReplCommand::Unknown(s) if s.trim().is_empty() => {}
+            ReplCommand::Unknown(s) => println!("unknown command: {s} (type 'help')"),
+        }
+    }
     Ok(())
 }
 
@@ -1082,26 +1480,31 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
 }
 
 fn cmd_full_backup(json: bool) -> anyhow::Result<()> {
+    // A full backup is a full-chip read to a descriptively named file, using
+    // the same wired SPI backend as `read`. (open_dyn warns on stderr when no
+    // device is present and it falls back to mock.)
+    let mut m = open_dyn();
+    let chip = m.identify_chip().ok().flatten();
+    let label = chip
+        .as_ref()
+        .map(|c| c.name.replace([' ', '/'], "_"))
+        .unwrap_or_else(|| "chip".to_string());
+    let path = format!("ratchet-backup-{label}.bin");
+    let r = m.read_chip(std::path::Path::new(&path))?;
     let env = AgentEnvelope::ok(
         "full-backup",
-        json!({
-            "note": "full-backup pipeline wiring deferred (parallel to full-repair)"
-        }),
-    );
-    emit_envelope(&env, json, || println!("full-backup deferred"))
-}
-
-fn cmd_monitor(interval_ms: u32, json: bool) -> anyhow::Result<()> {
-    let env = AgentEnvelope::ok(
-        "monitor",
-        json!({
-            "interval_ms": interval_ms,
-            "note": "live continuous monitor deferred (REPL TTY loop)"
-        }),
+        json!({ "output": r.file_path, "size_bytes": r.size_bytes, "duration_ms": r.duration_ms }),
     );
     emit_envelope(&env, json, || {
-        println!("monitor: interval={interval_ms}ms (live loop pending)")
+        println!("full-backup: {} bytes -> {}", r.size_bytes, r.file_path)
     })
+}
+
+fn cmd_monitor(_interval_ms: u32, _json: bool) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "monitor: continuous live monitor not implemented; use 'status' or 'identify' for a \
+         one-shot read"
+    )
 }
 
 fn parse_addr(s: &str) -> anyhow::Result<u64> {
@@ -1109,5 +1512,79 @@ fn parse_addr(s: &str) -> anyhow::Result<u64> {
         Ok(u64::from_str_radix(hex, 16)?)
     } else {
         Ok(s.parse::<u64>()?)
+    }
+}
+
+/// Parse a string of hex byte pairs ("deadbeef", "de ad be ef", "0xde,0xad")
+/// into raw bytes. Tolerates whitespace, commas, and `0x` separators.
+fn parse_hex_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
+    let cleaned: String = s
+        .replace("0x", "")
+        .replace("0X", "")
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+    if cleaned.len() % 2 != 0 {
+        anyhow::bail!(
+            "hex data must have an even number of digits, got {}",
+            cleaned.len()
+        );
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&cleaned[i..i + 2], 16)
+                .map_err(|e| anyhow::anyhow!("invalid hex byte '{}': {e}", &cleaned[i..i + 2]))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_bytes_tolerant() {
+        assert_eq!(
+            parse_hex_bytes("deadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert_eq!(parse_hex_bytes("de ad").unwrap(), vec![0xde, 0xad]);
+        assert_eq!(parse_hex_bytes("0xde,0xad").unwrap(), vec![0xde, 0xad]);
+        assert!(parse_hex_bytes("abc").is_err()); // odd digit count
+    }
+
+    #[test]
+    fn parse_eeprom_part_maps_known_and_rejects_unknown() {
+        assert_eq!(parse_eeprom_part("24c256").unwrap().name(), "24C256");
+        assert_eq!(parse_eeprom_part("24C02").unwrap().name(), "24C02");
+        assert!(parse_eeprom_part("bogus").is_err());
+    }
+
+    // Transport-less verbs must fail honestly (Err / non-zero exit), never a
+    // fake success. These call hw_unavailable directly (no bus open needed).
+    #[test]
+    fn hw_verbs_fail_honestly() {
+        assert!(cmd_swd(SwdCmd::Connect { json: true }).is_err());
+        assert!(cmd_avr(AvrCmd::Signature { json: true }).is_err());
+        assert!(cmd_onewire(OnewireCmd::Scan { json: true }).is_err());
+        assert!(cmd_esp(EspCmd::Detect { json: true }).is_err());
+        assert!(cmd_monitor(1000, true).is_err());
+        assert!(cmd_failure_search("x", true).is_err());
+    }
+
+    #[test]
+    fn hw_unavailable_message_is_honest() {
+        let e = hw_unavailable("swd", "connect", "needs adapter").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("not available"));
+        assert!(!msg.contains("stub"));
+        assert!(!msg.contains("registered"));
+        assert!(!msg.contains('—'), "no em-dash in honest errors");
+    }
+
+    #[test]
+    fn enumerate_serial_ports_does_not_panic() {
+        let _ = enumerate_serial_ports();
     }
 }

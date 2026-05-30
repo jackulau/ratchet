@@ -93,13 +93,13 @@ impl EepromSize {
     }
 }
 
-pub struct I2cEeprom<'m, M: I2cMaster> {
+pub struct I2cEeprom<'m, M: I2cMaster + ?Sized> {
     master: &'m mut M,
     pub address: u8,
     pub size: EepromSize,
 }
 
-impl<'m, M: I2cMaster> I2cEeprom<'m, M> {
+impl<'m, M: I2cMaster + ?Sized> I2cEeprom<'m, M> {
     pub fn new(master: &'m mut M, address: u8, size: EepromSize) -> Self {
         Self {
             master,

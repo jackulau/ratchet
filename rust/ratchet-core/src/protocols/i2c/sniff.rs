@@ -14,10 +14,13 @@
 // reliably detect both edges. At CH341A's ~6 MS/s ceiling that gives clean
 // decode up to ~400 kHz I2C.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Single SCL/SDA sample captured at a known timestamp.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+///
+/// `Deserialize` lets `ratchet i2c sniff <trace.json>` decode an externally
+/// captured trace (`[{"t_us":..,"scl":bool,"sda":bool}, …]`) offline.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineSample {
     pub t_us: u64,
     pub scl: bool,
