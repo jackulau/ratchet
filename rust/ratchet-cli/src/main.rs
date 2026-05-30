@@ -4,7 +4,7 @@
 
 use clap::{Parser, Subcommand};
 use ratchet_core::agent::envelope::AgentEnvelope;
-use ratchet_core::backends::{open_default, Backend, BackendKind};
+use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind, RawBus};
 use serde_json::json;
 use std::sync::OnceLock;
 
@@ -619,12 +619,101 @@ fn hw_stub(verb: &str, action: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run an I2C action against whichever live backend is present. The two real
+/// masters (`Ch341aI2c` over `UsbBus`, `Ch347I2c` over the CH347 transport) are
+/// different generic types, so the action runs against a `&mut dyn I2cMaster`
+/// trait object to avoid duplicating the per-action logic per backend.
+fn run_i2c<R>(
+    raw: RawBus,
+    f: impl FnOnce(
+        &mut dyn ratchet_core::protocols::i2c::I2cMaster,
+    ) -> ratchet_core::backends::Result<R>,
+) -> anyhow::Result<R> {
+    use ratchet_core::protocols::i2c::{Ch341aI2c, Ch347I2c};
+    let mut bus = raw.bus;
+    let out = match raw.kind {
+        BackendKind::Ch347 => {
+            let mut m = Ch347I2c::new(&mut bus);
+            f(&mut m)
+        }
+        BackendKind::Ch341a => {
+            let mut m = Ch341aI2c::new(&mut bus)?;
+            f(&mut m)
+        }
+        BackendKind::Mock => unreachable!("open_raw_bus never yields Mock"),
+    };
+    Ok(out?)
+}
+
 fn cmd_i2c(c: I2cCmd) -> anyhow::Result<()> {
     match c {
-        I2cCmd::Scan { json } => hw_stub("i2c", "scan", json),
-        I2cCmd::Read { json, .. } => hw_stub("i2c", "read", json),
-        I2cCmd::Write { json, .. } => hw_stub("i2c", "write", json),
-        I2cCmd::Sniff { json, .. } => hw_stub("i2c", "sniff", json),
+        I2cCmd::Scan { json } => {
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let addrs = run_i2c(raw, |m| m.scan_bus())?;
+            let hex: Vec<String> = addrs.iter().map(|a| format!("0x{a:02x}")).collect();
+            let env = AgentEnvelope::ok(
+                "i2c scan",
+                json!({ "addresses": hex, "count": addrs.len() }),
+            );
+            emit_envelope(&env, json, || {
+                if addrs.is_empty() {
+                    println!("i2c scan: no devices responded");
+                } else {
+                    println!("i2c devices: {}", hex.join(" "));
+                }
+            })
+        }
+        I2cCmd::Read {
+            addr,
+            reg,
+            len,
+            json,
+        } => {
+            let addr7 = parse_addr(&addr)? as u8;
+            let reg_b = parse_addr(&reg)? as u8;
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let data = run_i2c(raw, |m| m.write_then_read(addr7, &[reg_b], len as usize))?;
+            let hex: Vec<String> = data.iter().map(|b| format!("{b:02x}")).collect();
+            let env = AgentEnvelope::ok(
+                "i2c read",
+                json!({ "addr": format!("0x{addr7:02x}"), "reg": format!("0x{reg_b:02x}"), "data": hex.join("") }),
+            );
+            emit_envelope(&env, json, || println!("{}", hex.join(" ")))
+        }
+        I2cCmd::Write { addr, data, json } => {
+            let addr7 = parse_addr(&addr)? as u8;
+            let bytes = parse_hex_bytes(&data)?;
+            let n = bytes.len();
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            run_i2c(raw, |m| m.write(addr7, &bytes))?;
+            let env = AgentEnvelope::ok(
+                "i2c write",
+                json!({ "addr": format!("0x{addr7:02x}"), "bytes_written": n }),
+            );
+            emit_envelope(&env, json, || {
+                println!("i2c write: {n} byte(s) → 0x{addr7:02x}")
+            })
+        }
+        I2cCmd::Sniff { input, json } => {
+            // Offline decode of a captured (t_us, scl, sda) trace — no hardware.
+            let raw_json = std::fs::read_to_string(&input)
+                .map_err(|e| anyhow::anyhow!("read trace {input}: {e}"))?;
+            let samples: Vec<ratchet_core::protocols::i2c::LineSample> =
+                serde_json::from_str(&raw_json)
+                    .map_err(|e| anyhow::anyhow!("parse trace {input}: {e}"))?;
+            let events = ratchet_core::protocols::i2c::decode_trace(&samples);
+            let env = AgentEnvelope::ok(
+                "i2c sniff",
+                json!({ "samples": samples.len(), "events": events }),
+            );
+            emit_envelope(&env, json, || {
+                println!(
+                    "i2c sniff: {} event(s) from {} samples",
+                    events.len(),
+                    samples.len()
+                )
+            })
+        }
     }
 }
 
@@ -1110,4 +1199,28 @@ fn parse_addr(s: &str) -> anyhow::Result<u64> {
     } else {
         Ok(s.parse::<u64>()?)
     }
+}
+
+/// Parse a string of hex byte pairs ("deadbeef", "de ad be ef", "0xde,0xad")
+/// into raw bytes. Tolerates whitespace, commas, and `0x` separators.
+fn parse_hex_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
+    let cleaned: String = s
+        .replace("0x", "")
+        .replace("0X", "")
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+    if cleaned.len() % 2 != 0 {
+        anyhow::bail!(
+            "hex data must have an even number of digits, got {}",
+            cleaned.len()
+        );
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&cleaned[i..i + 2], 16)
+                .map_err(|e| anyhow::anyhow!("invalid hex byte '{}': {e}", &cleaned[i..i + 2]))
+        })
+        .collect()
 }
