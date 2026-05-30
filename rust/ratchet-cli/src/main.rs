@@ -918,7 +918,37 @@ fn cmd_stm32(c: Stm32Cmd) -> anyhow::Result<()> {
 fn cmd_la(c: LaCmd) -> anyhow::Result<()> {
     match c {
         LaCmd::Capture { .. } => hw_stub("la", "capture", false),
-        LaCmd::Export { .. } => hw_stub("la", "export", false),
+        LaCmd::Export {
+            input,
+            output,
+            format,
+        } => {
+            use ratchet_core::instruments::logic_analyzer::CaptureFrame;
+            // Offline format conversion of an existing capture — no hardware.
+            let raw = std::fs::read_to_string(&input)
+                .map_err(|e| anyhow::anyhow!("read capture {input}: {e}"))?;
+            let frame: CaptureFrame = serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("parse capture {input}: {e}"))?;
+            // Channel count: highest bit set across samples (1..=8).
+            let used = frame.samples.iter().fold(0u8, |acc, b| acc | b);
+            let channels = (8 - used.leading_zeros() as u8).max(1);
+            let body = match format.to_ascii_lowercase().as_str() {
+                "csv" => ratchet_core::instruments::export::write_csv(&frame, channels),
+                "jsonl" => ratchet_core::instruments::export::write_jsonl(&frame, channels),
+                other => {
+                    anyhow::bail!("unsupported export format '{other}' (supported: csv, jsonl)")
+                }
+            };
+            std::fs::write(&output, &body).map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
+            println!(
+                "la export: {} sample(s), {} channel(s) -> {} ({})",
+                frame.samples.len(),
+                channels,
+                output,
+                format
+            );
+            Ok(())
+        }
     }
 }
 
