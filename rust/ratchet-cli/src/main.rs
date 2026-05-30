@@ -733,8 +733,74 @@ fn cmd_onewire(c: OnewireCmd) -> anyhow::Result<()> {
 
 fn cmd_jtag(c: JtagCmd) -> anyhow::Result<()> {
     match c {
-        JtagCmd::IdcodeScan { json, .. } => hw_stub("jtag", "idcode-scan", json),
-        JtagCmd::BsdlScan { json, .. } => hw_stub("jtag", "bsdl-scan", json),
+        JtagCmd::IdcodeScan { max_devices, json } => {
+            use ratchet_core::protocols::jtag::{scan_idcode_chain, Ch347Jtag};
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Only the CH347 has a JTAG engine; CH341A cannot drive JTAG.
+            if raw.kind != BackendKind::Ch347 {
+                anyhow::bail!(
+                    "jtag idcode-scan requires a CH347 (detected {}; CH341A has no JTAG engine)",
+                    raw.kind.as_str()
+                );
+            }
+            let mut bus = raw.bus;
+            let mut jtag = Ch347Jtag::new(&mut bus);
+            let chain = scan_idcode_chain(&mut jtag, max_devices)?;
+            let entries: Vec<_> = chain
+                .entries
+                .iter()
+                .map(|e| {
+                    json!({
+                        "idcode": format!("0x{:08x}", e.idcode),
+                        "manufacturer": format!("0x{:03x}", e.manufacturer),
+                        "part": format!("0x{:04x}", e.part),
+                        "version": e.version,
+                    })
+                })
+                .collect();
+            let env = AgentEnvelope::ok(
+                "jtag idcode-scan",
+                json!({ "devices": entries.len(), "chain": entries }),
+            );
+            emit_envelope(&env, json, || {
+                println!("jtag chain: {} device(s)", chain.entries.len());
+                for e in &chain.entries {
+                    println!(
+                        "  idcode=0x{:08x} mfg=0x{:03x} part=0x{:04x} ver={}",
+                        e.idcode, e.manufacturer, e.part, e.version
+                    );
+                }
+            })
+        }
+        JtagCmd::BsdlScan { bsdl, json } => {
+            // Offline BSDL parse + report. Live EXTEST drive needs a JTAG
+            // transport adapter that is not yet wired; this validates the file
+            // and surfaces its boundary register without claiming a live scan.
+            let text =
+                std::fs::read_to_string(&bsdl).map_err(|e| anyhow::anyhow!("read {bsdl}: {e}"))?;
+            let desc = ratchet_core::debug::boundary_scan::parse_bsdl(&text)
+                .map_err(|e| anyhow::anyhow!("parse BSDL: {e}"))?;
+            let instrs: Vec<&String> = desc.instructions.keys().collect();
+            let env = AgentEnvelope::ok(
+                "jtag bsdl-scan",
+                json!({
+                    "entity": desc.entity,
+                    "boundary_length": desc.boundary_length,
+                    "boundary_cells": desc.boundary.len(),
+                    "instructions": instrs,
+                    "note": "offline BSDL parse; live EXTEST drive not yet wired",
+                }),
+            );
+            emit_envelope(&env, json, || {
+                println!(
+                    "BSDL {}: boundary_length={} cells={} instructions={}",
+                    desc.entity,
+                    desc.boundary_length,
+                    desc.boundary.len(),
+                    desc.instructions.len()
+                );
+            })
+        }
     }
 }
 
