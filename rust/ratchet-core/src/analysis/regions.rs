@@ -92,6 +92,23 @@ pub fn replace_region(
     region_name: &str,
     replacement: &[u8],
 ) -> Option<ReplaceResult> {
+    let mut result = image.to_vec();
+    let (region, warnings) = replace_region_in_place(&mut result, region_name, replacement)?;
+    Some(ReplaceResult {
+        data: result,
+        region,
+        warnings,
+    })
+}
+
+/// In-place variant of [`replace_region`]: mutates `image` directly instead of
+/// cloning the whole buffer per call. Returns the matched region + any warnings,
+/// or `None` if the region name is not present.
+pub fn replace_region_in_place(
+    image: &mut [u8],
+    region_name: &str,
+    replacement: &[u8],
+) -> Option<(RegionInfo, Vec<String>)> {
     let regions = list_regions(image);
     let lower = region_name.to_ascii_lowercase();
     let region = regions
@@ -122,27 +139,19 @@ pub fn replace_region(
         replacement.to_vec()
     };
 
-    let mut result = image.to_vec();
     let start = region.offset as usize;
-    let end = (start + region_size).min(result.len());
+    let end = (start + region_size).min(image.len());
     let copy_len = end - start;
-    result[start..end].copy_from_slice(&rep_data[..copy_len]);
-    Some(ReplaceResult {
-        data: result,
-        region,
-        warnings,
-    })
+    image[start..end].copy_from_slice(&rep_data[..copy_len]);
+    Some((region, warnings))
 }
 
 pub fn rebuild_image(base: &[u8], replacements: &[(String, Vec<u8>)]) -> (Vec<u8>, Vec<String>) {
     let mut warnings: Vec<String> = Vec::new();
     let mut result = base.to_vec();
     for (name, rep) in replacements {
-        match replace_region(&result, name, rep) {
-            Some(r) => {
-                result = r.data;
-                warnings.extend(r.warnings);
-            }
+        match replace_region_in_place(&mut result, name, rep) {
+            Some((_region, w)) => warnings.extend(w),
             None => warnings.push(format!("Region \"{name}\" not found in image  -  skipped")),
         }
     }

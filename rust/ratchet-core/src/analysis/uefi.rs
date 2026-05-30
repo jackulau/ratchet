@@ -280,28 +280,25 @@ pub fn parse_uefi_firmware_volume(data: &[u8], offset: usize) -> Option<UefiFirm
 
 pub fn scan_firmware_volumes(data: &[u8]) -> Vec<UefiFirmwareVolume> {
     let mut volumes = Vec::new();
-    let mut offset = 0usize;
-    while offset + 56 < data.len() {
-        // Search for "_FVH" from current offset.
-        let mut sig_offset: Option<usize> = None;
-        let end = data.len().saturating_sub(FVH_SIG.len());
-        for i in offset..=end {
-            if &data[i..i + 4] == FVH_SIG {
-                sig_offset = Some(i);
-                break;
-            }
-        }
-        let sig_offset = match sig_offset {
+    // Single forward cursor: the _FVH search always resumes here, so each
+    // location is examined at most once (no per-iteration rescan from 0).
+    let mut search_from = 0usize;
+    while search_from + 56 < data.len() {
+        // Resume the "_FVH" search from the cursor instead of restarting.
+        let sig_offset = match data[search_from..]
+            .windows(FVH_SIG.len())
+            .position(|w| w == FVH_SIG)
+            .map(|rel| search_from + rel)
+        {
             Some(s) if s >= 40 => s,
             _ => break,
         };
         let fv_base = sig_offset - 40;
         if let Some(fv) = parse_uefi_firmware_volume(data, fv_base) {
-            let next = fv_base + fv.size as usize;
+            search_from = fv_base + fv.size as usize;
             volumes.push(fv);
-            offset = next;
         } else {
-            offset = sig_offset + 4;
+            search_from = sig_offset + 4;
         }
     }
     volumes

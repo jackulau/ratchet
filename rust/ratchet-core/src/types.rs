@@ -3,6 +3,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Lowercase hex-encode bytes into a single pre-sized String (no per-byte heap alloc).
+pub fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProgrammerInfo {
     #[serde(rename = "type")]

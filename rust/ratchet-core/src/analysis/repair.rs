@@ -2,7 +2,8 @@
 // Ports src/analysis/repair.ts.
 
 use crate::analysis::nvram::{find_nvram_store, parse_nvram_store, NvramVarState};
-use crate::analysis::regions::{extract_region, list_regions, replace_region, RegionInfo};
+use crate::analysis::regions::{extract_region, list_regions, replace_region_in_place, RegionInfo};
+use crate::types::hex_encode;
 use sha2::{Digest, Sha256};
 
 use serde::{Deserialize, Serialize};
@@ -35,12 +36,7 @@ pub struct RepairReport {
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
-    let out = h.finalize();
-    let mut s = String::with_capacity(64);
-    for b in out {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    hex_encode(&h.finalize())
 }
 
 fn region_checksum(image: &[u8], region: &RegionInfo) -> String {
@@ -159,9 +155,10 @@ pub fn repair_from_reference(broken: &[u8], reference: &[u8]) -> RepairResult {
                 "Replaced region \"{}\" from reference",
                 region.name
             ));
-            if let Some(result) = replace_region(&repaired, &region.name, &rdata.0) {
-                repaired = result.data;
-                warnings.extend(result.warnings);
+            if let Some((_region, w)) =
+                replace_region_in_place(&mut repaired, &region.name, &rdata.0)
+            {
+                warnings.extend(w);
             }
         }
     }

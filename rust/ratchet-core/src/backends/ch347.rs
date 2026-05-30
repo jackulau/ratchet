@@ -203,43 +203,32 @@ impl<T: Transport> Ch347Protocol<T> {
 
     fn spi_transfer(&mut self, tx: &[u8]) -> Result<Vec<u8>> {
         let mut result = vec![0u8; tx.len()];
+        // Reused CS-assert packet buffer: only the payload bytes change per chunk,
+        // so we rewrite it in place instead of allocating a fresh Vec per 510-byte chunk.
+        let mut pkt: Vec<u8> = Vec::with_capacity(4 + CH347_MAX_SPI_PAYLOAD);
         let mut offset = 0;
         while offset < tx.len() {
             let remaining = tx.len() - offset;
             let chunk_len = remaining.min(CH347_MAX_SPI_PAYLOAD);
             let chunk = &tx[offset..offset + chunk_len];
-            let is_first = offset == 0;
             let is_last = offset + chunk_len >= tx.len();
 
-            if is_first && is_last {
-                // Single-packet transfer: CS-assert XFER + CS-deassert XFER.
-                let pkt = build_cs_xfer_packet(chunk, true, 0);
-                self.transport.write(&pkt)?;
-                let rx = self.transport.read(4 + chunk_len)?;
-                result[offset..offset + chunk_len].copy_from_slice(&rx[4..4 + chunk_len]);
+            // CS-assert XFER carrying this chunk (header + payload), buffer reused.
+            pkt.clear();
+            pkt.push(CH347_CMD_SPI_CS_XFER);
+            pkt.push((chunk_len & 0xff) as u8);
+            pkt.push(((chunk_len >> 8) & 0xff) as u8);
+            pkt.push(0x00); // cs_assert=true, cs_index=0
+            pkt.extend_from_slice(chunk);
+            self.transport.write(&pkt)?;
+            let rx = self.transport.read(4 + chunk_len)?;
+            result[offset..offset + chunk_len].copy_from_slice(&rx[4..4 + chunk_len]);
 
+            if is_last {
+                // CS-deassert XFER (empty payload) terminates the transaction.
                 let pkt_de = build_cs_xfer_packet(&[], false, 0);
                 self.transport.write(&pkt_de)?;
                 let _drain = self.transport.read(4)?;
-            } else if is_first {
-                let pkt = build_cs_xfer_packet(chunk, true, 0);
-                self.transport.write(&pkt)?;
-                let rx = self.transport.read(4 + chunk_len)?;
-                result[offset..offset + chunk_len].copy_from_slice(&rx[4..4 + chunk_len]);
-            } else if is_last {
-                let pkt = build_cs_xfer_packet(chunk, true, 0);
-                self.transport.write(&pkt)?;
-                let rx = self.transport.read(4 + chunk_len)?;
-                result[offset..offset + chunk_len].copy_from_slice(&rx[4..4 + chunk_len]);
-
-                let pkt_de = build_cs_xfer_packet(&[], false, 0);
-                self.transport.write(&pkt_de)?;
-                let _drain = self.transport.read(4)?;
-            } else {
-                let pkt = build_cs_xfer_packet(chunk, true, 0);
-                self.transport.write(&pkt)?;
-                let rx = self.transport.read(4 + chunk_len)?;
-                result[offset..offset + chunk_len].copy_from_slice(&rx[4..4 + chunk_len]);
             }
             offset += chunk_len;
         }
@@ -315,9 +304,13 @@ impl<T: Transport> Ch347Protocol<T> {
         });
         tx.extend(address_bytes(address, self.use_4byte_addr));
         tx.extend(std::iter::repeat_n(0u8, length));
-        let rx = self.spi_command(&tx)?;
+        let mut rx = self.spi_command(&tx)?;
         let addr_len = if self.use_4byte_addr { 4 } else { 3 };
-        Ok(rx[1 + addr_len..1 + addr_len + length].to_vec())
+        // Reuse rx's allocation: drop the leading opcode+address echo and trailing
+        // bytes in place rather than copying the data slice into a fresh Vec.
+        rx.truncate(1 + addr_len + length);
+        rx.drain(..1 + addr_len);
+        Ok(rx)
     }
 
     pub fn enter_4byte_mode(&mut self) -> Result<()> {
@@ -354,12 +347,7 @@ impl<T: Transport + Send> Ch347Backend<T> {
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
-    let out = h.finalize();
-    let mut s = String::with_capacity(64);
-    for b in out {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    hex_encode(&h.finalize())
 }
 
 impl<T: Transport + Send> Backend for Ch347Backend<T> {

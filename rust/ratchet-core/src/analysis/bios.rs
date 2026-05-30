@@ -2,6 +2,7 @@
 // diff, checksum, firmware-blob extraction (UEFI Capsule / Intel Flash Image / AMI cap).
 // Ports src/analysis/bios.ts.
 
+use crate::types::hex_encode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -84,12 +85,7 @@ pub struct ChecksumResult {
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
-    let out = h.finalize();
-    let mut s = String::with_capacity(64);
-    for b in out {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    hex_encode(&h.finalize())
 }
 
 fn crc32(data: &[u8]) -> String {
@@ -439,11 +435,7 @@ pub fn diff_bytes(a: &[u8], b: &[u8]) -> DiffResult {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    hex_encode(bytes)
 }
 
 /// Extract firmware payload from common wrappers (UEFI Capsule, Intel Flash Image, AMI cap).
