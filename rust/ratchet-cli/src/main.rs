@@ -757,10 +757,74 @@ fn cmd_avr(c: AvrCmd) -> anyhow::Result<()> {
     }
 }
 
+/// Map a 24Cxx part string ("24c256", "24C02", …) to its `EepromSize`.
+fn parse_eeprom_part(s: &str) -> anyhow::Result<ratchet_core::programmers::i2c_eeprom::EepromSize> {
+    use ratchet_core::programmers::i2c_eeprom::EepromSize::*;
+    let k = s.trim().to_ascii_uppercase().replace('-', "");
+    Ok(match k.as_str() {
+        "24C01" => Kbit1,
+        "24C02" => Kbit2,
+        "24C04" => Kbit4,
+        "24C08" => Kbit8,
+        "24C16" => Kbit16,
+        "24C32" => Kbit32,
+        "24C64" => Kbit64,
+        "24C128" => Kbit128,
+        "24C256" => Kbit256,
+        "24C512" => Kbit512,
+        "24C1024" | "24C1025" => Mbit1,
+        _ => anyhow::bail!("unknown 24Cxx part '{s}' (try 24c01 .. 24c1024)"),
+    })
+}
+
 fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
+    use ratchet_core::programmers::i2c_eeprom::I2cEeprom;
     match c {
-        EepromI2cCmd::Read { .. } => hw_stub("eeprom-i2c", "read", false),
-        EepromI2cCmd::Write { .. } => hw_stub("eeprom-i2c", "write", false),
+        EepromI2cCmd::Read { addr, part, output } => {
+            let address = parse_addr(&addr)? as u8;
+            let size = parse_eeprom_part(&part)?;
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let data = run_i2c(raw, |m| {
+                let mut ee = I2cEeprom::new(m, address, size);
+                ee.read(0, size.bytes())
+            })?;
+            std::fs::write(&output, &data).map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
+            let env = AgentEnvelope::ok(
+                "eeprom-i2c read",
+                json!({ "part": size.name(), "addr": format!("0x{address:02x}"), "bytes": data.len(), "output": output }),
+            );
+            emit_envelope(&env, false, || {
+                println!(
+                    "eeprom-i2c read {} bytes ({}) -> {}",
+                    data.len(),
+                    size.name(),
+                    output
+                )
+            })
+        }
+        EepromI2cCmd::Write { addr, part, input } => {
+            let address = parse_addr(&addr)? as u8;
+            let size = parse_eeprom_part(&part)?;
+            let data = std::fs::read(&input).map_err(|e| anyhow::anyhow!("read {input}: {e}"))?;
+            let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let verified = run_i2c(raw, |m| {
+                let mut ee = I2cEeprom::new(m, address, size);
+                ee.write(0, &data)?;
+                ee.verify(0, &data)
+            })?;
+            let env = AgentEnvelope::ok(
+                "eeprom-i2c write",
+                json!({ "part": size.name(), "addr": format!("0x{address:02x}"), "bytes": data.len(), "verified": verified }),
+            );
+            emit_envelope(&env, false, || {
+                println!(
+                    "eeprom-i2c write {} bytes ({}) verified={}",
+                    data.len(),
+                    size.name(),
+                    verified
+                )
+            })
+        }
     }
 }
 
