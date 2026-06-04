@@ -901,4 +901,174 @@ mod tests {
         assert!(format!("{err}").contains("chip holds only"));
         let _ = std::fs::remove_file(&path);
     }
+
+    /// A test bus that emulates a real SPI NOR flash behind the CH341A USB framing, so a full
+    /// write_chip → read-back → verify_chip cycle runs without hardware. It accumulates the SPI
+    /// bytes of each CS-low frame, answers reads full-duplex (response byte i depends on the
+    /// command bytes already in the frame), and applies erase/program side-effects on CS-high.
+    /// PAGE_PROGRAM uses real AND-into-flash semantics, so a missing erase-before-write would
+    /// leave stale 0-bits and fail verification — exactly like silicon.
+    struct LoopbackFlash {
+        flash: Vec<u8>,
+        jedec: [u8; 3],
+        frame: Vec<u8>,
+        read_pos: usize,
+    }
+    impl LoopbackFlash {
+        fn new(size: usize, jedec: [u8; 3]) -> Self {
+            Self {
+                flash: vec![0xff; size],
+                jedec,
+                frame: Vec::new(),
+                read_pos: 0,
+            }
+        }
+        fn decode_addr(bytes: &[u8]) -> usize {
+            bytes.iter().fold(0usize, |acc, &b| (acc << 8) | b as usize)
+        }
+        /// Full-duplex response for absolute frame position `pos`, given `self.frame` so far.
+        fn response_byte(&self, pos: usize) -> u8 {
+            if self.frame.is_empty() {
+                return 0;
+            }
+            match self.frame[0] {
+                SPI_RDID => {
+                    if (1..=3).contains(&pos) {
+                        self.jedec[pos - 1]
+                    } else {
+                        0
+                    }
+                }
+                SPI_RDSR | SPI_RDSR2 | SPI_RDSR3 => 0, // WIP clear
+                op @ (SPI_READ | SPI_READ_4B) => {
+                    let addr_len = if op == SPI_READ_4B { 4 } else { 3 };
+                    let data_start = 1 + addr_len;
+                    if pos >= data_start && self.frame.len() >= data_start {
+                        let base = Self::decode_addr(&self.frame[1..data_start]);
+                        *self.flash.get(base + (pos - data_start)).unwrap_or(&0xff)
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            }
+        }
+        /// Apply erase/program effects when the CS frame closes.
+        fn commit_frame(&mut self) {
+            if self.frame.is_empty() {
+                return;
+            }
+            match self.frame[0] {
+                SPI_CHIP_ERASE => self.flash.iter_mut().for_each(|b| *b = 0xff),
+                op @ (SPI_SECTOR_ERASE | SPI_SECTOR_ERASE_4B) => {
+                    let al = if op == SPI_SECTOR_ERASE_4B { 4 } else { 3 };
+                    let a = Self::decode_addr(&self.frame[1..1 + al]);
+                    for b in self.flash.iter_mut().skip(a).take(4096) {
+                        *b = 0xff;
+                    }
+                }
+                op @ (SPI_PAGE_PROGRAM | SPI_PAGE_PROGRAM_4B) => {
+                    let al = if op == SPI_PAGE_PROGRAM_4B { 4 } else { 3 };
+                    let a = Self::decode_addr(&self.frame[1..1 + al]);
+                    for (i, &d) in self.frame[1 + al..].iter().enumerate() {
+                        if let Some(cell) = self.flash.get_mut(a + i) {
+                            *cell &= d; // program can only clear bits — faithful to NOR flash
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.frame.clear();
+            self.read_pos = 0;
+        }
+    }
+    impl UsbBus for LoopbackFlash {
+        fn bulk_write(&mut self, data: &[u8]) -> Result<()> {
+            match data.first().copied() {
+                Some(CMD_UIO_STREAM) => {
+                    // CS bit clear ⇒ CS-low (frame start); CS bit set ⇒ CS-high (frame commit).
+                    if data.get(1).map(|b| b & STM_SPI_CS == 0).unwrap_or(false) {
+                        self.frame.clear();
+                        self.read_pos = 0;
+                    } else {
+                        self.commit_frame();
+                    }
+                }
+                Some(CMD_SPI_STREAM) => self.frame.extend_from_slice(&data[1..]),
+                _ => {}
+            }
+            Ok(())
+        }
+        fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
+            let out: Vec<u8> = (0..len)
+                .map(|j| self.response_byte(self.read_pos + j))
+                .collect();
+            self.read_pos += len;
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn write_then_verify_round_trip_via_loopback_flash() {
+        // Emulate a W25Q128 (ef4018). Image spans 2 sectors + 17 pages to exercise boundaries.
+        let firmware: Vec<u8> = (0..(4096u32 + 100)).map(|i| (i % 251) as u8).collect();
+        let path = std::env::temp_dir().join("ratchet-test-d3-roundtrip.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        let bus = LoopbackFlash::new(16 * 1024 * 1024, [0xef, 0x40, 0x18]);
+        let mut backend = CH341ABackend::with_bus(bus);
+
+        // Default-ish opts but skip the (16 MB) backup read to keep the test quick; DO verify.
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .unwrap();
+        assert!(w.success);
+        assert!(
+            w.verified,
+            "read-back verify after a real program cycle must match"
+        );
+
+        // Independent verify call against the same image also matches.
+        let v = backend.verify_chip(&path).unwrap();
+        assert!(v.matches);
+        assert_eq!(v.chip_checksum, v.file_checksum);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_chip_detects_mismatch_via_loopback() {
+        let firmware: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let written = std::env::temp_dir().join("ratchet-test-d3-written.bin");
+        let other = std::env::temp_dir().join("ratchet-test-d3-other.bin");
+        std::fs::write(&written, &firmware).unwrap();
+        std::fs::write(&other, vec![0x5au8; 1000]).unwrap();
+
+        let bus = LoopbackFlash::new(16 * 1024 * 1024, [0xef, 0x40, 0x18]);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend
+            .write_chip(
+                &written,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap();
+
+        // The chip now holds `firmware`; verifying a different file must NOT match.
+        let v = backend.verify_chip(&other).unwrap();
+        assert!(!v.matches, "verify must detect a chip≠file mismatch");
+        // And verifying the real image matches.
+        assert!(backend.verify_chip(&written).unwrap().matches);
+
+        std::fs::remove_file(&written).ok();
+        std::fs::remove_file(&other).ok();
+    }
 }
