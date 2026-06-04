@@ -10,7 +10,7 @@ use crate::chips::{format_size, lookup_by_jedec_id, needs_4byte_addressing};
 use crate::types::*;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // USB device IDs ─────────────────────────────────────────────────────────────
 pub const CH341A_VID: u16 = 0x1a86;
@@ -268,6 +268,45 @@ impl<B: UsbBus> CH341ABackend<B> {
             backoff = (backoff * 2).min(Duration::from_millis(20));
         }
     }
+
+    /// Read `len` bytes starting at `start_addr` via the READ (0x03) opcode, in 1KB chunks.
+    /// Shared by `read_chip` (whole chip) and `verify_chip` (file-length read-back) so the two
+    /// always use identical addressing.
+    pub fn read_range(&mut self, start_addr: u64, len: usize) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(len);
+        let chunk_size = 1024;
+        let addr_len = if self.use_4byte_addr { 4 } else { 3 };
+        let data_start = 1 + addr_len;
+        let mut cmd: Vec<u8> = Vec::with_capacity(data_start + chunk_size);
+        let mut addr = start_addr;
+        while buf.len() < len {
+            let n = chunk_size.min(len - buf.len());
+            cmd.clear();
+            cmd.push(SPI_READ);
+            cmd.extend(address_bytes(addr, self.use_4byte_addr));
+            cmd.resize(data_start + n, 0u8);
+            let rx = self.spi_command(&cmd)?;
+            buf.extend_from_slice(&rx[data_start..data_start + n]);
+            addr += n as u64;
+        }
+        Ok(buf)
+    }
+
+    /// Program a single page (≤ page_size bytes, never crossing a page boundary): WREN, then
+    /// PAGE_PROGRAM with the address + data, then wait for WIP to clear before returning.
+    pub fn page_program(&mut self, addr: u64, data: &[u8]) -> Result<()> {
+        self.spi_command(&[SPI_WREN])?;
+        let mut cmd = Vec::with_capacity(1 + 4 + data.len());
+        cmd.push(if self.use_4byte_addr {
+            SPI_PAGE_PROGRAM_4B
+        } else {
+            SPI_PAGE_PROGRAM
+        });
+        cmd.extend(address_bytes(addr, self.use_4byte_addr));
+        cmd.extend_from_slice(data);
+        self.spi_command(&cmd)?;
+        self.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
+    }
 }
 
 impl<B: UsbBus> Backend for CH341ABackend<B> {
@@ -385,24 +424,7 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         if size == 0 {
             return Err(BackendError::ChipNotDetected);
         }
-        let mut buf = Vec::with_capacity(size);
-        let chunk_size = 1024;
-        let addr_len = if self.use_4byte_addr { 4 } else { 3 };
-        let data_start = 1 + addr_len;
-        // Reused command buffer: only the opcode + address header changes per chunk,
-        // so we rewrite the header in place instead of allocating ~1KB per chunk.
-        let mut cmd: Vec<u8> = Vec::with_capacity(data_start + chunk_size);
-        let mut addr: u64 = 0;
-        while (addr as usize) < size {
-            let n = chunk_size.min(size - addr as usize);
-            cmd.clear();
-            cmd.push(SPI_READ);
-            cmd.extend(address_bytes(addr, self.use_4byte_addr));
-            cmd.resize(data_start + n, 0u8);
-            let rx = self.spi_command(&cmd)?;
-            buf.extend_from_slice(&rx[data_start..data_start + n]);
-            addr += n as u64;
-        }
+        let buf = self.read_range(0, size)?;
         std::fs::write(output_path, &buf)?;
         let mut h = Sha256::new();
         h.update(&buf);
@@ -420,13 +442,85 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
             error: None,
         })
     }
-    fn write_chip(&mut self, _input_path: &Path, _opts: WriteOpts) -> Result<WriteResult> {
-        Err(BackendError::Other(
-            "write_chip wired in follow-up (D12 chip ops workflow)".into(),
-        ))
+    fn write_chip(&mut self, input_path: &Path, opts: WriteOpts) -> Result<WriteResult> {
+        let start = Instant::now();
+        let firmware = std::fs::read(input_path)?;
+        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        let chip_size = chip.size_bytes as usize;
+        if chip_size > 0 && firmware.len() > chip_size {
+            return Err(BackendError::Other(format!(
+                "image is {} bytes but the chip holds only {} bytes",
+                firmware.len(),
+                chip_size
+            )));
+        }
+        let page_size = chip.page_size.unwrap_or(256).max(1) as usize;
+        let sector_size = chip.sector_size.unwrap_or(4096).max(1) as u64;
+
+        // 1. Back up current chip contents BEFORE touching anything (unless told to skip).
+        //    A user reflashing a motherboard should never lose their only copy of the old BIOS.
+        let backup_path = if opts.skip_backup {
+            None
+        } else {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!("ratchet-backup-{}.bin", ts));
+            self.read_chip(&path)?;
+            Some(path.display().to_string())
+        };
+
+        // 2. Erase every sector the image touches — SPI program can only flip 1→0, so the
+        //    target must be 0xFF first. (Each sector_erase issues WREN + erase + WIP-wait.)
+        let mut addr: u64 = 0;
+        while (addr as usize) < firmware.len() {
+            self.sector_erase(addr)?;
+            addr += sector_size;
+        }
+
+        // 3. Program page-by-page, never letting a PAGE_PROGRAM cross a page boundary (the chip
+        //    wraps the address within the page if you do, silently corrupting the write).
+        let mut offset = 0usize;
+        while offset < firmware.len() {
+            let page_end = (offset / page_size + 1) * page_size;
+            let chunk_end = page_end.min(firmware.len());
+            self.page_program(offset as u64, &firmware[offset..chunk_end])?;
+            offset = chunk_end;
+        }
+
+        // 4. Read back and compare unless the caller opted out.
+        let verified = if opts.skip_verify {
+            false
+        } else {
+            self.verify_chip(input_path)?.matches
+        };
+
+        Ok(WriteResult {
+            success: true,
+            backup_path,
+            verified,
+            duration_ms: start.elapsed().as_millis() as u64,
+            error: None,
+        })
     }
-    fn verify_chip(&mut self, _file_path: &Path) -> Result<VerifyResult> {
-        Err(BackendError::Other("verify_chip wired in D12".into()))
+    fn verify_chip(&mut self, file_path: &Path) -> Result<VerifyResult> {
+        let start = Instant::now();
+        let file_data = std::fs::read(file_path)?;
+        let chip_data = self.read_range(0, file_data.len())?;
+        let mut hc = Sha256::new();
+        hc.update(&chip_data);
+        let chip_checksum = hex_encode(&hc.finalize());
+        let mut hf = Sha256::new();
+        hf.update(&file_data);
+        let file_checksum = hex_encode(&hf.finalize());
+        Ok(VerifyResult {
+            matches: chip_checksum == file_checksum,
+            file_path: file_path.display().to_string(),
+            chip_checksum,
+            file_checksum,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
     }
     fn erase_chip(&mut self) -> Result<EraseResult> {
         let start = Instant::now();
@@ -731,5 +825,80 @@ mod tests {
             .wait_until_ready(Duration::from_millis(5))
             .unwrap_err();
         assert!(format!("{err}").contains("busy"));
+    }
+
+    /// Index of the first SPI-stream packet whose opcode + 3-byte address match.
+    fn find_cmd_at_addr(writes: &[Vec<u8>], opcode: u8, addr3: [u8; 3]) -> Option<usize> {
+        writes.iter().position(|w| {
+            w.len() >= 5 && w[0] == CMD_SPI_STREAM && w[1] == opcode && w[2..5] == addr3
+        })
+    }
+
+    #[test]
+    fn write_chip_erases_then_page_programs_across_page_boundaries() {
+        // 300-byte image → spans two 256-byte pages, so we must see PAGE_PROGRAM at addr 0
+        // AND at addr 256 (0x000100). Erase must precede the first program.
+        let firmware: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let path = std::env::temp_dir().join("ratchet-test-d2-write.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        let mut bus = MockBus::new();
+        // RDID → Winbond W25Q128 (ef4018), the most common motherboard BIOS chip: 16 MB,
+        // 256-byte pages, 4 KB sectors, 3-byte addressing.
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x18]);
+        // Every subsequent read is don't-care except RDSR polls, whose byte[1]=0 ⇒ WIP clear.
+        for _ in 0..80 {
+            bus.queue_read(vec![0u8; 8]);
+        }
+        let mut backend = CH341ABackend::with_bus(bus);
+
+        let res = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap();
+        assert!(res.success);
+        assert_eq!(res.backup_path, None); // skip_backup honored
+        assert!(!res.verified); // skip_verify honored
+
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        let erase_idx = find_cmd_at_addr(writes, SPI_SECTOR_ERASE, [0, 0, 0])
+            .expect("sector-erase at addr 0 must be issued before programming");
+        let pp0_idx =
+            find_cmd_at_addr(writes, SPI_PAGE_PROGRAM, [0, 0, 0]).expect("page-program at addr 0");
+        let pp1_idx = find_cmd_at_addr(writes, SPI_PAGE_PROGRAM, [0x00, 0x01, 0x00])
+            .expect("page-program at addr 256 (page boundary split)");
+        // Erase before program; first page before second.
+        assert!(erase_idx < pp0_idx, "must erase before programming");
+        assert!(pp0_idx < pp1_idx, "pages programmed in order");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_chip_rejects_image_larger_than_chip() {
+        // Winbond W25Q64 (ef4017) = 8 MB. A 9 MB image must be rejected, not silently truncated.
+        let big = vec![0xa5u8; 9 * 1024 * 1024];
+        let path = std::env::temp_dir().join("ratchet-test-d2-oversize.bin");
+        std::fs::write(&path, &big).unwrap();
+
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x17]); // RDID → W25Q64, 8 MB
+        let mut backend = CH341ABackend::with_bus(bus);
+        let err = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("chip holds only"));
+        let _ = std::fs::remove_file(&path);
     }
 }
