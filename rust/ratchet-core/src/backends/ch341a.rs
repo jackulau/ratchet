@@ -5,12 +5,12 @@
 // trait, which real hardware satisfies via ratchet_usb::DeviceHandle. Tests use
 // an in-memory recorder to assert protocol correctness without hardware.
 
-use super::{Backend, BackendError, Result, WriteOpts};
+use super::{reject_blank_image, Backend, BackendError, Result, WriteOpts};
 use crate::chips::{format_size, lookup_by_jedec_id, needs_4byte_addressing};
 use crate::types::*;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // USB device IDs ─────────────────────────────────────────────────────────────
 pub const CH341A_VID: u16 = 0x1a86;
@@ -241,6 +241,82 @@ impl<B: UsbBus> CH341ABackend<B> {
         let rx = self.spi_command(&[SPI_RDID, 0, 0, 0])?;
         decode_jedec_response(&rx).ok_or(BackendError::ChipNotDetected)
     }
+
+    /// Poll RDSR until the write-in-progress (WIP) bit clears, or `timeout` elapses.
+    /// Every erase and page-program MUST be followed by this: SPI flash NAKs further
+    /// commands while an internal write/erase is running, and chip-erase can take well
+    /// over a minute on a 16MB part. Skipping it silently corrupts writes.
+    pub fn wait_until_ready(&mut self, timeout: Duration) -> Result<()> {
+        let start = Instant::now();
+        let mut backoff = Duration::from_micros(50);
+        loop {
+            let sr1 = self
+                .spi_command(&[SPI_RDSR, 0])?
+                .get(1)
+                .copied()
+                .unwrap_or(0);
+            if sr1 & SR_WIP == 0 {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout {
+                return Err(BackendError::Other(format!(
+                    "chip still busy (WIP set) after {} ms",
+                    timeout.as_millis()
+                )));
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(20));
+        }
+    }
+
+    /// Read `len` bytes starting at `start_addr` via the READ (0x03) opcode, in 1KB chunks.
+    /// Shared by `read_chip` (whole chip) and `verify_chip` (file-length read-back) so the two
+    /// always use identical addressing.
+    pub fn read_range(&mut self, start_addr: u64, len: usize) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(len);
+        let chunk_size = 1024;
+        let addr_len = if self.use_4byte_addr { 4 } else { 3 };
+        let data_start = 1 + addr_len;
+        let mut cmd: Vec<u8> = Vec::with_capacity(data_start + chunk_size);
+        let mut addr = start_addr;
+        while buf.len() < len {
+            let n = chunk_size.min(len - buf.len());
+            cmd.clear();
+            cmd.push(SPI_READ);
+            cmd.extend(address_bytes(addr, self.use_4byte_addr));
+            cmd.resize(data_start + n, 0u8);
+            let rx = self.spi_command(&cmd)?;
+            buf.extend_from_slice(&rx[data_start..data_start + n]);
+            addr += n as u64;
+        }
+        Ok(buf)
+    }
+
+    /// Program a single page (≤ page_size bytes, never crossing a page boundary): WREN, then
+    /// PAGE_PROGRAM with the address + data, then wait for WIP to clear before returning.
+    pub fn page_program(&mut self, addr: u64, data: &[u8]) -> Result<()> {
+        self.spi_command(&[SPI_WREN])?;
+        let mut cmd = Vec::with_capacity(1 + 4 + data.len());
+        cmd.push(if self.use_4byte_addr {
+            SPI_PAGE_PROGRAM_4B
+        } else {
+            SPI_PAGE_PROGRAM
+        });
+        cmd.extend(address_bytes(addr, self.use_4byte_addr));
+        cmd.extend_from_slice(data);
+        self.spi_command(&cmd)?;
+        self.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
+    }
+
+    /// Put the chip into 4-byte address mode (EN4B, 0xb7) and remember it. Required for chips
+    /// larger than 16 MB: without it a 4-byte address sent after a plain READ (0x03) is
+    /// misinterpreted, so reads/writes land at the wrong offset. Sending EN4B is the most
+    /// compatible activation — it works even on parts that lack the dedicated 4-byte opcodes.
+    pub fn enter_4byte_mode(&mut self) -> Result<()> {
+        self.spi_command(&[SPI_EN4B])?;
+        self.use_4byte_addr = true;
+        Ok(())
+    }
 }
 
 impl<B: UsbBus> Backend for CH341ABackend<B> {
@@ -270,13 +346,10 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
             return Ok(None);
         }
         let info = if let Some(db) = lookup_by_jedec_id(&hex) {
-            if db.size_bytes > SIZE_16MB {
-                self.use_4byte_addr = true;
-            }
             ChipInfo {
                 name: db.name.clone(),
                 vendor_name: db.vendor.clone(),
-                jedec_id: hex,
+                jedec_id: hex.clone(),
                 size_bytes: db.size_bytes,
                 size_human: format_size(db.size_bytes),
                 chip_type: "spi".into(),
@@ -287,14 +360,10 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
                 voltage: Some(db.voltage),
             }
         } else {
-            let needs_4b = needs_4byte_addressing(&hex);
-            if needs_4b {
-                self.use_4byte_addr = true;
-            }
             ChipInfo {
                 name: format!("Unknown {}", hex.to_ascii_uppercase()),
                 vendor_name: "Unknown".into(),
-                jedec_id: hex,
+                jedec_id: hex.clone(),
                 size_bytes: 0,
                 size_human: "?".into(),
                 chip_type: "spi".into(),
@@ -305,6 +374,16 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
                 voltage: None,
             }
         };
+        // Chips larger than 16 MB need 4-byte addressing; enter it now (sends EN4B) so every
+        // subsequent read/write/erase addresses the full chip instead of wrapping at 16 MB.
+        let needs_4b = if info.size_bytes > 0 {
+            info.size_bytes > SIZE_16MB
+        } else {
+            needs_4byte_addressing(&hex)
+        };
+        if needs_4b {
+            self.enter_4byte_mode()?;
+        }
         Ok(Some(info))
     }
     fn read_status_registers(&mut self) -> Result<StatusRegisters> {
@@ -358,24 +437,7 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         if size == 0 {
             return Err(BackendError::ChipNotDetected);
         }
-        let mut buf = Vec::with_capacity(size);
-        let chunk_size = 1024;
-        let addr_len = if self.use_4byte_addr { 4 } else { 3 };
-        let data_start = 1 + addr_len;
-        // Reused command buffer: only the opcode + address header changes per chunk,
-        // so we rewrite the header in place instead of allocating ~1KB per chunk.
-        let mut cmd: Vec<u8> = Vec::with_capacity(data_start + chunk_size);
-        let mut addr: u64 = 0;
-        while (addr as usize) < size {
-            let n = chunk_size.min(size - addr as usize);
-            cmd.clear();
-            cmd.push(SPI_READ);
-            cmd.extend(address_bytes(addr, self.use_4byte_addr));
-            cmd.resize(data_start + n, 0u8);
-            let rx = self.spi_command(&cmd)?;
-            buf.extend_from_slice(&rx[data_start..data_start + n]);
-            addr += n as u64;
-        }
+        let buf = self.read_range(0, size)?;
         std::fs::write(output_path, &buf)?;
         let mut h = Sha256::new();
         h.update(&buf);
@@ -393,24 +455,103 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
             error: None,
         })
     }
-    fn write_chip(&mut self, _input_path: &Path, _opts: WriteOpts) -> Result<WriteResult> {
-        Err(BackendError::Other(
-            "write_chip wired in follow-up (D12 chip ops workflow)".into(),
-        ))
+    fn write_chip(&mut self, input_path: &Path, opts: WriteOpts) -> Result<WriteResult> {
+        let start = Instant::now();
+        let firmware = std::fs::read(input_path)?;
+        reject_blank_image(&firmware)?;
+        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        let chip_size = chip.size_bytes as usize;
+        if chip_size > 0 && firmware.len() > chip_size {
+            return Err(BackendError::Other(format!(
+                "image is {} bytes but the chip holds only {} bytes",
+                firmware.len(),
+                chip_size
+            )));
+        }
+        let page_size = chip.page_size.unwrap_or(256).max(1) as usize;
+        let sector_size = chip.sector_size.unwrap_or(4096).max(1) as u64;
+
+        // 1. Back up current chip contents BEFORE touching anything (unless told to skip).
+        //    A user reflashing a motherboard should never lose their only copy of the old BIOS.
+        let backup_path = if opts.skip_backup {
+            None
+        } else {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!("ratchet-backup-{}.bin", ts));
+            self.read_chip(&path)?;
+            Some(path.display().to_string())
+        };
+
+        // 2. Erase every sector the image touches — SPI program can only flip 1→0, so the
+        //    target must be 0xFF first. (Each sector_erase issues WREN + erase + WIP-wait.)
+        let mut addr: u64 = 0;
+        while (addr as usize) < firmware.len() {
+            self.sector_erase(addr)?;
+            addr += sector_size;
+        }
+
+        // 3. Program page-by-page, never letting a PAGE_PROGRAM cross a page boundary (the chip
+        //    wraps the address within the page if you do, silently corrupting the write).
+        let mut offset = 0usize;
+        while offset < firmware.len() {
+            let page_end = (offset / page_size + 1) * page_size;
+            let chunk_end = page_end.min(firmware.len());
+            self.page_program(offset as u64, &firmware[offset..chunk_end])?;
+            offset = chunk_end;
+        }
+
+        // 4. Read back and compare unless the caller opted out.
+        let verified = if opts.skip_verify {
+            false
+        } else {
+            self.verify_chip(input_path)?.matches
+        };
+
+        Ok(WriteResult {
+            success: true,
+            backup_path,
+            verified,
+            duration_ms: start.elapsed().as_millis() as u64,
+            error: None,
+        })
     }
-    fn verify_chip(&mut self, _file_path: &Path) -> Result<VerifyResult> {
-        Err(BackendError::Other("verify_chip wired in D12".into()))
+    fn verify_chip(&mut self, file_path: &Path) -> Result<VerifyResult> {
+        let start = Instant::now();
+        let file_data = std::fs::read(file_path)?;
+        // Identify first so 4-byte mode (EN4B) is active before reading back a >16 MB chip;
+        // a standalone `verify` would otherwise read with 3-byte addressing.
+        self.identify_chip()?;
+        let chip_data = self.read_range(0, file_data.len())?;
+        let mut hc = Sha256::new();
+        hc.update(&chip_data);
+        let chip_checksum = hex_encode(&hc.finalize());
+        let mut hf = Sha256::new();
+        hf.update(&file_data);
+        let file_checksum = hex_encode(&hf.finalize());
+        Ok(VerifyResult {
+            matches: chip_checksum == file_checksum,
+            file_path: file_path.display().to_string(),
+            chip_checksum,
+            file_checksum,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
     }
     fn erase_chip(&mut self) -> Result<EraseResult> {
+        let start = Instant::now();
         self.spi_command(&[SPI_WREN])?;
         self.spi_command(&[SPI_CHIP_ERASE])?;
+        self.wait_until_ready(ERASE_TIMEOUT)?;
         Ok(EraseResult {
             success: true,
-            duration_ms: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
     }
     fn sector_erase(&mut self, address: u64) -> Result<EraseResult> {
+        let start = Instant::now();
         self.spi_command(&[SPI_WREN])?;
         let mut cmd = vec![if self.use_4byte_addr {
             SPI_SECTOR_ERASE_4B
@@ -419,13 +560,15 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         }];
         cmd.extend(address_bytes(address, self.use_4byte_addr));
         self.spi_command(&cmd)?;
+        self.wait_until_ready(ERASE_TIMEOUT)?;
         Ok(EraseResult {
             success: true,
-            duration_ms: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
     }
     fn block_erase(&mut self, address: u64) -> Result<EraseResult> {
+        let start = Instant::now();
         self.spi_command(&[SPI_WREN])?;
         let mut cmd = vec![if self.use_4byte_addr {
             SPI_BLOCK_ERASE_4B
@@ -434,14 +577,16 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         }];
         cmd.extend(address_bytes(address, self.use_4byte_addr));
         self.spi_command(&cmd)?;
+        self.wait_until_ready(ERASE_TIMEOUT)?;
         Ok(EraseResult {
             success: true,
-            duration_ms: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
     }
     fn region_erase(&mut self, start_addr: u64, length: u64) -> Result<EraseResult> {
-        // Sector-by-sector erase across the range.
+        // Sector-by-sector erase across the range; each sector_erase waits for WIP to clear.
+        let start = Instant::now();
         let mut addr = start_addr & !0xfff;
         let end = start_addr + length;
         while addr < end {
@@ -450,7 +595,7 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         }
         Ok(EraseResult {
             success: true,
-            duration_ms: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
     }
@@ -606,26 +751,29 @@ mod tests {
     }
 
     #[test]
-    fn backend_erase_chip_sends_wren_then_chip_erase() {
+    fn backend_erase_chip_sends_wren_then_chip_erase_then_polls_wip() {
         let mut bus = MockBus::new();
-        for _ in 0..4 {
-            // Two SPI commands × (CS_assert read + stream read + CS_deassert read) reads.
-            // Each spi_command reads exactly once (combined chunks). Two commands → 2 reads.
+        // WREN read, CHIP_ERASE read, then one RDSR poll whose byte[1]=0 → WIP clear.
+        for _ in 0..3 {
             bus.queue_read(vec![0; 8]);
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.erase_chip().unwrap();
         let bus = backend.bus.as_ref().unwrap();
-        // CS↓ + stream(WREN) + CS↑ + CS↓ + stream(C7) + CS↑ = 6 writes.
-        assert_eq!(bus.writes.len(), 6);
         assert_eq!(bus.writes[1][1], SPI_WREN);
         assert_eq!(bus.writes[4][1], SPI_CHIP_ERASE);
+        // A WIP poll (RDSR 0x05) must follow the erase — otherwise we'd race the busy chip.
+        assert!(bus
+            .writes
+            .iter()
+            .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_RDSR));
     }
 
     #[test]
     fn backend_sector_erase_uses_3byte_addr_by_default() {
         let mut bus = MockBus::new();
-        for _ in 0..2 {
+        // WREN, SECTOR_ERASE, RDSR poll (WIP clear).
+        for _ in 0..3 {
             bus.queue_read(vec![0; 8]);
         }
         let mut backend = CH341ABackend::with_bus(bus);
@@ -641,7 +789,8 @@ mod tests {
     #[test]
     fn backend_sector_erase_uses_4byte_when_enabled() {
         let mut bus = MockBus::new();
-        for _ in 0..2 {
+        // WREN, SECTOR_ERASE, RDSR poll (WIP clear).
+        for _ in 0..3 {
             bus.queue_read(vec![0; 8]);
         }
         let mut backend = CH341ABackend::with_bus(bus);
@@ -651,5 +800,349 @@ mod tests {
         let pkt = &bus.writes[4];
         assert_eq!(pkt[1], SPI_SECTOR_ERASE_4B);
         assert_eq!(&pkt[2..6], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    /// A bus that always reports the chip busy (WIP=1) — used to exercise the timeout path.
+    struct AlwaysBusyBus;
+    impl UsbBus for AlwaysBusyBus {
+        fn bulk_write(&mut self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
+            // byte[1] carries the status; WIP bit set.
+            let mut v = vec![0u8; len.max(2)];
+            v[1] = SR_WIP;
+            Ok(v)
+        }
+    }
+
+    #[test]
+    fn wait_until_ready_polls_rdsr_until_wip_clears() {
+        let mut bus = MockBus::new();
+        // Two busy polls (WIP=1) then ready (WIP=0). byte[1] is the status register.
+        bus.queue_read(vec![0x00, SR_WIP]);
+        bus.queue_read(vec![0x00, SR_WIP]);
+        bus.queue_read(vec![0x00, 0x00]);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.wait_until_ready(ERASE_TIMEOUT).unwrap();
+        let bus = backend.bus.as_ref().unwrap();
+        // Exactly three RDSR stream packets were issued (busy, busy, ready).
+        let rdsr_polls = bus
+            .writes
+            .iter()
+            .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_RDSR)
+            .count();
+        assert_eq!(rdsr_polls, 3);
+    }
+
+    #[test]
+    fn wait_until_ready_times_out_when_chip_never_ready() {
+        let mut backend = CH341ABackend::with_bus(AlwaysBusyBus);
+        let err = backend
+            .wait_until_ready(Duration::from_millis(5))
+            .unwrap_err();
+        assert!(format!("{err}").contains("busy"));
+    }
+
+    /// Index of the first SPI-stream packet whose opcode + 3-byte address match.
+    fn find_cmd_at_addr(writes: &[Vec<u8>], opcode: u8, addr3: [u8; 3]) -> Option<usize> {
+        writes.iter().position(|w| {
+            w.len() >= 5 && w[0] == CMD_SPI_STREAM && w[1] == opcode && w[2..5] == addr3
+        })
+    }
+
+    #[test]
+    fn write_chip_erases_then_page_programs_across_page_boundaries() {
+        // 300-byte image → spans two 256-byte pages, so we must see PAGE_PROGRAM at addr 0
+        // AND at addr 256 (0x000100). Erase must precede the first program.
+        let firmware: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let path = std::env::temp_dir().join("ratchet-test-d2-write.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        let mut bus = MockBus::new();
+        // RDID → Winbond W25Q128 (ef4018), the most common motherboard BIOS chip: 16 MB,
+        // 256-byte pages, 4 KB sectors, 3-byte addressing.
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x18]);
+        // Every subsequent read is don't-care except RDSR polls, whose byte[1]=0 ⇒ WIP clear.
+        for _ in 0..80 {
+            bus.queue_read(vec![0u8; 8]);
+        }
+        let mut backend = CH341ABackend::with_bus(bus);
+
+        let res = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap();
+        assert!(res.success);
+        assert_eq!(res.backup_path, None); // skip_backup honored
+        assert!(!res.verified); // skip_verify honored
+
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        let erase_idx = find_cmd_at_addr(writes, SPI_SECTOR_ERASE, [0, 0, 0])
+            .expect("sector-erase at addr 0 must be issued before programming");
+        let pp0_idx =
+            find_cmd_at_addr(writes, SPI_PAGE_PROGRAM, [0, 0, 0]).expect("page-program at addr 0");
+        let pp1_idx = find_cmd_at_addr(writes, SPI_PAGE_PROGRAM, [0x00, 0x01, 0x00])
+            .expect("page-program at addr 256 (page boundary split)");
+        // Erase before program; first page before second.
+        assert!(erase_idx < pp0_idx, "must erase before programming");
+        assert!(pp0_idx < pp1_idx, "pages programmed in order");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_chip_rejects_image_larger_than_chip() {
+        // Winbond W25Q64 (ef4017) = 8 MB. A 9 MB image must be rejected, not silently truncated.
+        let big = vec![0xa5u8; 9 * 1024 * 1024];
+        let path = std::env::temp_dir().join("ratchet-test-d2-oversize.bin");
+        std::fs::write(&path, &big).unwrap();
+
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x17]); // RDID → W25Q64, 8 MB
+        let mut backend = CH341ABackend::with_bus(bus);
+        let err = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("chip holds only"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A test bus that emulates a real SPI NOR flash behind the CH341A USB framing, so a full
+    /// write_chip → read-back → verify_chip cycle runs without hardware. It accumulates the SPI
+    /// bytes of each CS-low frame, answers reads full-duplex (response byte i depends on the
+    /// command bytes already in the frame), and applies erase/program side-effects on CS-high.
+    /// PAGE_PROGRAM uses real AND-into-flash semantics, so a missing erase-before-write would
+    /// leave stale 0-bits and fail verification — exactly like silicon.
+    struct LoopbackFlash {
+        flash: Vec<u8>,
+        jedec: [u8; 3],
+        frame: Vec<u8>,
+        read_pos: usize,
+    }
+    impl LoopbackFlash {
+        fn new(size: usize, jedec: [u8; 3]) -> Self {
+            Self {
+                flash: vec![0xff; size],
+                jedec,
+                frame: Vec::new(),
+                read_pos: 0,
+            }
+        }
+        fn decode_addr(bytes: &[u8]) -> usize {
+            bytes.iter().fold(0usize, |acc, &b| (acc << 8) | b as usize)
+        }
+        /// Full-duplex response for absolute frame position `pos`, given `self.frame` so far.
+        fn response_byte(&self, pos: usize) -> u8 {
+            if self.frame.is_empty() {
+                return 0;
+            }
+            match self.frame[0] {
+                SPI_RDID => {
+                    if (1..=3).contains(&pos) {
+                        self.jedec[pos - 1]
+                    } else {
+                        0
+                    }
+                }
+                SPI_RDSR | SPI_RDSR2 | SPI_RDSR3 => 0, // WIP clear
+                op @ (SPI_READ | SPI_READ_4B) => {
+                    let addr_len = if op == SPI_READ_4B { 4 } else { 3 };
+                    let data_start = 1 + addr_len;
+                    if pos >= data_start && self.frame.len() >= data_start {
+                        let base = Self::decode_addr(&self.frame[1..data_start]);
+                        *self.flash.get(base + (pos - data_start)).unwrap_or(&0xff)
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            }
+        }
+        /// Apply erase/program effects when the CS frame closes.
+        fn commit_frame(&mut self) {
+            if self.frame.is_empty() {
+                return;
+            }
+            match self.frame[0] {
+                SPI_CHIP_ERASE => self.flash.iter_mut().for_each(|b| *b = 0xff),
+                op @ (SPI_SECTOR_ERASE | SPI_SECTOR_ERASE_4B) => {
+                    let al = if op == SPI_SECTOR_ERASE_4B { 4 } else { 3 };
+                    let a = Self::decode_addr(&self.frame[1..1 + al]);
+                    for b in self.flash.iter_mut().skip(a).take(4096) {
+                        *b = 0xff;
+                    }
+                }
+                op @ (SPI_PAGE_PROGRAM | SPI_PAGE_PROGRAM_4B) => {
+                    let al = if op == SPI_PAGE_PROGRAM_4B { 4 } else { 3 };
+                    let a = Self::decode_addr(&self.frame[1..1 + al]);
+                    for (i, &d) in self.frame[1 + al..].iter().enumerate() {
+                        if let Some(cell) = self.flash.get_mut(a + i) {
+                            *cell &= d; // program can only clear bits — faithful to NOR flash
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.frame.clear();
+            self.read_pos = 0;
+        }
+    }
+    impl UsbBus for LoopbackFlash {
+        fn bulk_write(&mut self, data: &[u8]) -> Result<()> {
+            match data.first().copied() {
+                Some(CMD_UIO_STREAM) => {
+                    // CS bit clear ⇒ CS-low (frame start); CS bit set ⇒ CS-high (frame commit).
+                    if data.get(1).map(|b| b & STM_SPI_CS == 0).unwrap_or(false) {
+                        self.frame.clear();
+                        self.read_pos = 0;
+                    } else {
+                        self.commit_frame();
+                    }
+                }
+                Some(CMD_SPI_STREAM) => self.frame.extend_from_slice(&data[1..]),
+                _ => {}
+            }
+            Ok(())
+        }
+        fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
+            let out: Vec<u8> = (0..len)
+                .map(|j| self.response_byte(self.read_pos + j))
+                .collect();
+            self.read_pos += len;
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn write_then_verify_round_trip_via_loopback_flash() {
+        // Emulate a W25Q128 (ef4018). Image spans 2 sectors + 17 pages to exercise boundaries.
+        let firmware: Vec<u8> = (0..(4096u32 + 100)).map(|i| (i % 251) as u8).collect();
+        let path = std::env::temp_dir().join("ratchet-test-d3-roundtrip.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        let bus = LoopbackFlash::new(16 * 1024 * 1024, [0xef, 0x40, 0x18]);
+        let mut backend = CH341ABackend::with_bus(bus);
+
+        // Default-ish opts but skip the (16 MB) backup read to keep the test quick; DO verify.
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .unwrap();
+        assert!(w.success);
+        assert!(
+            w.verified,
+            "read-back verify after a real program cycle must match"
+        );
+
+        // Independent verify call against the same image also matches.
+        let v = backend.verify_chip(&path).unwrap();
+        assert!(v.matches);
+        assert_eq!(v.chip_checksum, v.file_checksum);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_chip_detects_mismatch_via_loopback() {
+        let firmware: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let written = std::env::temp_dir().join("ratchet-test-d3-written.bin");
+        let other = std::env::temp_dir().join("ratchet-test-d3-other.bin");
+        std::fs::write(&written, &firmware).unwrap();
+        std::fs::write(&other, vec![0x5au8; 1000]).unwrap();
+
+        let bus = LoopbackFlash::new(16 * 1024 * 1024, [0xef, 0x40, 0x18]);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend
+            .write_chip(
+                &written,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap();
+
+        // The chip now holds `firmware`; verifying a different file must NOT match.
+        let v = backend.verify_chip(&other).unwrap();
+        assert!(!v.matches, "verify must detect a chip≠file mismatch");
+        // And verifying the real image matches.
+        assert!(backend.verify_chip(&written).unwrap().matches);
+
+        std::fs::remove_file(&written).ok();
+        std::fs::remove_file(&other).ok();
+    }
+
+    #[test]
+    fn identify_large_chip_sends_en4b_and_enables_4byte() {
+        // W25Q256 (ef4019) = 32 MB → must enter 4-byte mode (EN4B 0xb7) so >16 MB is addressable.
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x19]);
+        for _ in 0..4 {
+            bus.queue_read(vec![0u8; 8]); // EN4B command's reads (don't-care)
+        }
+        let mut backend = CH341ABackend::with_bus(bus);
+        let info = backend.identify_chip().unwrap().unwrap();
+        assert!(info.size_bytes > SIZE_16MB);
+        assert!(backend.use_4byte_addr, "4-byte addressing flag must be set");
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        assert!(
+            writes
+                .iter()
+                .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EN4B),
+            "EN4B (0xb7) must be sent when identifying a >16 MB chip"
+        );
+    }
+
+    #[test]
+    fn identify_small_chip_does_not_send_en4b() {
+        // W25Q128 (ef4018) = 16 MB → stays in 3-byte mode, no EN4B.
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x18]);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.identify_chip().unwrap();
+        assert!(!backend.use_4byte_addr);
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        assert!(
+            !writes
+                .iter()
+                .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EN4B),
+            "EN4B must NOT be sent for a ≤16 MB chip"
+        );
+    }
+
+    #[test]
+    fn write_chip_refuses_blank_all_ff_image() {
+        // Flashing an all-0xFF (blank) image would wipe a working BIOS — must be refused.
+        let path = std::env::temp_dir().join("ratchet-test-blank-ff.bin");
+        std::fs::write(&path, vec![0xffu8; 4096]).unwrap();
+        let mut backend = CH341ABackend::with_bus(MockBus::new());
+        let err = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("blank"));
+        std::fs::remove_file(&path).ok();
     }
 }

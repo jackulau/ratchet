@@ -174,6 +174,7 @@ impl Backend for MockBackend {
             });
         }
         let firmware = std::fs::read(input_path)?;
+        super::reject_blank_image(&firmware)?;
         let backup_path = if opts.skip_backup {
             None
         } else {

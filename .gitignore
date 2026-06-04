@@ -7,3 +7,4 @@ tasks/
 !tasks/mcp-smoke.sh
 .claude/
 .claude-workspace/
+ratchet-backup-*.bin

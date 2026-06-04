@@ -9,7 +9,7 @@ use crate::types::*;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ─── USB device IDs ──────────────────────────────────────────────────────────
 
@@ -64,6 +64,10 @@ pub const SPI_CMD_BLOCK_ERASE_4BYTE: u8 = 0xdc;
 
 pub const SPI_SR_WIP: u8 = 0x01;
 pub const SPI_SR_WEL: u8 = 0x02;
+
+// WIP-poll timeouts. Page-program completes in ~ms; a full chip-erase can run for minutes.
+pub const PAGE_PROGRAM_TIMEOUT: Duration = Duration::from_millis(10_000);
+pub const ERASE_TIMEOUT: Duration = Duration::from_millis(240_000);
 
 pub const ADDR_4BYTE_THRESHOLD: u64 = 16 * 1024 * 1024;
 
@@ -249,6 +253,26 @@ impl<T: Transport> Ch347Protocol<T> {
         Ok(rx[1])
     }
 
+    /// Poll RDSR until the WIP bit clears or `timeout` elapses. Required after every erase and
+    /// program: the chip NAKs new commands while busy, and chip-erase runs for tens of seconds.
+    pub fn wait_until_ready(&mut self, timeout: Duration) -> Result<()> {
+        let start = Instant::now();
+        let mut backoff = Duration::from_micros(50);
+        loop {
+            if self.read_status_register()? & SPI_SR_WIP == 0 {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout {
+                return Err(BackendError::Other(format!(
+                    "chip still busy (WIP set) after {} ms",
+                    timeout.as_millis()
+                )));
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(20));
+        }
+    }
+
     pub fn write_enable(&mut self) -> Result<()> {
         self.spi_command(&[SPI_CMD_WREN]).map(|_| ())
     }
@@ -263,7 +287,8 @@ impl<T: Transport> Ch347Protocol<T> {
         });
         tx.extend(address_bytes(address, self.use_4byte_addr));
         tx.extend_from_slice(data);
-        self.spi_command(&tx).map(|_| ())
+        self.spi_command(&tx)?;
+        self.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
     }
 
     pub fn sector_erase(&mut self, address: u32) -> Result<()> {
@@ -275,7 +300,8 @@ impl<T: Transport> Ch347Protocol<T> {
             SPI_CMD_SECTOR_ERASE
         });
         tx.extend(address_bytes(address, self.use_4byte_addr));
-        self.spi_command(&tx).map(|_| ())
+        self.spi_command(&tx)?;
+        self.wait_until_ready(ERASE_TIMEOUT)
     }
 
     pub fn block_erase_64k(&mut self, address: u32) -> Result<()> {
@@ -287,12 +313,14 @@ impl<T: Transport> Ch347Protocol<T> {
             SPI_CMD_BLOCK_ERASE
         });
         tx.extend(address_bytes(address, self.use_4byte_addr));
-        self.spi_command(&tx).map(|_| ())
+        self.spi_command(&tx)?;
+        self.wait_until_ready(ERASE_TIMEOUT)
     }
 
     pub fn chip_erase(&mut self) -> Result<()> {
         self.write_enable()?;
-        self.spi_command(&[SPI_CMD_CHIP_ERASE]).map(|_| ())
+        self.spi_command(&[SPI_CMD_CHIP_ERASE])?;
+        self.wait_until_ready(ERASE_TIMEOUT)
     }
 
     pub fn read_data(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
@@ -377,23 +405,27 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
     fn identify_chip(&mut self) -> Result<Option<ChipInfo>> {
         let id = self.proto.read_jedec_id()?;
         let hex = id.to_hex();
-        if let Some(db) = lookup_by_jedec_id(&hex) {
-            Ok(Some(ChipInfo {
-                name: db.name.clone(),
-                vendor_name: db.vendor.clone(),
-                jedec_id: hex,
-                size_bytes: db.size_bytes,
-                size_human: format_size(db.size_bytes),
-                chip_type: "spi".to_string(),
-                page_size: Some(db.page_size),
-                sector_size: Some(db.sector_size),
-                block_size: Some(db.block_size),
-                write_protected: None,
-                voltage: Some(db.voltage),
-            }))
-        } else {
-            Ok(None)
+        let Some(db) = lookup_by_jedec_id(&hex) else {
+            return Ok(None);
+        };
+        let info = ChipInfo {
+            name: db.name.clone(),
+            vendor_name: db.vendor.clone(),
+            jedec_id: hex,
+            size_bytes: db.size_bytes,
+            size_human: format_size(db.size_bytes),
+            chip_type: "spi".to_string(),
+            page_size: Some(db.page_size),
+            sector_size: Some(db.sector_size),
+            block_size: Some(db.block_size),
+            write_protected: None,
+            voltage: Some(db.voltage),
+        };
+        // Chips larger than 16 MB need 4-byte addressing — enter it now (sends EN4B 0xb7).
+        if db.size_bytes > 16 * 1024 * 1024 {
+            self.proto.enter_4byte_mode()?;
         }
+        Ok(Some(info))
     }
 
     fn read_status_registers(&mut self) -> Result<StatusRegisters> {
@@ -410,7 +442,13 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
 
     fn read_chip(&mut self, output_path: &Path) -> Result<ReadResult> {
         let start = Instant::now();
-        let data = self.proto.read_data(0, 8 * 1024 * 1024)?;
+        // Read the ACTUAL chip size, not a hardcoded 8 MB (a 16 MB BIOS was reading half).
+        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        let size = chip.size_bytes as usize;
+        if size == 0 {
+            return Err(BackendError::ChipNotDetected);
+        }
+        let data = self.proto.read_data(0, size)?;
         fs::write(output_path, &data)?;
         Ok(ReadResult {
             success: true,
@@ -424,16 +462,64 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
         })
     }
 
-    fn write_chip(&mut self, input_path: &Path, _opts: WriteOpts) -> Result<WriteResult> {
+    fn write_chip(&mut self, input_path: &Path, opts: WriteOpts) -> Result<WriteResult> {
         let start = Instant::now();
         let firmware = fs::read(input_path)?;
-        for (i, chunk) in firmware.chunks(256).enumerate() {
-            self.proto.page_program((i * 256) as u32, chunk)?;
+        super::reject_blank_image(&firmware)?;
+        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        let chip_size = chip.size_bytes as usize;
+        if chip_size > 0 && firmware.len() > chip_size {
+            return Err(BackendError::Other(format!(
+                "image is {} bytes but the chip holds only {} bytes",
+                firmware.len(),
+                chip_size
+            )));
         }
+        let page_size = chip.page_size.unwrap_or(256).max(1) as usize;
+        let sector_size = chip.sector_size.unwrap_or(4096).max(1);
+
+        // 1. Back up current contents before overwriting (unless skipped).
+        let backup_path = if opts.skip_backup {
+            None
+        } else {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!("ratchet-backup-{}.bin", ts));
+            self.read_chip(&path)?;
+            Some(path.display().to_string())
+        };
+
+        // 2. Erase the sectors the image covers — program can only flip 1→0 (each sector_erase
+        //    now WREN + erase + WIP-wait). Previously write skipped erase entirely.
+        let mut addr: u32 = 0;
+        while (addr as usize) < firmware.len() {
+            self.proto.sector_erase(addr)?;
+            addr = addr.saturating_add(sector_size);
+        }
+
+        // 3. Program page-by-page, never crossing a page boundary.
+        let mut offset = 0usize;
+        while offset < firmware.len() {
+            let page_end = (offset / page_size + 1) * page_size;
+            let chunk_end = page_end.min(firmware.len());
+            self.proto
+                .page_program(offset as u32, &firmware[offset..chunk_end])?;
+            offset = chunk_end;
+        }
+
+        // 4. Read back and compare unless skipped — no more hardcoded `verified: true`.
+        let verified = if opts.skip_verify {
+            false
+        } else {
+            self.verify_chip(input_path)?.matches
+        };
+
         Ok(WriteResult {
             success: true,
-            backup_path: None,
-            verified: true,
+            backup_path,
+            verified,
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
@@ -442,6 +528,9 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
     fn verify_chip(&mut self, file_path: &Path) -> Result<VerifyResult> {
         let start = Instant::now();
         let file_data = fs::read(file_path)?;
+        // Identify first so 4-byte mode (EN4B) is active before reading back a >16 MB chip;
+        // a standalone `verify` would otherwise read with 3-byte addressing and misaddress.
+        self.identify_chip()?;
         let chip_data = self.proto.read_data(0, file_data.len())?;
         let chip_checksum = sha256_hex(&chip_data);
         let file_checksum = sha256_hex(&file_data);
@@ -750,6 +839,32 @@ mod tests {
     }
 
     #[test]
+    fn page_program_polls_wip_after_write() {
+        // Empty read queue ⇒ CapturingTransport returns zeros ⇒ RDSR reads WIP=0 (ready).
+        let mut p = Ch347Protocol::new(CapturingTransport::new());
+        p.page_program(0, &[0xab; 16]).unwrap();
+        // A WIP poll (RDSR) CS_XFER must appear after the PAGE_PROGRAM, else we'd race the chip.
+        let polled = p
+            .transport_mut()
+            .writes
+            .iter()
+            .any(|w| w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_RDSR);
+        assert!(polled, "page_program must poll RDSR/WIP before returning");
+    }
+
+    #[test]
+    fn chip_erase_polls_wip_after_erase() {
+        let mut p = Ch347Protocol::new(CapturingTransport::new());
+        p.chip_erase().unwrap();
+        let polled = p
+            .transport_mut()
+            .writes
+            .iter()
+            .any(|w| w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_RDSR);
+        assert!(polled, "chip_erase must poll RDSR/WIP before returning");
+    }
+
+    #[test]
     fn page_program_4byte_uses_12_opcode() {
         let t = primed_transport(vec![
             vec![0u8; 4 + 1],
@@ -820,5 +935,36 @@ mod tests {
         let mut b = Ch347Backend::new(t);
         let id = Backend::read_jedec_id(&mut b).unwrap();
         assert_eq!(id.to_hex(), "ef4017");
+    }
+
+    #[test]
+    fn backend_identify_large_chip_enters_4byte_en4b() {
+        // W25Q256 (ef4019) = 32 MB → identify must enter 4-byte mode (EN4B 0xb7).
+        let t = primed_transport(vec![vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x19]]);
+        let mut b = Ch347Backend::new(t);
+        let info = Backend::identify_chip(&mut b).unwrap().unwrap();
+        assert!(info.size_bytes > 16 * 1024 * 1024);
+        assert!(b.protocol().use_4byte_addr(), "4-byte mode must be enabled");
+        let sent_en4b =
+            b.protocol().transport_mut().writes.iter().any(|w| {
+                w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_ENTER_4BYTE
+            });
+        assert!(sent_en4b, "EN4B (0xb7) must be sent for a >16 MB chip");
+    }
+
+    #[test]
+    fn backend_verify_enters_4byte_for_large_chip() {
+        // A standalone verify of a >16 MB chip must identify first and enter 4-byte mode,
+        // otherwise it reads back with 3-byte addressing and misaddresses the chip.
+        let path = std::env::temp_dir().join("ratchet-ch347-verify-4b.bin");
+        std::fs::write(&path, vec![0xa5u8; 32]).unwrap();
+        let t = primed_transport(vec![vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x19]]); // RDID → ef4019 (32 MB)
+        let mut b = Ch347Backend::new(t);
+        let _ = Backend::verify_chip(&mut b, &path);
+        assert!(
+            b.protocol().use_4byte_addr(),
+            "verify_chip must enter 4-byte mode for a >16 MB chip"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }
