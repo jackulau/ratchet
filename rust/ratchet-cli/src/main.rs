@@ -1239,16 +1239,22 @@ fn cmd_serial_list(json: bool) -> anyhow::Result<()> {
 fn cmd_chip_info(key: &str, json: bool) -> anyhow::Result<()> {
     let chip = ratchet_core::chips::lookup_by_jedec_id(key)
         .or_else(|| ratchet_core::chips::lookup_by_name(key));
-    let env = AgentEnvelope::ok("chip-info", chip.cloned());
-    emit_envelope(&env, json, || match chip {
-        Some(c) => println!(
+    // A lookup miss is a failure, not an "ok" envelope with null data — fail honestly
+    // (consistent with the other bogus-input handlers, e.g. post-decode / unknown 24Cxx part).
+    let Some(c) = chip else {
+        anyhow::bail!(
+            "chip not found: {key} (try a JEDEC id like ef4018 or a name like W25Q128JV)"
+        );
+    };
+    let env = AgentEnvelope::ok("chip-info", Some(c.clone()));
+    emit_envelope(&env, json, || {
+        println!(
             "{} ({}) jedec={} size={}",
             c.name,
             c.vendor,
             c.jedec_id,
             ratchet_core::chips::format_size(c.size_bytes)
-        ),
-        None => println!("not found: {key}"),
+        )
     })
 }
 
