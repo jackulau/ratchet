@@ -9,7 +9,7 @@ use crate::types::*;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ─── USB device IDs ──────────────────────────────────────────────────────────
 
@@ -64,6 +64,10 @@ pub const SPI_CMD_BLOCK_ERASE_4BYTE: u8 = 0xdc;
 
 pub const SPI_SR_WIP: u8 = 0x01;
 pub const SPI_SR_WEL: u8 = 0x02;
+
+// WIP-poll timeouts. Page-program completes in ~ms; a full chip-erase can run for minutes.
+pub const PAGE_PROGRAM_TIMEOUT: Duration = Duration::from_millis(10_000);
+pub const ERASE_TIMEOUT: Duration = Duration::from_millis(240_000);
 
 pub const ADDR_4BYTE_THRESHOLD: u64 = 16 * 1024 * 1024;
 
@@ -249,6 +253,26 @@ impl<T: Transport> Ch347Protocol<T> {
         Ok(rx[1])
     }
 
+    /// Poll RDSR until the WIP bit clears or `timeout` elapses. Required after every erase and
+    /// program: the chip NAKs new commands while busy, and chip-erase runs for tens of seconds.
+    pub fn wait_until_ready(&mut self, timeout: Duration) -> Result<()> {
+        let start = Instant::now();
+        let mut backoff = Duration::from_micros(50);
+        loop {
+            if self.read_status_register()? & SPI_SR_WIP == 0 {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout {
+                return Err(BackendError::Other(format!(
+                    "chip still busy (WIP set) after {} ms",
+                    timeout.as_millis()
+                )));
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(20));
+        }
+    }
+
     pub fn write_enable(&mut self) -> Result<()> {
         self.spi_command(&[SPI_CMD_WREN]).map(|_| ())
     }
@@ -263,7 +287,8 @@ impl<T: Transport> Ch347Protocol<T> {
         });
         tx.extend(address_bytes(address, self.use_4byte_addr));
         tx.extend_from_slice(data);
-        self.spi_command(&tx).map(|_| ())
+        self.spi_command(&tx)?;
+        self.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
     }
 
     pub fn sector_erase(&mut self, address: u32) -> Result<()> {
@@ -275,7 +300,8 @@ impl<T: Transport> Ch347Protocol<T> {
             SPI_CMD_SECTOR_ERASE
         });
         tx.extend(address_bytes(address, self.use_4byte_addr));
-        self.spi_command(&tx).map(|_| ())
+        self.spi_command(&tx)?;
+        self.wait_until_ready(ERASE_TIMEOUT)
     }
 
     pub fn block_erase_64k(&mut self, address: u32) -> Result<()> {
@@ -287,12 +313,14 @@ impl<T: Transport> Ch347Protocol<T> {
             SPI_CMD_BLOCK_ERASE
         });
         tx.extend(address_bytes(address, self.use_4byte_addr));
-        self.spi_command(&tx).map(|_| ())
+        self.spi_command(&tx)?;
+        self.wait_until_ready(ERASE_TIMEOUT)
     }
 
     pub fn chip_erase(&mut self) -> Result<()> {
         self.write_enable()?;
-        self.spi_command(&[SPI_CMD_CHIP_ERASE]).map(|_| ())
+        self.spi_command(&[SPI_CMD_CHIP_ERASE])?;
+        self.wait_until_ready(ERASE_TIMEOUT)
     }
 
     pub fn read_data(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
@@ -410,7 +438,13 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
 
     fn read_chip(&mut self, output_path: &Path) -> Result<ReadResult> {
         let start = Instant::now();
-        let data = self.proto.read_data(0, 8 * 1024 * 1024)?;
+        // Read the ACTUAL chip size, not a hardcoded 8 MB (a 16 MB BIOS was reading half).
+        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        let size = chip.size_bytes as usize;
+        if size == 0 {
+            return Err(BackendError::ChipNotDetected);
+        }
+        let data = self.proto.read_data(0, size)?;
         fs::write(output_path, &data)?;
         Ok(ReadResult {
             success: true,
@@ -424,16 +458,63 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
         })
     }
 
-    fn write_chip(&mut self, input_path: &Path, _opts: WriteOpts) -> Result<WriteResult> {
+    fn write_chip(&mut self, input_path: &Path, opts: WriteOpts) -> Result<WriteResult> {
         let start = Instant::now();
         let firmware = fs::read(input_path)?;
-        for (i, chunk) in firmware.chunks(256).enumerate() {
-            self.proto.page_program((i * 256) as u32, chunk)?;
+        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        let chip_size = chip.size_bytes as usize;
+        if chip_size > 0 && firmware.len() > chip_size {
+            return Err(BackendError::Other(format!(
+                "image is {} bytes but the chip holds only {} bytes",
+                firmware.len(),
+                chip_size
+            )));
         }
+        let page_size = chip.page_size.unwrap_or(256).max(1) as usize;
+        let sector_size = chip.sector_size.unwrap_or(4096).max(1) as u32;
+
+        // 1. Back up current contents before overwriting (unless skipped).
+        let backup_path = if opts.skip_backup {
+            None
+        } else {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!("ratchet-backup-{}.bin", ts));
+            self.read_chip(&path)?;
+            Some(path.display().to_string())
+        };
+
+        // 2. Erase the sectors the image covers — program can only flip 1→0 (each sector_erase
+        //    now WREN + erase + WIP-wait). Previously write skipped erase entirely.
+        let mut addr: u32 = 0;
+        while (addr as usize) < firmware.len() {
+            self.proto.sector_erase(addr)?;
+            addr = addr.saturating_add(sector_size);
+        }
+
+        // 3. Program page-by-page, never crossing a page boundary.
+        let mut offset = 0usize;
+        while offset < firmware.len() {
+            let page_end = (offset / page_size + 1) * page_size;
+            let chunk_end = page_end.min(firmware.len());
+            self.proto
+                .page_program(offset as u32, &firmware[offset..chunk_end])?;
+            offset = chunk_end;
+        }
+
+        // 4. Read back and compare unless skipped — no more hardcoded `verified: true`.
+        let verified = if opts.skip_verify {
+            false
+        } else {
+            self.verify_chip(input_path)?.matches
+        };
+
         Ok(WriteResult {
             success: true,
-            backup_path: None,
-            verified: true,
+            backup_path,
+            verified,
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
@@ -747,6 +828,32 @@ mod tests {
         // 3-byte addr (all zero) + 256 data bytes.
         assert_eq!(&writes[2][5..8], &[0, 0, 0]);
         assert_eq!(writes[2][8], 0); // first data byte
+    }
+
+    #[test]
+    fn page_program_polls_wip_after_write() {
+        // Empty read queue ⇒ CapturingTransport returns zeros ⇒ RDSR reads WIP=0 (ready).
+        let mut p = Ch347Protocol::new(CapturingTransport::new());
+        p.page_program(0, &[0xab; 16]).unwrap();
+        // A WIP poll (RDSR) CS_XFER must appear after the PAGE_PROGRAM, else we'd race the chip.
+        let polled = p
+            .transport_mut()
+            .writes
+            .iter()
+            .any(|w| w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_RDSR);
+        assert!(polled, "page_program must poll RDSR/WIP before returning");
+    }
+
+    #[test]
+    fn chip_erase_polls_wip_after_erase() {
+        let mut p = Ch347Protocol::new(CapturingTransport::new());
+        p.chip_erase().unwrap();
+        let polled = p
+            .transport_mut()
+            .writes
+            .iter()
+            .any(|w| w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_RDSR);
+        assert!(polled, "chip_erase must poll RDSR/WIP before returning");
     }
 
     #[test]
