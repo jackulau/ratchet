@@ -528,6 +528,9 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
     fn verify_chip(&mut self, file_path: &Path) -> Result<VerifyResult> {
         let start = Instant::now();
         let file_data = fs::read(file_path)?;
+        // Identify first so 4-byte mode (EN4B) is active before reading back a >16 MB chip;
+        // a standalone `verify` would otherwise read with 3-byte addressing and misaddress.
+        self.identify_chip()?;
         let chip_data = self.proto.read_data(0, file_data.len())?;
         let chip_checksum = sha256_hex(&chip_data);
         let file_checksum = sha256_hex(&file_data);
@@ -947,5 +950,21 @@ mod tests {
                 w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_ENTER_4BYTE
             });
         assert!(sent_en4b, "EN4B (0xb7) must be sent for a >16 MB chip");
+    }
+
+    #[test]
+    fn backend_verify_enters_4byte_for_large_chip() {
+        // A standalone verify of a >16 MB chip must identify first and enter 4-byte mode,
+        // otherwise it reads back with 3-byte addressing and misaddresses the chip.
+        let path = std::env::temp_dir().join("ratchet-ch347-verify-4b.bin");
+        std::fs::write(&path, vec![0xa5u8; 32]).unwrap();
+        let t = primed_transport(vec![vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x19]]); // RDID → ef4019 (32 MB)
+        let mut b = Ch347Backend::new(t);
+        let _ = Backend::verify_chip(&mut b, &path);
+        assert!(
+            b.protocol().use_4byte_addr(),
+            "verify_chip must enter 4-byte mode for a >16 MB chip"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }
