@@ -241,6 +241,33 @@ impl<B: UsbBus> CH341ABackend<B> {
         let rx = self.spi_command(&[SPI_RDID, 0, 0, 0])?;
         decode_jedec_response(&rx).ok_or(BackendError::ChipNotDetected)
     }
+
+    /// Poll RDSR until the write-in-progress (WIP) bit clears, or `timeout` elapses.
+    /// Every erase and page-program MUST be followed by this: SPI flash NAKs further
+    /// commands while an internal write/erase is running, and chip-erase can take well
+    /// over a minute on a 16MB part. Skipping it silently corrupts writes.
+    pub fn wait_until_ready(&mut self, timeout: Duration) -> Result<()> {
+        let start = Instant::now();
+        let mut backoff = Duration::from_micros(50);
+        loop {
+            let sr1 = self
+                .spi_command(&[SPI_RDSR, 0])?
+                .get(1)
+                .copied()
+                .unwrap_or(0);
+            if sr1 & SR_WIP == 0 {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout {
+                return Err(BackendError::Other(format!(
+                    "chip still busy (WIP set) after {} ms",
+                    timeout.as_millis()
+                )));
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(20));
+        }
+    }
 }
 
 impl<B: UsbBus> Backend for CH341ABackend<B> {
@@ -402,15 +429,18 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         Err(BackendError::Other("verify_chip wired in D12".into()))
     }
     fn erase_chip(&mut self) -> Result<EraseResult> {
+        let start = Instant::now();
         self.spi_command(&[SPI_WREN])?;
         self.spi_command(&[SPI_CHIP_ERASE])?;
+        self.wait_until_ready(ERASE_TIMEOUT)?;
         Ok(EraseResult {
             success: true,
-            duration_ms: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
     }
     fn sector_erase(&mut self, address: u64) -> Result<EraseResult> {
+        let start = Instant::now();
         self.spi_command(&[SPI_WREN])?;
         let mut cmd = vec![if self.use_4byte_addr {
             SPI_SECTOR_ERASE_4B
@@ -419,13 +449,15 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         }];
         cmd.extend(address_bytes(address, self.use_4byte_addr));
         self.spi_command(&cmd)?;
+        self.wait_until_ready(ERASE_TIMEOUT)?;
         Ok(EraseResult {
             success: true,
-            duration_ms: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
     }
     fn block_erase(&mut self, address: u64) -> Result<EraseResult> {
+        let start = Instant::now();
         self.spi_command(&[SPI_WREN])?;
         let mut cmd = vec![if self.use_4byte_addr {
             SPI_BLOCK_ERASE_4B
@@ -434,14 +466,16 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         }];
         cmd.extend(address_bytes(address, self.use_4byte_addr));
         self.spi_command(&cmd)?;
+        self.wait_until_ready(ERASE_TIMEOUT)?;
         Ok(EraseResult {
             success: true,
-            duration_ms: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
     }
     fn region_erase(&mut self, start_addr: u64, length: u64) -> Result<EraseResult> {
-        // Sector-by-sector erase across the range.
+        // Sector-by-sector erase across the range; each sector_erase waits for WIP to clear.
+        let start = Instant::now();
         let mut addr = start_addr & !0xfff;
         let end = start_addr + length;
         while addr < end {
@@ -450,7 +484,7 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         }
         Ok(EraseResult {
             success: true,
-            duration_ms: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
     }
@@ -606,26 +640,29 @@ mod tests {
     }
 
     #[test]
-    fn backend_erase_chip_sends_wren_then_chip_erase() {
+    fn backend_erase_chip_sends_wren_then_chip_erase_then_polls_wip() {
         let mut bus = MockBus::new();
-        for _ in 0..4 {
-            // Two SPI commands × (CS_assert read + stream read + CS_deassert read) reads.
-            // Each spi_command reads exactly once (combined chunks). Two commands → 2 reads.
+        // WREN read, CHIP_ERASE read, then one RDSR poll whose byte[1]=0 → WIP clear.
+        for _ in 0..3 {
             bus.queue_read(vec![0; 8]);
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.erase_chip().unwrap();
         let bus = backend.bus.as_ref().unwrap();
-        // CS↓ + stream(WREN) + CS↑ + CS↓ + stream(C7) + CS↑ = 6 writes.
-        assert_eq!(bus.writes.len(), 6);
         assert_eq!(bus.writes[1][1], SPI_WREN);
         assert_eq!(bus.writes[4][1], SPI_CHIP_ERASE);
+        // A WIP poll (RDSR 0x05) must follow the erase — otherwise we'd race the busy chip.
+        assert!(bus
+            .writes
+            .iter()
+            .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_RDSR));
     }
 
     #[test]
     fn backend_sector_erase_uses_3byte_addr_by_default() {
         let mut bus = MockBus::new();
-        for _ in 0..2 {
+        // WREN, SECTOR_ERASE, RDSR poll (WIP clear).
+        for _ in 0..3 {
             bus.queue_read(vec![0; 8]);
         }
         let mut backend = CH341ABackend::with_bus(bus);
@@ -641,7 +678,8 @@ mod tests {
     #[test]
     fn backend_sector_erase_uses_4byte_when_enabled() {
         let mut bus = MockBus::new();
-        for _ in 0..2 {
+        // WREN, SECTOR_ERASE, RDSR poll (WIP clear).
+        for _ in 0..3 {
             bus.queue_read(vec![0; 8]);
         }
         let mut backend = CH341ABackend::with_bus(bus);
@@ -651,5 +689,47 @@ mod tests {
         let pkt = &bus.writes[4];
         assert_eq!(pkt[1], SPI_SECTOR_ERASE_4B);
         assert_eq!(&pkt[2..6], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    /// A bus that always reports the chip busy (WIP=1) — used to exercise the timeout path.
+    struct AlwaysBusyBus;
+    impl UsbBus for AlwaysBusyBus {
+        fn bulk_write(&mut self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
+            // byte[1] carries the status; WIP bit set.
+            let mut v = vec![0u8; len.max(2)];
+            v[1] = SR_WIP;
+            Ok(v)
+        }
+    }
+
+    #[test]
+    fn wait_until_ready_polls_rdsr_until_wip_clears() {
+        let mut bus = MockBus::new();
+        // Two busy polls (WIP=1) then ready (WIP=0). byte[1] is the status register.
+        bus.queue_read(vec![0x00, SR_WIP]);
+        bus.queue_read(vec![0x00, SR_WIP]);
+        bus.queue_read(vec![0x00, 0x00]);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.wait_until_ready(ERASE_TIMEOUT).unwrap();
+        let bus = backend.bus.as_ref().unwrap();
+        // Exactly three RDSR stream packets were issued (busy, busy, ready).
+        let rdsr_polls = bus
+            .writes
+            .iter()
+            .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_RDSR)
+            .count();
+        assert_eq!(rdsr_polls, 3);
+    }
+
+    #[test]
+    fn wait_until_ready_times_out_when_chip_never_ready() {
+        let mut backend = CH341ABackend::with_bus(AlwaysBusyBus);
+        let err = backend
+            .wait_until_ready(Duration::from_millis(5))
+            .unwrap_err();
+        assert!(format!("{err}").contains("busy"));
     }
 }
