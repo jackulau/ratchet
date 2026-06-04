@@ -307,6 +307,16 @@ impl<B: UsbBus> CH341ABackend<B> {
         self.spi_command(&cmd)?;
         self.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
     }
+
+    /// Put the chip into 4-byte address mode (EN4B, 0xb7) and remember it. Required for chips
+    /// larger than 16 MB: without it a 4-byte address sent after a plain READ (0x03) is
+    /// misinterpreted, so reads/writes land at the wrong offset. Sending EN4B is the most
+    /// compatible activation — it works even on parts that lack the dedicated 4-byte opcodes.
+    pub fn enter_4byte_mode(&mut self) -> Result<()> {
+        self.spi_command(&[SPI_EN4B])?;
+        self.use_4byte_addr = true;
+        Ok(())
+    }
 }
 
 impl<B: UsbBus> Backend for CH341ABackend<B> {
@@ -336,13 +346,10 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
             return Ok(None);
         }
         let info = if let Some(db) = lookup_by_jedec_id(&hex) {
-            if db.size_bytes > SIZE_16MB {
-                self.use_4byte_addr = true;
-            }
             ChipInfo {
                 name: db.name.clone(),
                 vendor_name: db.vendor.clone(),
-                jedec_id: hex,
+                jedec_id: hex.clone(),
                 size_bytes: db.size_bytes,
                 size_human: format_size(db.size_bytes),
                 chip_type: "spi".into(),
@@ -353,14 +360,10 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
                 voltage: Some(db.voltage),
             }
         } else {
-            let needs_4b = needs_4byte_addressing(&hex);
-            if needs_4b {
-                self.use_4byte_addr = true;
-            }
             ChipInfo {
                 name: format!("Unknown {}", hex.to_ascii_uppercase()),
                 vendor_name: "Unknown".into(),
-                jedec_id: hex,
+                jedec_id: hex.clone(),
                 size_bytes: 0,
                 size_human: "?".into(),
                 chip_type: "spi".into(),
@@ -371,6 +374,16 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
                 voltage: None,
             }
         };
+        // Chips larger than 16 MB need 4-byte addressing; enter it now (sends EN4B) so every
+        // subsequent read/write/erase addresses the full chip instead of wrapping at 16 MB.
+        let needs_4b = if info.size_bytes > 0 {
+            info.size_bytes > SIZE_16MB
+        } else {
+            needs_4byte_addressing(&hex)
+        };
+        if needs_4b {
+            self.enter_4byte_mode()?;
+        }
         Ok(Some(info))
     }
     fn read_status_registers(&mut self) -> Result<StatusRegisters> {
@@ -507,6 +520,9 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
     fn verify_chip(&mut self, file_path: &Path) -> Result<VerifyResult> {
         let start = Instant::now();
         let file_data = std::fs::read(file_path)?;
+        // Identify first so 4-byte mode (EN4B) is active before reading back a >16 MB chip;
+        // a standalone `verify` would otherwise read with 3-byte addressing.
+        self.identify_chip()?;
         let chip_data = self.read_range(0, file_data.len())?;
         let mut hc = Sha256::new();
         hc.update(&chip_data);
@@ -1070,5 +1086,43 @@ mod tests {
 
         std::fs::remove_file(&written).ok();
         std::fs::remove_file(&other).ok();
+    }
+
+    #[test]
+    fn identify_large_chip_sends_en4b_and_enables_4byte() {
+        // W25Q256 (ef4019) = 32 MB → must enter 4-byte mode (EN4B 0xb7) so >16 MB is addressable.
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x19]);
+        for _ in 0..4 {
+            bus.queue_read(vec![0u8; 8]); // EN4B command's reads (don't-care)
+        }
+        let mut backend = CH341ABackend::with_bus(bus);
+        let info = backend.identify_chip().unwrap().unwrap();
+        assert!(info.size_bytes > SIZE_16MB);
+        assert!(backend.use_4byte_addr, "4-byte addressing flag must be set");
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        assert!(
+            writes
+                .iter()
+                .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EN4B),
+            "EN4B (0xb7) must be sent when identifying a >16 MB chip"
+        );
+    }
+
+    #[test]
+    fn identify_small_chip_does_not_send_en4b() {
+        // W25Q128 (ef4018) = 16 MB → stays in 3-byte mode, no EN4B.
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x18]);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.identify_chip().unwrap();
+        assert!(!backend.use_4byte_addr);
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        assert!(
+            !writes
+                .iter()
+                .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EN4B),
+            "EN4B must NOT be sent for a ≤16 MB chip"
+        );
     }
 }

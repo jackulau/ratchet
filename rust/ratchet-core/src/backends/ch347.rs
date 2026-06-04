@@ -405,23 +405,27 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
     fn identify_chip(&mut self) -> Result<Option<ChipInfo>> {
         let id = self.proto.read_jedec_id()?;
         let hex = id.to_hex();
-        if let Some(db) = lookup_by_jedec_id(&hex) {
-            Ok(Some(ChipInfo {
-                name: db.name.clone(),
-                vendor_name: db.vendor.clone(),
-                jedec_id: hex,
-                size_bytes: db.size_bytes,
-                size_human: format_size(db.size_bytes),
-                chip_type: "spi".to_string(),
-                page_size: Some(db.page_size),
-                sector_size: Some(db.sector_size),
-                block_size: Some(db.block_size),
-                write_protected: None,
-                voltage: Some(db.voltage),
-            }))
-        } else {
-            Ok(None)
+        let Some(db) = lookup_by_jedec_id(&hex) else {
+            return Ok(None);
+        };
+        let info = ChipInfo {
+            name: db.name.clone(),
+            vendor_name: db.vendor.clone(),
+            jedec_id: hex,
+            size_bytes: db.size_bytes,
+            size_human: format_size(db.size_bytes),
+            chip_type: "spi".to_string(),
+            page_size: Some(db.page_size),
+            sector_size: Some(db.sector_size),
+            block_size: Some(db.block_size),
+            write_protected: None,
+            voltage: Some(db.voltage),
+        };
+        // Chips larger than 16 MB need 4-byte addressing — enter it now (sends EN4B 0xb7).
+        if db.size_bytes > 16 * 1024 * 1024 {
+            self.proto.enter_4byte_mode()?;
         }
+        Ok(Some(info))
     }
 
     fn read_status_registers(&mut self) -> Result<StatusRegisters> {
@@ -927,5 +931,20 @@ mod tests {
         let mut b = Ch347Backend::new(t);
         let id = Backend::read_jedec_id(&mut b).unwrap();
         assert_eq!(id.to_hex(), "ef4017");
+    }
+
+    #[test]
+    fn backend_identify_large_chip_enters_4byte_en4b() {
+        // W25Q256 (ef4019) = 32 MB → identify must enter 4-byte mode (EN4B 0xb7).
+        let t = primed_transport(vec![vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x19]]);
+        let mut b = Ch347Backend::new(t);
+        let info = Backend::identify_chip(&mut b).unwrap().unwrap();
+        assert!(info.size_bytes > 16 * 1024 * 1024);
+        assert!(b.protocol().use_4byte_addr(), "4-byte mode must be enabled");
+        let sent_en4b =
+            b.protocol().transport_mut().writes.iter().any(|w| {
+                w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_ENTER_4BYTE
+            });
+        assert!(sent_en4b, "EN4B (0xb7) must be sent for a >16 MB chip");
     }
 }
