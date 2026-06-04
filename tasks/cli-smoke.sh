@@ -75,8 +75,13 @@ run "wp-status"          $RATCHET wp-status
 DUMP="$TMP/dump.bin"
 run "read (backup)"      $RATCHET read "$DUMP"
 if [ -s "$DUMP" ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); FAILED_CMDS+=("read produced empty file"); fi
-run "write (auto backup + verify)"      $RATCHET write "$DUMP"
-run "write --skip-backup --skip-verify" $RATCHET write "$DUMP" --skip-backup --skip-verify
+# A real (non-blank) image to flash — an all-0xFF dump is correctly refused, so derive
+# a varied 4 MB image from the binary itself.
+IMG="$TMP/img.bin"
+head -c $((4 * 1024 * 1024)) "$RATCHET" > "$IMG"
+run "write (auto backup + verify)"      $RATCHET write "$IMG"
+run "write --skip-backup --skip-verify" $RATCHET write "$IMG" --skip-backup --skip-verify
+expect_fail "write refuses blank image" $RATCHET write "$DUMP"
 run "verify"             $RATCHET verify "$DUMP"
 run "erase"              $RATCHET erase
 

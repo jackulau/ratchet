@@ -5,7 +5,7 @@
 // trait, which real hardware satisfies via ratchet_usb::DeviceHandle. Tests use
 // an in-memory recorder to assert protocol correctness without hardware.
 
-use super::{Backend, BackendError, Result, WriteOpts};
+use super::{reject_blank_image, Backend, BackendError, Result, WriteOpts};
 use crate::chips::{format_size, lookup_by_jedec_id, needs_4byte_addressing};
 use crate::types::*;
 use sha2::{Digest, Sha256};
@@ -458,6 +458,7 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
     fn write_chip(&mut self, input_path: &Path, opts: WriteOpts) -> Result<WriteResult> {
         let start = Instant::now();
         let firmware = std::fs::read(input_path)?;
+        reject_blank_image(&firmware)?;
         let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
         let chip_size = chip.size_bytes as usize;
         if chip_size > 0 && firmware.len() > chip_size {
@@ -1124,5 +1125,24 @@ mod tests {
                 .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EN4B),
             "EN4B must NOT be sent for a ≤16 MB chip"
         );
+    }
+
+    #[test]
+    fn write_chip_refuses_blank_all_ff_image() {
+        // Flashing an all-0xFF (blank) image would wipe a working BIOS — must be refused.
+        let path = std::env::temp_dir().join("ratchet-test-blank-ff.bin");
+        std::fs::write(&path, vec![0xffu8; 4096]).unwrap();
+        let mut backend = CH341ABackend::with_bus(MockBus::new());
+        let err = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("blank"));
+        std::fs::remove_file(&path).ok();
     }
 }

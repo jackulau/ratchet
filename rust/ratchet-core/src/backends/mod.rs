@@ -59,3 +59,27 @@ pub struct WriteOpts {
     pub skip_backup: bool,
     pub skip_verify: bool,
 }
+
+/// Reject an image that is entirely 0xFF or 0x00. Flashing one is almost always a mistake —
+/// a blank or failed dump — and would wipe a working BIOS. To intentionally blank a chip,
+/// use `erase`. Called at the top of every backend's `write_chip`.
+pub fn reject_blank_image(firmware: &[u8]) -> Result<()> {
+    if firmware.is_empty() {
+        return Err(BackendError::Other(
+            "refusing to write an empty file".into(),
+        ));
+    }
+    if firmware.iter().all(|&b| b == 0xff) {
+        return Err(BackendError::Other(
+            "refusing to write an all-0xFF (blank) image — this would erase your BIOS; \
+             pass a real image, or use `erase` to intentionally blank the chip"
+                .into(),
+        ));
+    }
+    if firmware.iter().all(|&b| b == 0x00) {
+        return Err(BackendError::Other(
+            "refusing to write an all-0x00 image — almost certainly a failed or empty dump".into(),
+        ));
+    }
+    Ok(())
+}

@@ -465,6 +465,7 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
     fn write_chip(&mut self, input_path: &Path, opts: WriteOpts) -> Result<WriteResult> {
         let start = Instant::now();
         let firmware = fs::read(input_path)?;
+        super::reject_blank_image(&firmware)?;
         let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
         let chip_size = chip.size_bytes as usize;
         if chip_size > 0 && firmware.len() > chip_size {
@@ -475,7 +476,7 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
             )));
         }
         let page_size = chip.page_size.unwrap_or(256).max(1) as usize;
-        let sector_size = chip.sector_size.unwrap_or(4096).max(1) as u32;
+        let sector_size = chip.sector_size.unwrap_or(4096).max(1);
 
         // 1. Back up current contents before overwriting (unless skipped).
         let backup_path = if opts.skip_backup {
