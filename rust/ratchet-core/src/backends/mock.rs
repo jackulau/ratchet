@@ -54,12 +54,7 @@ impl MockBackend {
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
-    let out = h.finalize();
-    let mut s = String::with_capacity(64);
-    for b in out {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
+    crate::types::hex_encode(&h.finalize())
 }
 
 impl Backend for MockBackend {

@@ -271,26 +271,44 @@ impl<B: UsbBus> CH341ABackend<B> {
         }
     }
 
-    /// Read `len` bytes starting at `start_addr` via the READ (0x03) opcode, in 1KB chunks.
+    /// Read `len` bytes starting at `start_addr` via the READ (0x03) opcode.
     /// Shared by `read_chip` (whole chip) and `verify_chip` (file-length read-back) so the two
     /// always use identical addressing.
+    ///
+    /// The whole range streams inside ONE CS assertion: the opcode + address go out
+    /// once and the chip auto-increments while data is clocked out in 31-byte USB
+    /// packets. The old scheme re-issued READ + address + CS toggle per KiB — a
+    /// 5-byte header and two extra USB frames every 1024 bytes of an 8-16 MB dump.
     pub fn read_range(&mut self, start_addr: u64, len: usize) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(len);
-        let chunk_size = 1024;
-        let addr_len = if self.use_4byte_addr { 4 } else { 3 };
-        let data_start = 1 + addr_len;
-        let mut cmd: Vec<u8> = Vec::with_capacity(data_start + chunk_size);
-        let mut addr = start_addr;
-        while buf.len() < len {
-            let n = chunk_size.min(len - buf.len());
-            cmd.clear();
-            cmd.push(SPI_READ);
-            cmd.extend(address_bytes(addr, self.use_4byte_addr));
-            cmd.resize(data_start + n, 0u8);
-            let rx = self.spi_command(&cmd)?;
-            buf.extend_from_slice(&rx[data_start..data_start + n]);
-            addr += n as u64;
+        if len == 0 {
+            return Ok(Vec::new());
         }
+        let use_4byte = self.use_4byte_addr;
+        let bus = self.bus.as_mut().ok_or(BackendError::NotConnected)?;
+        let max_payload = MAX_XFER - 1; // 31 SPI bytes per USB packet
+        let mut packet: Vec<u8> = Vec::with_capacity(max_payload + 1);
+
+        bus.bulk_write(&cs_assert_packet())?;
+        // Opcode + address, echoed back full-duplex and discarded.
+        packet.push(CMD_SPI_STREAM);
+        packet.push(SPI_READ);
+        packet.extend(address_bytes(start_addr, use_4byte));
+        let header_len = packet.len() - 1;
+        bus.bulk_write(&packet)?;
+        let _echo = bus.bulk_read(header_len)?;
+        // Clock out the data: every dummy byte shifted in clocks one byte out.
+        let zeros = [0u8; MAX_XFER - 1];
+        let mut buf = Vec::with_capacity(len);
+        while buf.len() < len {
+            let n = (len - buf.len()).min(max_payload);
+            packet.clear();
+            packet.push(CMD_SPI_STREAM);
+            packet.extend_from_slice(&zeros[..n]);
+            bus.bulk_write(&packet)?;
+            let rx = bus.bulk_read(n)?;
+            buf.extend_from_slice(&rx[..n.min(rx.len())]);
+        }
+        bus.bulk_write(&cs_deassert_packet())?;
         Ok(buf)
     }
 
@@ -1301,6 +1319,34 @@ mod tests {
                 .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EN4B),
             "EN4B must NOT be sent for a ≤16 MB chip"
         );
+    }
+
+    #[test]
+    fn read_range_streams_single_opcode() {
+        // 3 KiB read: the READ opcode + address must be issued exactly ONCE,
+        // inside exactly one CS assertion — never re-addressed per KiB.
+        let mut bus = MockBus::new();
+        for _ in 0..120 {
+            bus.queue_read(vec![0u8; 40]); // header echo + 31-byte data chunks
+        }
+        let mut backend = CH341ABackend::with_bus(bus);
+        let data = backend.read_range(0, 3 * 1024).unwrap();
+        assert_eq!(data.len(), 3 * 1024);
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        let read_opcodes = writes
+            .iter()
+            .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_READ)
+            .count();
+        assert_eq!(read_opcodes, 1, "READ (0x03) must go out once per range");
+        let cs_asserts = writes
+            .iter()
+            .filter(|w| w.as_slice() == cs_assert_packet())
+            .count();
+        let cs_deasserts = writes
+            .iter()
+            .filter(|w| w.as_slice() == cs_deassert_packet())
+            .count();
+        assert_eq!((cs_asserts, cs_deasserts), (1, 1), "one CS pulse per range");
     }
 
     #[test]
