@@ -226,6 +226,43 @@ pub fn parse_basic_flash_params(buf: &[u8]) -> Option<SfdpBasicFlashParams> {
     })
 }
 
+/// Run full SFDP discovery over any transport. `read_at(addr, len)` performs an
+/// SFDP read (opcode 0x5A + 3-byte address + dummy) at the given SFDP-space
+/// address. Returns Ok(None) when the chip exposes no valid SFDP signature or
+/// no parsable basic flash parameter table — callers report that honestly
+/// instead of fabricating zeroed parameters.
+pub fn discover_sfdp<E>(
+    mut read_at: impl FnMut(u32, usize) -> std::result::Result<Vec<u8>, E>,
+) -> std::result::Result<Option<crate::types::SfdpInfo>, E> {
+    // SFDP header (8 bytes) + first parameter header (8 bytes).
+    let hdr = read_at(0, 16)?;
+    let info = parse_sfdp_header(&hdr);
+    if !info.valid {
+        return Ok(None);
+    }
+    // The Basic Flash Parameter Table is the mandatory id-0x00 header.
+    let Some(ph) = info.parameter_headers.iter().find(|h| h.id_lsb == 0x00) else {
+        return Ok(None);
+    };
+    let table_len = ((ph.length as usize) * 4).max(16);
+    let table = read_at(ph.table_pointer, table_len)?;
+    let Some(p) = parse_basic_flash_params(&table) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::types::SfdpInfo {
+        density_bits: p.density_bits,
+        density_bytes: p.density_bytes,
+        page_size: p.page_size,
+        sector_size_4kb: p.erase_size_4kb,
+        block_size_32kb: p.erase_types.iter().any(|e| e.size_bytes == 32 * 1024),
+        block_size_64kb: p.erase_types.iter().any(|e| e.size_bytes == 64 * 1024),
+        supports_4byte_addr: p.needs_4byte_addr
+            || !matches!(p.address_byte_count, AddressByteCount::Three),
+        fast_read_supported: p.fast_read_supported,
+        raw_header: crate::types::hex_encode(&hdr),
+    }))
+}
+
 pub fn synthesize_chip_from_sfdp(
     jedec_id: &str,
     manufacturer_name: &str,

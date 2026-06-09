@@ -338,6 +338,25 @@ impl<B: UsbBus> CH341ABackend<B> {
         }
     }
 
+    /// SFDP read (0x5A): 3-byte SFDP-space address + one dummy byte, then `len`
+    /// data bytes clocked out.
+    fn sfdp_read_at(&mut self, addr: u32, len: usize) -> Result<Vec<u8>> {
+        let mut cmd = vec![
+            SPI_SFDP,
+            (addr >> 16) as u8,
+            (addr >> 8) as u8,
+            addr as u8,
+            0, // dummy cycle per JESD216
+        ];
+        let data_start = cmd.len();
+        cmd.resize(data_start + len, 0);
+        let rx = self.spi_command(&cmd)?;
+        if rx.len() < data_start + len {
+            return Err(BackendError::Other("short SFDP response".into()));
+        }
+        Ok(rx[data_start..data_start + len].to_vec())
+    }
+
     /// Refuse destructive ops on write-protected silicon: protected chips silently
     /// ignore erase/program commands, which would otherwise read as fake success.
     fn ensure_not_write_protected(&mut self) -> Result<()> {
@@ -586,30 +605,9 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         Ok(StatusRegisters { sr1, sr2, sr3 })
     }
     fn read_sfdp(&mut self) -> Result<Option<SfdpInfo>> {
-        let mut cmd = vec![SPI_SFDP, 0, 0, 0, 0];
-        // 8 bytes header
-        cmd.extend(std::iter::repeat_n(0, 8));
-        let rx = self.spi_command(&cmd)?;
-        // First 5 bytes are cmd + 3 addr + dummy. Header bytes start at 5.
-        if rx.len() < 5 + 8 {
-            return Ok(None);
-        }
-        let hdr = &rx[5..5 + 8];
-        let info = crate::sfdp::parse_sfdp_header(hdr);
-        if !info.valid {
-            return Ok(None);
-        }
-        Ok(Some(SfdpInfo {
-            density_bits: 0,
-            density_bytes: 0,
-            page_size: 256,
-            sector_size_4kb: true,
-            block_size_32kb: true,
-            block_size_64kb: true,
-            supports_4byte_addr: false,
-            fast_read_supported: true,
-            raw_header: hex_encode(hdr),
-        }))
+        // Full JESD216 discovery: header, then the real Basic Flash Parameter
+        // Table — density/page/erase geometry come from the chip, not defaults.
+        crate::sfdp::discover_sfdp(|addr, len| self.sfdp_read_at(addr, len))
     }
     fn read_chip(&mut self, output_path: &Path) -> Result<ReadResult> {
         let res = self.read_chip_to_file(output_path);
@@ -1303,6 +1301,48 @@ mod tests {
                 .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EN4B),
             "EN4B must NOT be sent for a ≤16 MB chip"
         );
+    }
+
+    #[test]
+    fn read_sfdp_parses_real_header_and_density() {
+        use crate::sfdp::{build_synthetic_sfdp, BuildSfdpOptions};
+        let sfdp_space = build_synthetic_sfdp(&BuildSfdpOptions::default());
+        let mut bus = MockBus::new();
+        // Header read: tx = 5 (cmd+addr+dummy) + 16 = 21 bytes, single chunk →
+        // one bulk_read(21) whose data sits at [5..21].
+        let mut rx1 = vec![0u8; 5];
+        rx1.extend_from_slice(&sfdp_space[..16]);
+        bus.queue_read(rx1);
+        // BFPT read at 0x80 (20 dwords = 80 bytes): tx = 85 bytes → CH341A chunks
+        // of 31 + 31 + 23, each answered by one queued bulk_read.
+        let mut rx2 = vec![0u8; 5];
+        rx2.extend_from_slice(&sfdp_space[0x80..0x80 + 80]);
+        bus.queue_read(rx2[..31].to_vec());
+        bus.queue_read(rx2[31..62].to_vec());
+        bus.queue_read(rx2[62..85].to_vec());
+        let mut backend = CH341ABackend::with_bus(bus);
+        let info = backend.read_sfdp().unwrap().expect("SFDP present");
+        // Real density parsed from the BFPT — never the fabricated zeros.
+        assert_eq!(info.density_bytes, 8 * 1024 * 1024);
+        assert_eq!(info.density_bits, 8 * 1024 * 1024 * 8);
+        assert_eq!(info.page_size, 256);
+        assert!(info.sector_size_4kb);
+        assert!(!info.supports_4byte_addr);
+        // Wire bytes: 0x5a + 3-byte address 0 + dummy.
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        let first_sfdp = writes
+            .iter()
+            .find(|w| w.len() >= 6 && w[0] == CMD_SPI_STREAM && w[1] == SPI_SFDP)
+            .expect("an SFDP (0x5a) frame must be issued");
+        assert_eq!(&first_sfdp[2..6], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn read_sfdp_returns_none_without_valid_signature() {
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0u8; 21]); // zeros — no "SFDP" signature
+        let mut backend = CH341ABackend::with_bus(bus);
+        assert!(backend.read_sfdp().unwrap().is_none());
     }
 
     #[test]

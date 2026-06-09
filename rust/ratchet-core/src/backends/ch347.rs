@@ -50,6 +50,8 @@ pub const SPI_CMD_SECTOR_ERASE: u8 = 0x20;
 pub const SPI_CMD_BLOCK_ERASE: u8 = 0xd8;
 pub const SPI_CMD_CHIP_ERASE: u8 = 0xc7;
 pub const SPI_CMD_RDSR: u8 = 0x05;
+pub const SPI_CMD_RDSR2: u8 = 0x35;
+pub const SPI_CMD_RDSR3: u8 = 0x15;
 pub const SPI_CMD_WRSR: u8 = 0x01;
 pub const SPI_CMD_EWSR: u8 = 0x50;
 pub const SPI_CMD_SFDP: u8 = 0x5a;
@@ -253,6 +255,34 @@ impl<T: Transport> Ch347Protocol<T> {
     pub fn read_status_register(&mut self) -> Result<u8> {
         let rx = self.spi_command(&[SPI_CMD_RDSR, 0])?;
         Ok(rx[1])
+    }
+
+    pub fn read_status_register2(&mut self) -> Result<u8> {
+        let rx = self.spi_command(&[SPI_CMD_RDSR2, 0])?;
+        Ok(rx[1])
+    }
+
+    pub fn read_status_register3(&mut self) -> Result<u8> {
+        let rx = self.spi_command(&[SPI_CMD_RDSR3, 0])?;
+        Ok(rx[1])
+    }
+
+    /// SFDP read (0x5A): 3-byte SFDP-space address + one dummy byte, then `len`
+    /// data bytes clocked out.
+    pub fn sfdp_read_at(&mut self, addr: u32, len: usize) -> Result<Vec<u8>> {
+        let mut tx = vec![
+            SPI_CMD_SFDP,
+            (addr >> 16) as u8,
+            (addr >> 8) as u8,
+            addr as u8,
+            0, // dummy cycle per JESD216
+        ];
+        let data_start = tx.len();
+        tx.resize(data_start + len, 0);
+        let mut rx = self.spi_command(&tx)?;
+        rx.truncate(data_start + len);
+        rx.drain(..data_start);
+        Ok(rx)
     }
 
     /// Poll RDSR until the WIP bit clears or `timeout` elapses. Required after every erase and
@@ -562,13 +592,14 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
     fn read_status_registers(&mut self) -> Result<StatusRegisters> {
         Ok(StatusRegisters {
             sr1: self.proto.read_status_register()?,
-            sr2: 0,
-            sr3: 0,
+            sr2: self.proto.read_status_register2()?,
+            sr3: self.proto.read_status_register3()?,
         })
     }
 
     fn read_sfdp(&mut self) -> Result<Option<SfdpInfo>> {
-        Ok(None)
+        // Full JESD216 discovery via the live transport — same parser as CH341A.
+        crate::sfdp::discover_sfdp(|addr, len| self.proto.sfdp_read_at(addr, len))
     }
 
     fn read_chip(&mut self, output_path: &Path) -> Result<ReadResult> {
@@ -1027,6 +1058,63 @@ mod tests {
         assert!(sent(SPI_CMD_ENTER_4BYTE), "EN4B must be sent during verify");
         assert!(sent(SPI_CMD_EXIT_4BYTE), "EX4B must be sent after verify");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn backend_read_status_registers_reads_sr1_sr2_sr3() {
+        let t = primed_transport(vec![
+            vec![0, 0, 0, 0, 0xff, 0x11],
+            vec![0u8; 4], // RDSR (0x05)
+            vec![0, 0, 0, 0, 0xff, 0x22],
+            vec![0u8; 4], // RDSR2 (0x35)
+            vec![0, 0, 0, 0, 0xff, 0x33],
+            vec![0u8; 4], // RDSR3 (0x15)
+        ]);
+        let mut b = Ch347Backend::new(t);
+        let sr = Backend::read_status_registers(&mut b).unwrap();
+        assert_eq!((sr.sr1, sr.sr2, sr.sr3), (0x11, 0x22, 0x33));
+        let writes = &b.protocol().transport_mut().writes;
+        let sent = |op: u8| {
+            writes
+                .iter()
+                .any(|w| w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == op)
+        };
+        assert!(sent(SPI_CMD_RDSR), "SR1 read (0x05) must be issued");
+        assert!(sent(SPI_CMD_RDSR2), "SR2 read (0x35) must be issued");
+        assert!(sent(SPI_CMD_RDSR3), "SR3 read (0x15) must be issued");
+    }
+
+    #[test]
+    fn backend_read_sfdp_issues_5a_and_parses_density() {
+        use crate::sfdp::{build_synthetic_sfdp, BuildSfdpOptions};
+        let sfdp_space = build_synthetic_sfdp(&BuildSfdpOptions::default());
+        // Header read: tx = 5 + 16 = 21 bytes, single CH347 packet → rx is the
+        // 4-byte packet header + 21 echo/data bytes (data at [4+5..]).
+        let mut rx1 = vec![0u8; 4 + 5];
+        rx1.extend_from_slice(&sfdp_space[..16]);
+        // BFPT read at 0x80 (80 bytes): tx = 85 → rx = 4 + 85.
+        let mut rx2 = vec![0u8; 4 + 5];
+        rx2.extend_from_slice(&sfdp_space[0x80..0x80 + 80]);
+        let t = primed_transport(vec![rx1, vec![0u8; 4], rx2, vec![0u8; 4]]);
+        let mut b = Ch347Backend::new(t);
+        let info = Backend::read_sfdp(&mut b).unwrap().expect("SFDP present");
+        assert_eq!(info.density_bytes, 8 * 1024 * 1024);
+        assert!(info.fast_read_supported);
+        let writes = &b.protocol().transport_mut().writes;
+        let sfdp_frame = writes
+            .iter()
+            .find(|w| w.len() > 8 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_SFDP)
+            .expect("an SFDP (0x5a) packet must be issued");
+        // 3-byte SFDP address 0 + dummy byte follow the opcode.
+        assert_eq!(&sfdp_frame[5..9], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn backend_read_sfdp_returns_none_without_signature() {
+        // All-zero response → no "SFDP" signature → honest None, not fabricated data.
+        let t = primed_transport(vec![vec![0u8; 4 + 21], vec![0u8; 4]]);
+        let mut b = Ch347Backend::new(t);
+        assert!(Backend::read_sfdp(&mut b).unwrap().is_none());
     }
 
     #[test]
