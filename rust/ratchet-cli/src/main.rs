@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Show programmer status. (Today all commands route through MockBackend; RATCHET_FORCE_MOCK is reported but not yet wired to switch backends.)
+    /// Show programmer status (backend kind, force-mock state, warnings).
     Status {
         #[arg(long)]
         json: bool,
@@ -175,6 +175,9 @@ enum Command {
     FullBackup {
         #[arg(long)]
         json: bool,
+        /// Overwrite an existing backup file with the same name.
+        #[arg(long)]
+        force: bool,
     },
     /// Monitor connection quality continuously.
     Monitor {
@@ -373,6 +376,8 @@ enum EepromI2cCmd {
         #[arg(long, default_value = "24c256")]
         part: String,
         output: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Write file to a 24Cxx EEPROM.
     Write {
@@ -381,6 +386,8 @@ enum EepromI2cCmd {
         #[arg(long, default_value = "24c256")]
         part: String,
         input: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -622,7 +629,7 @@ fn main() -> anyhow::Result<()> {
             skip_write,
             json,
         }) => cmd_full_repair(reference.as_deref(), skip_write, json)?,
-        Some(Command::FullBackup { json }) => cmd_full_backup(json)?,
+        Some(Command::FullBackup { json, force }) => cmd_full_backup(json, force)?,
         Some(Command::Monitor { interval_ms, json }) => cmd_monitor(interval_ms, json)?,
         Some(Command::I2c(c)) => cmd_i2c(c)?,
         Some(Command::Uart(c)) => cmd_uart(c)?,
@@ -913,7 +920,12 @@ fn parse_eeprom_part(s: &str) -> anyhow::Result<ratchet_core::programmers::i2c_e
 fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
     use ratchet_core::programmers::i2c_eeprom::I2cEeprom;
     match c {
-        EepromI2cCmd::Read { addr, part, output } => {
+        EepromI2cCmd::Read {
+            addr,
+            part,
+            output,
+            json,
+        } => {
             let address = parse_addr(&addr)? as u8;
             let size = parse_eeprom_part(&part)?;
             let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -926,7 +938,7 @@ fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
                 "eeprom-i2c read",
                 json!({ "part": size.name(), "addr": format!("0x{address:02x}"), "bytes": data.len(), "output": output }),
             );
-            emit_envelope(&env, false, || {
+            emit_envelope(&env, json, || {
                 println!(
                     "eeprom-i2c read {} bytes ({}) -> {}",
                     data.len(),
@@ -935,7 +947,12 @@ fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
                 )
             })
         }
-        EepromI2cCmd::Write { addr, part, input } => {
+        EepromI2cCmd::Write {
+            addr,
+            part,
+            input,
+            json,
+        } => {
             let address = parse_addr(&addr)? as u8;
             let size = parse_eeprom_part(&part)?;
             let data = std::fs::read(&input).map_err(|e| anyhow::anyhow!("read {input}: {e}"))?;
@@ -949,7 +966,7 @@ fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
                 "eeprom-i2c write",
                 json!({ "part": size.name(), "addr": format!("0x{address:02x}"), "bytes": data.len(), "verified": verified }),
             );
-            emit_envelope(&env, false, || {
+            emit_envelope(&env, json, || {
                 println!(
                     "eeprom-i2c write {} bytes ({}) verified={}",
                     data.len(),
@@ -1534,7 +1551,7 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
     })
 }
 
-fn cmd_full_backup(json: bool) -> anyhow::Result<()> {
+fn cmd_full_backup(json: bool, force: bool) -> anyhow::Result<()> {
     // A full backup is a full-chip read to a descriptively named file, using
     // the same wired SPI backend as `read`. (open_dyn warns on stderr when no
     // device is present and it falls back to mock.)
@@ -1545,6 +1562,14 @@ fn cmd_full_backup(json: bool) -> anyhow::Result<()> {
         .map(|c| c.name.replace([' ', '/'], "_"))
         .unwrap_or_else(|| "chip".to_string());
     let path = format!("ratchet-backup-{label}.bin");
+    // An existing backup may be the user's only copy of a working BIOS — never
+    // clobber it implicitly.
+    if !force && std::path::Path::new(&path).exists() {
+        anyhow::bail!(
+            "full-backup: {path} already exists; pass --force to overwrite it \
+             (it may be your only copy of the old firmware)"
+        );
+    }
     let r = m.read_chip(std::path::Path::new(&path))?;
     let env = AgentEnvelope::ok(
         "full-backup",

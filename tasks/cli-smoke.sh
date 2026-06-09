@@ -86,7 +86,9 @@ run "verify"             $RATCHET verify "$DUMP"
 run "erase"              $RATCHET erase
 
 # ── Whole-chip workflows (the pipelines a repair drives) ─────
-run "full-backup"        $RATCHET full-backup
+# --force: smoke reruns leave a ratchet-backup-<chip>.bin behind, and full-backup
+# (correctly) refuses to clobber an existing backup without it.
+run "full-backup"        $RATCHET full-backup --force
 run "full-repair --skip-write" $RATCHET full-repair --skip-write
 run "full-repair"        $RATCHET full-repair
 
