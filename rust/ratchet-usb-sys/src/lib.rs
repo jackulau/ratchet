@@ -6,5 +6,10 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 #![allow(clippy::all)]
+// bindgen carries libusb's doxygen comments verbatim; `\param[in]` reads as a
+// broken intra-doc link to rustdoc. The comments are worth keeping, so silence
+// the lint instead of stripping them with generate_comments(false).
+#![allow(rustdoc::broken_intra_doc_links)]
+#![allow(rustdoc::bare_urls)]
 
 include!(concat!(env!("OUT_DIR"), "/libusb_bindings.rs"));

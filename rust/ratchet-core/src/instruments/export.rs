@@ -15,7 +15,7 @@
 use super::logic_analyzer::CaptureFrame;
 use std::fmt::Write;
 
-/// Write a CSV with header "Time[s], CH0, CH1, ...".
+/// Write a CSV with header "Time\[s\], CH0, CH1, ...".
 pub fn write_csv(frame: &CaptureFrame, channels: u8) -> String {
     let mut out = String::new();
     out.push_str("Time[s]");
