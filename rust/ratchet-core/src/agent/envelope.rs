@@ -94,11 +94,6 @@ pub fn wants_json(args: &[String]) -> bool {
     args.iter().any(|a| a == "--json")
 }
 
-/// Returns true if `--ndjson` flag is present.
-pub fn wants_ndjson(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--ndjson")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,13 +151,5 @@ mod tests {
         assert!(wants_json(&args));
         let args = vec!["read".to_string()];
         assert!(!wants_json(&args));
-    }
-
-    #[test]
-    fn wants_ndjson_detection() {
-        let args = vec!["read".to_string(), "--ndjson".to_string()];
-        assert!(wants_ndjson(&args));
-        let args = vec!["read".to_string(), "--json".to_string()];
-        assert!(!wants_ndjson(&args));
     }
 }

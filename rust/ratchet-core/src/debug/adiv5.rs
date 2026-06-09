@@ -116,11 +116,6 @@ impl<'s, T: SwdTransport> Adiv5<'s, T> {
     }
 
     /// Read a contiguous block via TAR auto-increment.
-    #[cfg(test)]
-    fn swd_for_test_count(&self) -> usize {
-        0 // unused  -  placeholder for future inspection helpers.
-    }
-
     pub fn mem_read_block(&mut self, addr: u32, count: usize) -> Result<Vec<u32>> {
         self.write_ap(0, AP_CSW, CSW_DEFAULT_W32)?;
         self.write_ap(0, AP_TAR, addr)?;
@@ -165,18 +160,13 @@ mod tests {
         t.queue_ok_ack();
         t.queue_ok_ack();
         t.queue_ok_ack();
-        let writes_before;
         {
             let swd = Swd::new(&mut t);
             let mut adi = Adiv5::new(swd);
             adi.write_ap(0, AP_CSW, 0).unwrap();
-            writes_before = adi.swd_for_test_count();
             adi.write_ap(0, AP_CSW, 0).unwrap();
         }
-        // The second write_ap should add fewer ACKs since bank is cached.
-        // We can't easily inspect ACK count from outside; instead assert the
-        // overall log has no extra SELECT writes.
-        let _ = writes_before;
+        // The second write_ap must not re-write SELECT — the bank is cached.
         // SELECT register address = DP_SELECT = 0x08. Look for it in write_log.
         let select_writes = t
             .write_log

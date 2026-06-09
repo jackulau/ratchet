@@ -5,10 +5,9 @@
 //
 // Why napi-rs and not node-gyp directly?
 //   - napi-rs handles ABI compatibility across Node versions via N-API
-//   - prebuilt-binaries.yml + `napi prepublish` ships per-arch binaries to npm
-//     so end users `npm install ratchet` and get the right .node file with
-//     zero compiler / build-tool requirements
 //   - node-gyp directly requires distutils + python on the install host
+// (No npm packaging or prebuilt-binary pipeline exists for this crate today;
+// consumers build `index.node` themselves with `napi build`.)
 //
 // This bridge is OPTIONAL  -  the primary distribution is the standalone Rust
 // binaries (ratchet / ratchet-mcp). Node consumers only need this if they want

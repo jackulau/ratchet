@@ -1,11 +1,5 @@
-// REPL state machines + macros + sniffer/watch event generators.
-// Hardware-free  -  actual TTY loop (rustyline) lives in the CLI binary (D18).
-// Pure logic here lets us unit-test the behavior without a real serial port.
-
-pub mod macros;
-pub mod plugins;
-pub mod sniffer;
-pub mod watch;
+// REPL command parser. Hardware-free — the interactive stdin loop lives in the
+// CLI binary (cmd_repl); pure parsing here lets us unit-test it directly.
 
 use serde::{Deserialize, Serialize};
 
