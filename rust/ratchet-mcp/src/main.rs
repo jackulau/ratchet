@@ -2,9 +2,9 @@
 // Skips third-party MCP crates per the project's "fully custom" objective.
 // Surface: 30 tools  -  18 SPI-flash / BIOS analysis + 12 hardware-protocol tools
 // (I2C, UART, JTAG, SWD, AVR/ESP/STM32 programmers, logic analyzer, Bus Pirate,
-// slcan CAN). Hardware-protocol handlers return placeholder JSON until live USB
-// wiring lands; the dispatch surface, JSON-schema descriptors, and arg shapes
-// are real today.
+// slcan CAN). SPI-flash, I2C, and JTAG tools run against the live CH341A/CH347
+// backend (or the mock when RATCHET_FORCE_MOCK=1); every tool without a wired
+// transport returns an honest JSON-RPC error, never placeholder data.
 
 use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind};
 use serde_json::{json, Value};
@@ -186,11 +186,12 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "write_chip",
-            "Write a file to the chip",
+            "Write a file to the chip (destructive — requires confirm=true)",
             json!({
-                "type":"object","required":["input"],
+                "type":"object","required":["input","confirm"],
                 "properties":{
                     "input":{"type":"string"},
+                    "confirm":{"type":"boolean","description":"Must be true: explicit opt-in for a destructive write"},
                     "skip_backup":{"type":"boolean","default":false},
                     "skip_verify":{"type":"boolean","default":false}
                 }
@@ -206,17 +207,23 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "erase_chip",
-            "Erase the entire chip",
-            json!({"type":"object","properties":{}}),
+            "Erase the entire chip (destructive — requires confirm=true)",
+            json!({
+                "type":"object","required":["confirm"],
+                "properties":{
+                    "confirm":{"type":"boolean","description":"Must be true: explicit opt-in for a destructive erase"}
+                }
+            }),
         ),
         tool(
             "region_erase",
-            "Erase a specific byte range",
+            "Erase a specific byte range (destructive — requires confirm=true)",
             json!({
-                "type":"object","required":["start","length"],
+                "type":"object","required":["start","length","confirm"],
                 "properties":{
                     "start":{"type":"integer","minimum":0},
-                    "length":{"type":"integer","minimum":1}
+                    "length":{"type":"integer","minimum":1},
+                    "confirm":{"type":"boolean","description":"Must be true: explicit opt-in for a destructive erase"}
                 }
             }),
         ),
@@ -278,7 +285,7 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "failure_search",
-            "Search the failure-pattern KB",
+            "Search the failure-pattern knowledge base (not bundled in this build — always errors)",
             json!({
                 "type":"object","required":["query"],
                 "properties":{"query":{"type":"string"}}
@@ -443,10 +450,19 @@ fn tool_call(params: &Value) -> Result<Value, (i32, String)> {
         "sfdp" => call_sfdp()?,
         "wp_status" => call_wp_status()?,
         "read_chip" => call_read_chip(&args)?,
-        "write_chip" => call_write_chip(&args)?,
+        "write_chip" => {
+            require_confirm("write_chip", &args)?;
+            call_write_chip(&args)?
+        }
         "verify_chip" => call_verify_chip(&args)?,
-        "erase_chip" => call_erase_chip()?,
-        "region_erase" => call_region_erase(&args)?,
+        "erase_chip" => {
+            require_confirm("erase_chip", &args)?;
+            call_erase_chip()?
+        }
+        "region_erase" => {
+            require_confirm("region_erase", &args)?;
+            call_region_erase(&args)?
+        }
         "blank_check" => call_blank_check()?,
         "analyze_image" => call_analyze_image(&args)?,
         "bios_regions" => call_bios_regions(&args)?,
@@ -505,6 +521,21 @@ fn arg_u64(args: &Value, key: &str) -> Result<u64, (i32, String)> {
 
 fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Destructive tools require an explicit `confirm: true` argument per call —
+/// the agent must opt in to each write/erase, never trigger one by accident.
+fn require_confirm(tool: &str, args: &Value) -> Result<(), (i32, String)> {
+    if args.get("confirm").and_then(|v| v.as_bool()) == Some(true) {
+        return Ok(());
+    }
+    Err((
+        -32602,
+        format!(
+            "{tool} is destructive and requires explicit confirmation: pass \"confirm\": true \
+             in the arguments to proceed"
+        ),
+    ))
 }
 
 // ─── Hardware-protocol tools ────────────────────────────────────────────────
@@ -773,8 +804,15 @@ fn call_post_decode(args: &Value) -> Result<Value, (i32, String)> {
 }
 
 fn call_failure_search(args: &Value) -> Result<Value, (i32, String)> {
+    // Same honest contract as the CLI: no fake-success empty result set.
     let q = arg_str(args, "query")?;
-    Ok(json!({"query": q, "results": serde_json::Value::Array(vec![])}))
+    Err((
+        -32000,
+        format!(
+            "failure_search '{q}': the failure-pattern knowledge base is not bundled in this \
+             build; consult vendor boardview/schematic references instead"
+        ),
+    ))
 }
 
 fn call_voltage_reference(args: &Value) -> Result<Value, (i32, String)> {
