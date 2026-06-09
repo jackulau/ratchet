@@ -86,9 +86,11 @@ run "verify"             $RATCHET verify "$DUMP"
 run "erase"              $RATCHET erase
 
 # ── Whole-chip workflows (the pipelines a repair drives) ─────
-# --force: smoke reruns leave a ratchet-backup-<chip>.bin behind, and full-backup
-# (correctly) refuses to clobber an existing backup without it.
-run "full-backup"        $RATCHET full-backup --force
+# full-backup writes ratchet-backup-<chip>.bin into CWD — run it inside the temp
+# dir so the smoke can never collide with (or clobber) a backup at repo root.
+run "full-backup"        bash -c "cd '$TMP' && '$PWD/$RATCHET' full-backup"
+expect_fail "full-backup refuses clobber" bash -c "cd '$TMP' && '$PWD/$RATCHET' full-backup"
+run "full-backup --force overwrites" bash -c "cd '$TMP' && '$PWD/$RATCHET' full-backup --force"
 run "full-repair --skip-write" $RATCHET full-repair --skip-write
 run "full-repair"        $RATCHET full-repair
 
