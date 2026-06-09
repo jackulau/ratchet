@@ -824,3 +824,126 @@ fn call_voltage_reference(args: &Value) -> Result<Value, (i32, String)> {
 fn map_err<E: std::fmt::Display>(e: E) -> (i32, String) {
     (-32000, e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_response_shape() {
+        let resp =
+            handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(v["result"]["serverInfo"]["name"], "ratchet-mcp");
+        assert!(v["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[test]
+    fn tools_list_has_30_tools_with_valid_schemas() {
+        let tools = tool_list();
+        assert_eq!(tools.len(), 30);
+        for t in &tools {
+            assert!(t["name"].is_string(), "tool missing name: {t}");
+            assert!(
+                t["description"].is_string(),
+                "tool missing description: {t}"
+            );
+            assert_eq!(
+                t["inputSchema"]["type"], "object",
+                "tool {} must declare an object schema",
+                t["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_tool_schemas_require_confirm() {
+        let tools = tool_list();
+        for name in ["write_chip", "erase_chip", "region_erase"] {
+            let t = tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from tool list"));
+            let required: Vec<&str> = t["inputSchema"]["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert!(
+                required.contains(&"confirm"),
+                "{name} schema must require confirm"
+            );
+        }
+    }
+
+    #[test]
+    fn arg_extractors() {
+        let args = json!({"s":"x","n":7,"b":true});
+        assert_eq!(arg_str(&args, "s").unwrap(), "x");
+        assert_eq!(arg_u64(&args, "n").unwrap(), 7);
+        assert!(arg_bool(&args, "b"));
+        assert!(!arg_bool(&args, "missing"));
+        assert_eq!(arg_str(&args, "missing").unwrap_err().0, -32602);
+        assert_eq!(arg_u64(&args, "s").unwrap_err().0, -32602);
+    }
+
+    #[test]
+    fn confirm_gate_blocks_destructive_tools() {
+        for tool in ["write_chip", "erase_chip", "region_erase"] {
+            let (code, msg) = require_confirm(tool, &json!({})).unwrap_err();
+            assert_eq!(code, -32602);
+            assert!(msg.contains("confirm"), "gate message must explain: {msg}");
+            assert!(require_confirm(tool, &json!({"confirm": true})).is_ok());
+            assert!(require_confirm(tool, &json!({"confirm": false})).is_err());
+            assert!(require_confirm(tool, &json!({"confirm": "yes"})).is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_method_returns_method_not_found() {
+        let resp =
+            handle_line(r#"{"jsonrpc":"2.0","id":9,"method":"bogus/method","params":{}}"#).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn notifications_get_no_response() {
+        assert!(handle_line(
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_error_returns_32700() {
+        let resp = handle_line("not json").unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn hw_unavailable_is_32000_and_honest() {
+        let (code, msg) = hw_unavailable_mcp("swd_dump_ram", "needs adapter").unwrap_err();
+        assert_eq!(code, -32000);
+        assert!(msg.contains("swd_dump_ram"));
+        assert!(msg.contains("not available"));
+        assert!(!msg.contains("stub"));
+    }
+
+    #[test]
+    fn unknown_tool_errors_without_opening_a_backend() {
+        let (code, msg) = tool_call(&json!({"name":"bogus_tool","arguments":{}})).unwrap_err();
+        assert_eq!(code, -32601);
+        assert!(msg.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn with_backend_field_tags_objects() {
+        let v = with_backend_field(json!({"success": true}), BackendKind::Mock);
+        assert_eq!(v["backend"], "mock");
+        assert_eq!(v["success"], true);
+    }
+}
