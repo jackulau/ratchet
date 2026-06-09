@@ -25,7 +25,9 @@ What is NOT wired to live hardware yet (these fail honestly: non-zero exit / JSO
 - `uart open/sniff`, `onewire scan/temp`, `swd connect/halt/resume/step/dump`, `avr signature/program/fuses/erase`, `eeprom-microwire read/write`, `esp detect/flash`, `stm32 swd-flash/uart-flash`, `la capture`, `buspirate bridge/probe`, `can sniff/send`. The protocol logic for each is implemented and unit-tested against a mock, but no live CH341A/CH347 transport adapter is wired (SWD/1-Wire/AVR-ISP/Microwire bit-bang, native UART RX, external serial/CAN devices). `monitor`, `serial` connect, and `failure-search` likewise return honest errors rather than placeholder envelopes.
 - **No GitHub Releases are published yet**, so the only supported install route today is from source via `cargo install`.
 
-470 unit + integration tests pass. The SPI write path is proven without hardware by a `LoopbackFlash` test bus that emulates a real SPI NOR chip behind the CH341A USB framing (full-duplex reads, erase/program with AND-into-flash semantics), so a write → read-back → verify round-trip is exercised end to end. Without hardware, the mock backend keeps the SPI-flash surface exercisable for development and CI; protocol verbs report honestly that a device is required.
+472 unit + integration tests pass. The SPI write path is proven without hardware by a `LoopbackFlash` test bus that emulates a real SPI NOR chip behind the CH341A USB framing (full-duplex reads, erase/program with AND-into-flash semantics), so a write → read-back → verify round-trip is exercised end to end. Without hardware, the mock backend keeps the SPI-flash surface exercisable for development and CI; protocol verbs report honestly that a device is required.
+
+Goal 016 hardened the destructive surface further: short USB reads are a hard error instead of silent zero-padding, erase/write refuse write-protected silicon and unknown-capacity chips, chips entered into 4-byte mode are always exited, whole-range reads stream inside a single chip-select assertion, and the CLI/MCP refuse to run destructive verbs against a silently-selected mock backend.
 
 ## Install
 
@@ -136,8 +138,10 @@ verify — as a single guided workflow.
 
 ### Verifying on real hardware
 
-CI and the test suite prove the protocol byte-for-byte without a programmer (see
-[Status](#status)), but to confirm against your own board:
+CI (`.github/workflows/ci.yml`: fmt, clippy `-D warnings`, full test suite, strict doc
+build, and both smoke suites under `RATCHET_FORCE_MOCK=1`) and the test suite prove the
+protocol byte-for-byte without a programmer (see [Status](#status)), but to confirm
+against your own board:
 
 ```bash
 ratchet detect                       # programmer enumerates on USB
@@ -199,14 +203,12 @@ fakes success).
 | Not wired yet | `uart open/sniff`, `onewire scan/temp`, `swd connect/halt/resume/step/dump`, `avr signature/program/fuses/erase`, `eeprom-microwire read/write`, `esp detect/flash`, `stm32 swd-flash/uart-flash`, `buspirate bridge/probe`, `can sniff/send` [n/w] |
 
 Every inspection command supports `--json` for AgentEnvelope output:
-`{ok, command, data?|error, nextAction?}`. Long-running commands also accept
-`--ndjson` for line-delimited progress events.
+`{ok, command, data?|error, nextAction?}`.
 
 ```bash
 ratchet status --json
 ratchet chip-info ef4017 --json
 ratchet analyze backup.bin --json | jq '.data.regions'
-ratchet read backup.bin --ndjson
 ```
 
 ## Agent Interface (MCP)
@@ -262,15 +264,32 @@ ratchet is built to not brick your board. Every item below is enforced in code (
   program, so the next command never races a still-busy chip (chip-erase can take tens of seconds).
 - **Blank-image guard.** `write` refuses an all-0xFF or all-0x00 image — a blank or failed dump
   that would wipe a working BIOS. Use `erase` to intentionally blank a chip.
-- **Capacity check.** Writes larger than the chip are rejected, not silently truncated.
-- **Automatic 4-byte addressing** on chips over 16 MB, so large BIOS images aren't half-addressed.
+- **Capacity check.** Writes larger than the chip are rejected, not silently truncated; chips the
+  database cannot size (`unknown chip capacity`) are refused outright instead of written blind.
+- **Write-protect guard.** Erase and write refuse a chip whose block-protect bits are set
+  (`write protected`) — protected silicon silently ignores program commands, which would
+  otherwise read as a fake success.
+- **No silent mock writes.** The CLI `write`/`erase`/`region-erase`/`full-repair` verbs and the
+  MCP `write_chip`/`erase_chip`/`region_erase` tools refuse to run when the factory silently fell
+  back to the mock backend (no programmer attached); only an explicit `RATCHET_FORCE_MOCK=1`
+  allows it. Destructive-op JSON carries a `backend` field so agents can tell silicon from mock.
+- **MCP confirm gate.** The destructive MCP tools require `"confirm": true` in their arguments;
+  calls without it get a JSON-RPC error, so an agent can never write or erase by accident.
+- **Short-read detection.** A USB transfer that delivers fewer bytes than requested is a hard
+  `short transfer` error, never zero-padded data — protecting reads, verifies, and backups.
+- **Automatic 4-byte addressing** on chips over 16 MB, so large BIOS images aren't half-addressed
+  — and 4-byte mode is always exited when the operation completes, so the chip is never left
+  misaddressing for the next tool (or the board itself).
+- **Backup no-clobber.** `full-backup` refuses to overwrite an existing
+  `ratchet-backup-<chip>.bin` without `--force` — it may be your only copy of a working BIOS.
 - **Post-read flags.** `read` reports `all_ff` / `all_zero` so a blank (0xFF) or dead (0x00) read
   is obvious in the output.
 
 Advisory (not an automatic block): `identify` / `chip-info` report the chip's rated voltage so you
-can confirm a 1.8 V part isn't being driven by a stock 3.3 V CH341A before you connect. `erase` is
-a direct destructive verb (no interactive prompt) — it's meant for scripting/agents — but `write`'s
-automatic pre-write backup means a normal reflash is always recoverable.
+can confirm a 1.8 V part isn't being driven by a stock 3.3 V CH341A before you connect. The CLI
+`erase` verb has no interactive prompt (it's meant for scripting; the MCP surface has the confirm
+gate instead) — but `write`'s automatic pre-write backup means a normal reflash is always
+recoverable.
 
 ## Architecture
 

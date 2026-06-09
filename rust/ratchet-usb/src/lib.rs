@@ -5,9 +5,7 @@
 
 use ratchet_usb_sys as sys;
 use std::ffi::{c_int, c_uchar, c_uint};
-use std::os::raw::c_void;
 use std::ptr::{self, NonNull};
-use std::slice;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -339,16 +337,6 @@ pub const ENDPOINT_OUT: u8 = 0x00;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
-}
-
-// Silence unused-import warning if `c_void` isn't referenced (kept for future async work).
-#[allow(dead_code)]
-fn _keep_c_void_imported(_: *mut c_void) {}
-
-// Silence unused-import warning for slice if not referenced.
-#[allow(dead_code)]
-fn _keep_slice_imported(_: &[u8]) {
-    let _ = slice::from_ref(&0u8);
 }
 
 #[cfg(test)]

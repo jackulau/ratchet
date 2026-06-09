@@ -2,9 +2,9 @@
 // Skips third-party MCP crates per the project's "fully custom" objective.
 // Surface: 30 tools  -  18 SPI-flash / BIOS analysis + 12 hardware-protocol tools
 // (I2C, UART, JTAG, SWD, AVR/ESP/STM32 programmers, logic analyzer, Bus Pirate,
-// slcan CAN). Hardware-protocol handlers return placeholder JSON until live USB
-// wiring lands; the dispatch surface, JSON-schema descriptors, and arg shapes
-// are real today.
+// slcan CAN). SPI-flash, I2C, and JTAG tools run against the live CH341A/CH347
+// backend (or the mock when RATCHET_FORCE_MOCK=1); every tool without a wired
+// transport returns an honest JSON-RPC error, never placeholder data.
 
 use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind};
 use serde_json::{json, Value};
@@ -25,6 +25,40 @@ fn open_dyn() -> Box<dyn Backend + Send> {
         }
     }
     r.backend
+}
+
+/// Open the backend for a DESTRUCTIVE tool (write_chip / erase_chip /
+/// region_erase). Refuses to run when the factory silently fell back to mock:
+/// an agent that believes it flashed a BIOS while the bytes went to an
+/// in-memory fake is a bricked board waiting to happen. Explicitly setting
+/// RATCHET_FORCE_MOCK=1 remains allowed (test / smoke path).
+#[allow(clippy::type_complexity)]
+fn open_dyn_destructive(op: &str) -> Result<(Box<dyn Backend + Send>, BackendKind), (i32, String)> {
+    let r = open_default();
+    if r.kind == BackendKind::Mock && !r.force_mock_env {
+        return Err((
+            -32000,
+            format!(
+                "{op}: refusing to run against the mock fallback backend ({}). Plug in a \
+                 CH341A/CH347 programmer, or set RATCHET_FORCE_MOCK=1 to target the mock \
+                 explicitly.",
+                r.warning
+                    .as_deref()
+                    .unwrap_or("no CH341A or CH347 USB device detected")
+            ),
+        ));
+    }
+    Ok((r.backend, r.kind))
+}
+
+/// Tag a destructive-op result with the backend kind so agents can tell real
+/// silicon results from explicitly-mocked ones.
+fn with_backend_field(v: Value, kind: BackendKind) -> Value {
+    let mut v = v;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("backend".to_string(), Value::String(kind.as_str().into()));
+    }
+    v
 }
 
 fn main() -> anyhow::Result<()> {
@@ -152,11 +186,12 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "write_chip",
-            "Write a file to the chip",
+            "Write a file to the chip (destructive — requires confirm=true)",
             json!({
-                "type":"object","required":["input"],
+                "type":"object","required":["input","confirm"],
                 "properties":{
                     "input":{"type":"string"},
+                    "confirm":{"type":"boolean","description":"Must be true: explicit opt-in for a destructive write"},
                     "skip_backup":{"type":"boolean","default":false},
                     "skip_verify":{"type":"boolean","default":false}
                 }
@@ -172,17 +207,23 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "erase_chip",
-            "Erase the entire chip",
-            json!({"type":"object","properties":{}}),
+            "Erase the entire chip (destructive — requires confirm=true)",
+            json!({
+                "type":"object","required":["confirm"],
+                "properties":{
+                    "confirm":{"type":"boolean","description":"Must be true: explicit opt-in for a destructive erase"}
+                }
+            }),
         ),
         tool(
             "region_erase",
-            "Erase a specific byte range",
+            "Erase a specific byte range (destructive — requires confirm=true)",
             json!({
-                "type":"object","required":["start","length"],
+                "type":"object","required":["start","length","confirm"],
                 "properties":{
                     "start":{"type":"integer","minimum":0},
-                    "length":{"type":"integer","minimum":1}
+                    "length":{"type":"integer","minimum":1},
+                    "confirm":{"type":"boolean","description":"Must be true: explicit opt-in for a destructive erase"}
                 }
             }),
         ),
@@ -244,7 +285,7 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "failure_search",
-            "Search the failure-pattern KB",
+            "Search the failure-pattern knowledge base (not bundled in this build — always errors)",
             json!({
                 "type":"object","required":["query"],
                 "properties":{"query":{"type":"string"}}
@@ -409,10 +450,19 @@ fn tool_call(params: &Value) -> Result<Value, (i32, String)> {
         "sfdp" => call_sfdp()?,
         "wp_status" => call_wp_status()?,
         "read_chip" => call_read_chip(&args)?,
-        "write_chip" => call_write_chip(&args)?,
+        "write_chip" => {
+            require_confirm("write_chip", &args)?;
+            call_write_chip(&args)?
+        }
         "verify_chip" => call_verify_chip(&args)?,
-        "erase_chip" => call_erase_chip()?,
-        "region_erase" => call_region_erase(&args)?,
+        "erase_chip" => {
+            require_confirm("erase_chip", &args)?;
+            call_erase_chip()?
+        }
+        "region_erase" => {
+            require_confirm("region_erase", &args)?;
+            call_region_erase(&args)?
+        }
         "blank_check" => call_blank_check()?,
         "analyze_image" => call_analyze_image(&args)?,
         "bios_regions" => call_bios_regions(&args)?,
@@ -471,6 +521,21 @@ fn arg_u64(args: &Value, key: &str) -> Result<u64, (i32, String)> {
 
 fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Destructive tools require an explicit `confirm: true` argument per call —
+/// the agent must opt in to each write/erase, never trigger one by accident.
+fn require_confirm(tool: &str, args: &Value) -> Result<(), (i32, String)> {
+    if args.get("confirm").and_then(|v| v.as_bool()) == Some(true) {
+        return Ok(());
+    }
+    Err((
+        -32602,
+        format!(
+            "{tool} is destructive and requires explicit confirmation: pass \"confirm\": true \
+             in the arguments to proceed"
+        ),
+    ))
 }
 
 // ─── Hardware-protocol tools ────────────────────────────────────────────────
@@ -636,11 +701,14 @@ fn call_write_chip(args: &Value) -> Result<Value, (i32, String)> {
         skip_backup: arg_bool(args, "skip_backup"),
         skip_verify: arg_bool(args, "skip_verify"),
     };
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("write_chip")?;
     let r = m
         .write_chip(std::path::Path::new(&input), opts)
         .map_err(map_err)?;
-    Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&r).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_verify_chip(args: &Value) -> Result<Value, (i32, String)> {
@@ -653,17 +721,23 @@ fn call_verify_chip(args: &Value) -> Result<Value, (i32, String)> {
 }
 
 fn call_erase_chip() -> Result<Value, (i32, String)> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("erase_chip")?;
     let r = m.erase_chip().map_err(map_err)?;
-    Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&r).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_region_erase(args: &Value) -> Result<Value, (i32, String)> {
     let start = arg_u64(args, "start")?;
     let length = arg_u64(args, "length")?;
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("region_erase")?;
     let r = m.region_erase(start, length).map_err(map_err)?;
-    Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&r).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_blank_check() -> Result<Value, (i32, String)> {
@@ -730,8 +804,15 @@ fn call_post_decode(args: &Value) -> Result<Value, (i32, String)> {
 }
 
 fn call_failure_search(args: &Value) -> Result<Value, (i32, String)> {
+    // Same honest contract as the CLI: no fake-success empty result set.
     let q = arg_str(args, "query")?;
-    Ok(json!({"query": q, "results": serde_json::Value::Array(vec![])}))
+    Err((
+        -32000,
+        format!(
+            "failure_search '{q}': the failure-pattern knowledge base is not bundled in this \
+             build; consult vendor boardview/schematic references instead"
+        ),
+    ))
 }
 
 fn call_voltage_reference(args: &Value) -> Result<Value, (i32, String)> {
@@ -742,4 +823,127 @@ fn call_voltage_reference(args: &Value) -> Result<Value, (i32, String)> {
 
 fn map_err<E: std::fmt::Display>(e: E) -> (i32, String) {
     (-32000, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_response_shape() {
+        let resp =
+            handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(v["result"]["serverInfo"]["name"], "ratchet-mcp");
+        assert!(v["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[test]
+    fn tools_list_has_30_tools_with_valid_schemas() {
+        let tools = tool_list();
+        assert_eq!(tools.len(), 30);
+        for t in &tools {
+            assert!(t["name"].is_string(), "tool missing name: {t}");
+            assert!(
+                t["description"].is_string(),
+                "tool missing description: {t}"
+            );
+            assert_eq!(
+                t["inputSchema"]["type"], "object",
+                "tool {} must declare an object schema",
+                t["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_tool_schemas_require_confirm() {
+        let tools = tool_list();
+        for name in ["write_chip", "erase_chip", "region_erase"] {
+            let t = tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from tool list"));
+            let required: Vec<&str> = t["inputSchema"]["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert!(
+                required.contains(&"confirm"),
+                "{name} schema must require confirm"
+            );
+        }
+    }
+
+    #[test]
+    fn arg_extractors() {
+        let args = json!({"s":"x","n":7,"b":true});
+        assert_eq!(arg_str(&args, "s").unwrap(), "x");
+        assert_eq!(arg_u64(&args, "n").unwrap(), 7);
+        assert!(arg_bool(&args, "b"));
+        assert!(!arg_bool(&args, "missing"));
+        assert_eq!(arg_str(&args, "missing").unwrap_err().0, -32602);
+        assert_eq!(arg_u64(&args, "s").unwrap_err().0, -32602);
+    }
+
+    #[test]
+    fn confirm_gate_blocks_destructive_tools() {
+        for tool in ["write_chip", "erase_chip", "region_erase"] {
+            let (code, msg) = require_confirm(tool, &json!({})).unwrap_err();
+            assert_eq!(code, -32602);
+            assert!(msg.contains("confirm"), "gate message must explain: {msg}");
+            assert!(require_confirm(tool, &json!({"confirm": true})).is_ok());
+            assert!(require_confirm(tool, &json!({"confirm": false})).is_err());
+            assert!(require_confirm(tool, &json!({"confirm": "yes"})).is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_method_returns_method_not_found() {
+        let resp =
+            handle_line(r#"{"jsonrpc":"2.0","id":9,"method":"bogus/method","params":{}}"#).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn notifications_get_no_response() {
+        assert!(handle_line(
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_error_returns_32700() {
+        let resp = handle_line("not json").unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn hw_unavailable_is_32000_and_honest() {
+        let (code, msg) = hw_unavailable_mcp("swd_dump_ram", "needs adapter").unwrap_err();
+        assert_eq!(code, -32000);
+        assert!(msg.contains("swd_dump_ram"));
+        assert!(msg.contains("not available"));
+        assert!(!msg.contains("stub"));
+    }
+
+    #[test]
+    fn unknown_tool_errors_without_opening_a_backend() {
+        let (code, msg) = tool_call(&json!({"name":"bogus_tool","arguments":{}})).unwrap_err();
+        assert_eq!(code, -32601);
+        assert!(msg.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn with_backend_field_tags_objects() {
+        let v = with_backend_field(json!({"success": true}), BackendKind::Mock);
+        assert_eq!(v["backend"], "mock");
+        assert_eq!(v["success"], true);
+    }
 }

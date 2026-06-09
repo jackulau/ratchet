@@ -16,7 +16,6 @@ use crate::backends::{ch341a::UsbBus, ch347::Transport, BackendError, Result};
 use ratchet_usb::DeviceHandle;
 
 pub const DEFAULT_TIMEOUT_MS: u32 = 5_000;
-const MAX_BULK_IN: usize = 4096;
 
 pub struct LibusbBus {
     handle: DeviceHandle,
@@ -55,20 +54,35 @@ impl LibusbBus {
     }
 
     fn bulk_in_exact(&self, len: usize) -> Result<Vec<u8>> {
-        let cap = len.min(MAX_BULK_IN).max(len);
-        let mut buf = vec![0u8; cap];
-        let n = self
-            .handle
-            .bulk_in(self.ep_in, &mut buf, self.timeout_ms)
-            .map_err(BackendError::Usb)?;
-        buf.truncate(n);
-        if n < len {
-            buf.resize(len, 0);
-        } else if n > len {
-            buf.truncate(len);
-        }
-        Ok(buf)
+        fill_exact(len, |chunk| {
+            self.handle
+                .bulk_in(self.ep_in, chunk, self.timeout_ms)
+                .map_err(BackendError::Usb)
+        })
     }
+}
+
+/// Read exactly `len` bytes by re-invoking `read` until the buffer is full.
+/// A read that delivers 0 bytes means the device stopped responding mid-range;
+/// that is a hard `ShortTransfer` error, never zero-padding — padding would
+/// silently corrupt chip reads, verify passes, and pre-write backups.
+fn fill_exact<F>(len: usize, mut read: F) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut [u8]) -> Result<usize>,
+{
+    let mut buf = vec![0u8; len];
+    let mut filled = 0usize;
+    while filled < len {
+        let n = read(&mut buf[filled..])?;
+        if n == 0 {
+            return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
+                expected: len,
+                actual: filled,
+            }));
+        }
+        filled += n;
+    }
+    Ok(buf)
 }
 
 impl UsbBus for LibusbBus {
@@ -103,6 +117,59 @@ mod tests {
     #[test]
     fn default_timeout_is_5s() {
         assert_eq!(DEFAULT_TIMEOUT_MS, 5_000);
+    }
+
+    #[test]
+    fn fill_exact_assembles_partial_reads() {
+        // Device delivers 3 bytes, then 2 — fill_exact must stitch them.
+        let chunks: std::cell::RefCell<Vec<&[u8]>> =
+            std::cell::RefCell::new(vec![&[1u8, 2, 3][..], &[4u8, 5][..]]);
+        let out = fill_exact(5, |dst| {
+            let mut c = chunks.borrow_mut();
+            let chunk = c.remove(0);
+            dst[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        })
+        .expect("two partial reads fill the request");
+        assert_eq!(out, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn fill_exact_short_transfer_is_hard_error_not_padding() {
+        // Device delivers 2 bytes then stops (0-byte read): must be an error
+        // mentioning the short transfer, never a zero-padded success.
+        let reads = std::cell::Cell::new(0u32);
+        let err = fill_exact(4, |dst| {
+            if reads.get() == 0 {
+                reads.set(1);
+                dst[..2].copy_from_slice(&[0xAA, 0xBB]);
+                Ok(2)
+            } else {
+                Ok(0)
+            }
+        })
+        .expect_err("short transfer must fail");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("short"), "error must mention short: {msg}");
+        assert!(
+            msg.contains('2') && msg.contains('4'),
+            "got/expected counts: {msg}"
+        );
+    }
+
+    #[test]
+    fn fill_exact_propagates_read_errors() {
+        let err = fill_exact(8, |_| {
+            Err(BackendError::Usb(ratchet_usb::UsbError::Timeout))
+        })
+        .expect_err("underlying error propagates");
+        assert!(err.to_string().to_lowercase().contains("timeout"));
+    }
+
+    #[test]
+    fn fill_exact_zero_len_is_empty_ok() {
+        let out = fill_exact(0, |_| panic!("read must not be called for len 0")).unwrap();
+        assert!(out.is_empty());
     }
 
     // Compile-time assertion: LibusbBus satisfies both trait bounds.

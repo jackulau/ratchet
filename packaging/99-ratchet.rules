@@ -1,0 +1,17 @@
+# ratchet — udev rules for WCH CH341A / CH347 USB programmers (Linux).
+#
+# Install:
+#   sudo install -m 644 packaging/99-ratchet.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# TAG+="uaccess" grants the active seat access on systemd systems;
+# MODE/GROUP keep non-systemd setups working (add your user to plugdev).
+
+# CH341A programmer (also enumerates as 5523 in some modes)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="5512", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="5523", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# CH341A clones using the alternate Qinheng vendor id
+SUBSYSTEM=="usb", ATTR{idVendor}=="4348", ATTR{idProduct}=="5512", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# CH347 (USB-HS SPI/I2C/JTAG/UART)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="55db", MODE="0660", GROUP="plugdev", TAG+="uaccess"

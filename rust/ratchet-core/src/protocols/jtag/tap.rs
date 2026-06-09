@@ -192,16 +192,18 @@ impl<'t, T: JtagTransport> JtagTap<'t, T> {
     /// Returns the captured TDO bits (same length).
     pub fn shift_ir(&mut self, bits: &[bool]) -> Result<Vec<bool>> {
         self.goto(TapState::ShiftIr)?;
-        self.shift_bits(bits, TapState::Exit1Ir)
+        self.shift_bits(bits)
     }
 
     /// Shift `bits` through the data register.
     pub fn shift_dr(&mut self, bits: &[bool]) -> Result<Vec<bool>> {
         self.goto(TapState::ShiftDr)?;
-        self.shift_bits(bits, TapState::Exit1Ir.next(true) /* placeholder */)
+        self.shift_bits(bits)
     }
 
-    fn shift_bits(&mut self, bits: &[bool], _exit: TapState) -> Result<Vec<bool>> {
+    // TMS=1 on the final bit always moves Shift-IR/DR → Exit1; the exit state is
+    // implied by the state machine, not chosen by the caller.
+    fn shift_bits(&mut self, bits: &[bool]) -> Result<Vec<bool>> {
         let n = bits.len();
         if n == 0 {
             return Ok(Vec::new());

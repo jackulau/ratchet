@@ -265,13 +265,7 @@ mod tests {
         // Comp write value: bits 30:31 = 0b10, addr[28:2] = 0x1234 >> 2 = 0x48D,
         // bit 0 = 1. Compute expected.
         let expected = (0b10u32 << 30) | (0x08001234 & 0x1FFFFFFC) | 1;
-        let last_drw = t
-            .write_log
-            .iter()
-            .filter(|(_, n)| *n == 32)
-            .next_back()
-            .unwrap()
-            .0 as u32;
+        let last_drw = t.write_log.iter().rfind(|(_, n)| *n == 32).unwrap().0 as u32;
         assert_eq!(last_drw, expected);
     }
 }

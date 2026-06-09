@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # bindgen (ratchet-usb-sys) needs system libusb headers via pkg-config
+      # plus libclang to parse them.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev pkg-config clang
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Format check
+        working-directory: rust
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Tests (all features)
+        working-directory: rust
+        run: cargo test --workspace --all-features
+
+      - name: Strict doc build
+        working-directory: rust
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        run: cargo doc --workspace --no-deps
+
+      - name: Release build
+        working-directory: rust
+        run: cargo build --workspace --release
+
+      - name: CLI smoke (forced mock)
+        env:
+          RATCHET_FORCE_MOCK: "1"
+        run: bash tasks/cli-smoke.sh
+
+      - name: MCP smoke (forced mock)
+        env:
+          RATCHET_FORCE_MOCK: "1"
+        run: bash tasks/mcp-smoke.sh

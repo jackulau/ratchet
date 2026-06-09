@@ -1,5 +1,3 @@
-// Agent JSON envelope + tty-aware output helpers.
-// Ports src/agent/envelope.ts + src/output.ts.
+// Agent JSON envelope. Ports src/agent/envelope.ts.
 
 pub mod envelope;
-pub mod output;

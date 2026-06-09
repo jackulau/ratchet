@@ -242,10 +242,19 @@ fn try_open_ch341a(ctx: &Context) -> Option<OpenResult> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate RATCHET_FORCE_MOCK: the test harness runs
+    /// them on parallel threads, and an unsynchronized set/remove race can make
+    /// open_default() probe REAL hardware mid-suite. A poisoned lock is fine —
+    /// the env var is restored by each test regardless.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn force_mock_env_returns_mock() {
-        // SAFETY: env var manipulation in tests - serialize with a guard.
-        // We use a value that any sane CI will not have already set.
+        let _guard = env_lock();
         let prev = std::env::var(FORCE_MOCK_ENV).ok();
         std::env::set_var(FORCE_MOCK_ENV, "1");
         let r = open_default();
@@ -269,6 +278,7 @@ mod tests {
     fn open_raw_bus_forced_mock_errors_honestly() {
         // Protocol verbs must NOT silently fall back to mock — force-mock yields
         // an explicit error the caller surfaces, never a fake success.
+        let _guard = env_lock();
         let prev = std::env::var(FORCE_MOCK_ENV).ok();
         std::env::set_var(FORCE_MOCK_ENV, "1");
         let r = open_raw_bus();
@@ -300,6 +310,7 @@ mod tests {
 
     #[test]
     fn force_mock_env_helper_detects_truthy_values() {
+        let _guard = env_lock();
         let prev = std::env::var(FORCE_MOCK_ENV).ok();
 
         std::env::set_var(FORCE_MOCK_ENV, "1");

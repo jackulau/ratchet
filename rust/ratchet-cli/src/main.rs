@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Show programmer status. (Today all commands route through MockBackend; RATCHET_FORCE_MOCK is reported but not yet wired to switch backends.)
+    /// Show programmer status (backend kind, force-mock state, warnings).
     Status {
         #[arg(long)]
         json: bool,
@@ -175,6 +175,9 @@ enum Command {
     FullBackup {
         #[arg(long)]
         json: bool,
+        /// Overwrite an existing backup file with the same name.
+        #[arg(long)]
+        force: bool,
     },
     /// Monitor connection quality continuously.
     Monitor {
@@ -373,6 +376,8 @@ enum EepromI2cCmd {
         #[arg(long, default_value = "24c256")]
         part: String,
         output: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Write file to a 24Cxx EEPROM.
     Write {
@@ -381,6 +386,8 @@ enum EepromI2cCmd {
         #[arg(long, default_value = "24c256")]
         part: String,
         input: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -506,6 +513,52 @@ fn open_dyn_with_kind() -> (Box<dyn Backend + Send>, BackendKind, Option<String>
     (r.backend, r.kind, r.warning, r.force_mock_env)
 }
 
+/// Open the backend for a DESTRUCTIVE verb (write / erase / region-erase /
+/// full-repair). Refuses to run when the factory silently fell back to mock:
+/// an agent that believes it flashed a BIOS while the bytes went to an
+/// in-memory fake is a bricked board waiting to happen. Explicitly setting
+/// RATCHET_FORCE_MOCK=1 remains allowed (test / smoke path).
+fn open_dyn_destructive(op: &str) -> anyhow::Result<(Box<dyn Backend + Send>, BackendKind)> {
+    let r = open_default();
+    if let Some(msg) = mock_fallback_error(op, r.kind, r.force_mock_env, r.warning.as_deref()) {
+        anyhow::bail!(msg);
+    }
+    Ok((r.backend, r.kind))
+}
+
+/// The refusal message for a destructive verb about to run on a silently-selected
+/// mock; None when the run is allowed (real silicon, or explicit force-mock).
+fn mock_fallback_error(
+    op: &str,
+    kind: BackendKind,
+    force_mock_env: bool,
+    warning: Option<&str>,
+) -> Option<String> {
+    (kind == BackendKind::Mock && !force_mock_env).then(|| {
+        format!(
+            "{op}: refusing to run against the mock fallback backend ({}). Plug in a \
+             CH341A/CH347 programmer, or set RATCHET_FORCE_MOCK=1 to target the mock explicitly.",
+            warning.unwrap_or("no CH341A or CH347 USB device detected")
+        )
+    })
+}
+
+/// Serialize `data` and tag it with the backend kind so agents can tell real
+/// silicon results from explicitly-mocked ones.
+fn with_backend_field<T: serde::Serialize>(
+    data: &T,
+    kind: BackendKind,
+) -> anyhow::Result<serde_json::Value> {
+    let mut v = serde_json::to_value(data)?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "backend".to_string(),
+            serde_json::Value::String(kind.as_str().to_string()),
+        );
+    }
+    Ok(v)
+}
+
 /// Convenience: emit envelope as JSON if `json=true`, otherwise print human text.
 fn emit_envelope<T: serde::Serialize>(
     env: &AgentEnvelope<T>,
@@ -576,7 +629,7 @@ fn main() -> anyhow::Result<()> {
             skip_write,
             json,
         }) => cmd_full_repair(reference.as_deref(), skip_write, json)?,
-        Some(Command::FullBackup { json }) => cmd_full_backup(json)?,
+        Some(Command::FullBackup { json, force }) => cmd_full_backup(json, force)?,
         Some(Command::Monitor { interval_ms, json }) => cmd_monitor(interval_ms, json)?,
         Some(Command::I2c(c)) => cmd_i2c(c)?,
         Some(Command::Uart(c)) => cmd_uart(c)?,
@@ -867,7 +920,12 @@ fn parse_eeprom_part(s: &str) -> anyhow::Result<ratchet_core::programmers::i2c_e
 fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
     use ratchet_core::programmers::i2c_eeprom::I2cEeprom;
     match c {
-        EepromI2cCmd::Read { addr, part, output } => {
+        EepromI2cCmd::Read {
+            addr,
+            part,
+            output,
+            json,
+        } => {
             let address = parse_addr(&addr)? as u8;
             let size = parse_eeprom_part(&part)?;
             let raw = open_raw_bus().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -880,7 +938,7 @@ fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
                 "eeprom-i2c read",
                 json!({ "part": size.name(), "addr": format!("0x{address:02x}"), "bytes": data.len(), "output": output }),
             );
-            emit_envelope(&env, false, || {
+            emit_envelope(&env, json, || {
                 println!(
                     "eeprom-i2c read {} bytes ({}) -> {}",
                     data.len(),
@@ -889,7 +947,12 @@ fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
                 )
             })
         }
-        EepromI2cCmd::Write { addr, part, input } => {
+        EepromI2cCmd::Write {
+            addr,
+            part,
+            input,
+            json,
+        } => {
             let address = parse_addr(&addr)? as u8;
             let size = parse_eeprom_part(&part)?;
             let data = std::fs::read(&input).map_err(|e| anyhow::anyhow!("read {input}: {e}"))?;
@@ -903,7 +966,7 @@ fn cmd_eeprom_i2c(c: EepromI2cCmd) -> anyhow::Result<()> {
                 "eeprom-i2c write",
                 json!({ "part": size.name(), "addr": format!("0x{address:02x}"), "bytes": data.len(), "verified": verified }),
             );
-            emit_envelope(&env, false, || {
+            emit_envelope(&env, json, || {
                 println!(
                     "eeprom-i2c write {} bytes ({}) verified={}",
                     data.len(),
@@ -1094,7 +1157,7 @@ fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
 
 fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> anyhow::Result<()> {
     use ratchet_core::backends::WriteOpts;
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("write")?;
     let r = m.write_chip(
         std::path::Path::new(input),
         WriteOpts {
@@ -1102,19 +1165,22 @@ fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> a
             skip_verify,
         },
     )?;
-    let env = AgentEnvelope::ok("write", r.clone());
+    let env = AgentEnvelope::ok("write", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || {
         println!(
-            "write success={} verified={} backup={:?}",
-            r.success, r.verified, r.backup_path
+            "write success={} verified={} backup={:?} backend={}",
+            r.success,
+            r.verified,
+            r.backup_path,
+            kind.as_str()
         );
     })
 }
 
 fn cmd_erase(json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("erase")?;
     let r = m.erase_chip()?;
-    let env = AgentEnvelope::ok("erase", r.clone());
+    let env = AgentEnvelope::ok("erase", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || println!("erase ok ({}ms)", r.duration_ms))
 }
 
@@ -1333,9 +1399,9 @@ fn cmd_wp_status(json: bool) -> anyhow::Result<()> {
 fn cmd_region_erase(start: &str, length: &str, json: bool) -> anyhow::Result<()> {
     let s = parse_addr(start)?;
     let l = parse_addr(length)?;
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("region-erase")?;
     let r = m.region_erase(s, l)?;
-    let env = AgentEnvelope::ok("region-erase", r.clone());
+    let env = AgentEnvelope::ok("region-erase", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || {
         println!("region-erase ok ({}ms)", r.duration_ms)
     })
@@ -1460,7 +1526,7 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
     use ratchet_core::workflows::pipeline::{build_repair_pipeline, run_pipeline, PipelineContext};
     use ratchet_core::workflows::pipeline_adapter::BackendPipelineAdapter;
 
-    let mut backend = open_dyn();
+    let (mut backend, kind) = open_dyn_destructive("full-repair")?;
     let mut adapter = BackendPipelineAdapter::new(&mut *backend);
     let mut ctx = PipelineContext::new(&mut adapter);
     if let Some(r) = reference {
@@ -1468,7 +1534,7 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
     }
     ctx.skip_write = skip_write;
     let result = run_pipeline(&build_repair_pipeline(), &mut ctx);
-    let env = AgentEnvelope::ok("full-repair", result.clone());
+    let env = AgentEnvelope::ok("full-repair", with_backend_field(&result, kind)?);
     emit_envelope(&env, json, || {
         println!(
             "full-repair: success={} steps={}/{}",
@@ -1485,7 +1551,7 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
     })
 }
 
-fn cmd_full_backup(json: bool) -> anyhow::Result<()> {
+fn cmd_full_backup(json: bool, force: bool) -> anyhow::Result<()> {
     // A full backup is a full-chip read to a descriptively named file, using
     // the same wired SPI backend as `read`. (open_dyn warns on stderr when no
     // device is present and it falls back to mock.)
@@ -1496,6 +1562,14 @@ fn cmd_full_backup(json: bool) -> anyhow::Result<()> {
         .map(|c| c.name.replace([' ', '/'], "_"))
         .unwrap_or_else(|| "chip".to_string());
     let path = format!("ratchet-backup-{label}.bin");
+    // An existing backup may be the user's only copy of a working BIOS — never
+    // clobber it implicitly.
+    if !force && std::path::Path::new(&path).exists() {
+        anyhow::bail!(
+            "full-backup: {path} already exists; pass --force to overwrite it \
+             (it may be your only copy of the old firmware)"
+        );
+    }
     let r = m.read_chip(std::path::Path::new(&path))?;
     let env = AgentEnvelope::ok(
         "full-backup",
@@ -1592,5 +1666,34 @@ mod tests {
     #[test]
     fn enumerate_serial_ports_does_not_panic() {
         let _ = enumerate_serial_ports();
+    }
+
+    // Destructive verbs must refuse a silently-selected mock backend, allow an
+    // explicitly forced one, and never block real silicon. Tested through the
+    // pure decision fn so the suite is safe with or without hardware attached.
+    #[test]
+    fn mock_fallback_refused_unless_forced() {
+        let refusal = mock_fallback_error("write", BackendKind::Mock, false, Some("no device"));
+        let msg = refusal.expect("silent mock fallback must be refused");
+        assert!(msg.contains("mock fallback"));
+        assert!(msg.contains("RATCHET_FORCE_MOCK"));
+
+        assert!(
+            mock_fallback_error("write", BackendKind::Mock, true, None).is_none(),
+            "explicit RATCHET_FORCE_MOCK=1 stays allowed"
+        );
+        assert!(mock_fallback_error("erase", BackendKind::Ch341a, false, None).is_none());
+        assert!(mock_fallback_error("erase", BackendKind::Ch347, false, None).is_none());
+    }
+
+    #[test]
+    fn with_backend_field_tags_objects() {
+        #[derive(serde::Serialize)]
+        struct R {
+            success: bool,
+        }
+        let v = with_backend_field(&R { success: true }, BackendKind::Mock).unwrap();
+        assert_eq!(v["backend"], "mock");
+        assert_eq!(v["success"], true);
     }
 }
