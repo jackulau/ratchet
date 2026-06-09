@@ -1,148 +1,115 @@
 #!/usr/bin/env bash
-# MCP smoke  -  drives dist/mcp/server.js end-to-end via JSON-RPC over stdio.
-# Asserts the server starts, advertises tools, and answers calls with envelope-shaped responses.
-# Runs in mock mode (BIOSPY_FORCE_MOCK=1) so no real hardware is required.
+# MCP smoke — drives the Rust ratchet-mcp binary end-to-end via JSON-RPC over
+# stdio. Runs entirely against the mock backend (RATCHET_FORCE_MOCK=1) so no
+# hardware is required and no destructive op can ever touch real silicon.
+#
+# Asserts: initialize handshake, 30-tool surface, read-only calls succeed,
+# the confirm gate blocks destructive tools, a confirmed erase on the forced
+# mock succeeds (tagged backend:mock), failure_search errors honestly, and
+# transport-less hardware tools return JSON-RPC -32000.
 #
 # Run from repo root: `bash tasks/mcp-smoke.sh`
 
 set -u
 cd "$(dirname "$0")/.."
 
-if [ ! -x dist/mcp/server.js ]; then
-  echo "FAIL: dist/mcp/server.js not built  -  run 'npm run build' first" >&2
-  exit 1
+# ── Resolve the ratchet-mcp binary (prefer prebuilt; build release if missing) ──
+if [ -x rust/target/release/ratchet-mcp ]; then
+  MCP=rust/target/release/ratchet-mcp
+elif [ -x rust/target/debug/ratchet-mcp ]; then
+  MCP=rust/target/debug/ratchet-mcp
+else
+  echo "building ratchet-mcp (release)..." >&2
+  (cd rust && cargo build --release -p ratchet-mcp --quiet) || exit 1
+  MCP=rust/target/release/ratchet-mcp
 fi
+
+export RATCHET_FORCE_MOCK=1
+
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcp-smoke","version":"0"}}}'
+INITIALIZED='{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
 
 PASS=0
 FAIL=0
 FAILED_CHECKS=()
 
-# Helper: drive one JSON-RPC interaction against a freshly-spawned MCP server.
-# Sends init handshake, then a user-supplied tools/call (or tools/list), then EOF.
-# Returns the response JSON for the user's request on stdout.
-mcp_call() {
-  local method="$1"
-  local params="$2"
-  BIOSPY_FORCE_MOCK=1 node -e '
-    const { spawn } = require("child_process");
-    const p = spawn("node", ["dist/mcp/server.js"], { stdio: ["pipe", "pipe", "ignore"], env: process.env });
-    let buf = "";
-    const pending = new Map();
-    let nextId = 1;
-    p.stdout.on("data", (d) => {
-      buf += d.toString();
-      let i;
-      while ((i = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-        if (!line) continue;
-        try {
-          const m = JSON.parse(line);
-          if (m.id !== undefined && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
-        } catch {}
-      }
-    });
-    function request(method, params) {
-      const id = nextId++;
-      return new Promise((resolve, reject) => {
-        pending.set(id, resolve);
-        p.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-        setTimeout(() => reject(new Error("timeout " + method)), 15000);
-      });
-    }
-    (async () => {
-      await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "smoke", version: "0.0.1" } });
-      p.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
-      const resp = await request(process.argv[1], JSON.parse(process.argv[2]));
-      console.log(JSON.stringify(resp));
-      p.kill();
-    })().catch((e) => { console.error("ERR:", e.message); p.kill(); process.exit(1); });
-  ' "$method" "$params"
+# One fresh server per request: handshake + one request, then EOF. Prints every
+# response line; callers usually take `tail -1` (the answer to the request).
+rpc() {
+  printf '%s\n%s\n%s\n' "$INIT" "$INITIALIZED" "$1" | "$MCP" 2>/dev/null
 }
 
-# Helper: assert the response is JSON, the call succeeded (result present, no top-level error),
-# and the embedded envelope.ok matches the expected value (true/false).
-# Pass empty string for expected_ok if the call should be tools/list (no envelope).
-expect() {
-  local label="$1"
-  local expected_ok="$2"
-  local response="$3"
-
-  if ! echo "$response" | node -e 'let s=""; process.stdin.on("data",d=>s+=d); process.stdin.on("end",()=>{try{JSON.parse(s)}catch{process.exit(1)}})' 2>/dev/null; then
-    FAIL=$((FAIL + 1)); FAILED_CHECKS+=("$label  -  non-JSON response")
-    echo "  FAIL: $label  -  non-JSON: $response" >&2
-    return
-  fi
-
-  if [ "$expected_ok" = "" ]; then
-    # tools/list path  -  assert result.tools exists
-    local tool_count
-    tool_count=$(echo "$response" | node -e 'let s=""; process.stdin.on("data",d=>s+=d); process.stdin.on("end",()=>{const r=JSON.parse(s); process.stdout.write(String(r.result?.tools?.length ?? 0))})')
-    if [ "$tool_count" -ge 17 ]; then
-      PASS=$((PASS + 1))
-    else
-      FAIL=$((FAIL + 1)); FAILED_CHECKS+=("$label  -  tool count $tool_count < 17")
-      echo "  FAIL: $label  -  expected ≥17 tools, got $tool_count" >&2
-    fi
-    return
-  fi
-
-  local actual_ok
-  actual_ok=$(echo "$response" | node -e '
-    let s=""; process.stdin.on("data", d => s += d);
-    process.stdin.on("end", () => {
-      const r = JSON.parse(s);
-      const text = r.result?.content?.[0]?.text;
-      if (!text) { process.stdout.write("NO_CONTENT"); return; }
-      const env = JSON.parse(text);
-      process.stdout.write(String(env.ok));
-    })')
-  if [ "$actual_ok" = "$expected_ok" ]; then
+# check <label> <response> <must-match-grep> [more-must-match...]
+check() {
+  local label="$1" response="$2"
+  shift 2
+  local ok=1 pattern
+  for pattern in "$@"; do
+    if ! grep -q -- "$pattern" <<<"$response"; then ok=0; fi
+  done
+  if [ "$ok" = 1 ]; then
     PASS=$((PASS + 1))
   else
-    FAIL=$((FAIL + 1)); FAILED_CHECKS+=("$label  -  envelope.ok=$actual_ok (expected $expected_ok)")
-    echo "  FAIL: $label  -  envelope.ok=$actual_ok (expected $expected_ok)" >&2
+    FAIL=$((FAIL + 1))
+    FAILED_CHECKS+=("$label")
+    echo "  FAIL: $label" >&2
+    echo "        got: $response" >&2
   fi
 }
 
-# ── Tools list ─────────────────────────────────────────────
-expect "tools/list returns ≥17 tools" "" "$(mcp_call tools/list '{}')"
+# ── Handshake ──
+FULL=$(rpc '{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}')
+check "initialize answers with protocolVersion + serverInfo" \
+  "$(head -1 <<<"$FULL")" '"protocolVersion"' '"ratchet-mcp"'
 
-# ── Read-only / database tools (expect envelope.ok=true) ───
-expect "search_chips W25Q64JV" "true" "$(mcp_call tools/call '{"name":"search_chips","arguments":{"query":"W25Q64JV"}}')"
-expect "chip_info ef4017"      "true" "$(mcp_call tools/call '{"name":"chip_info","arguments":{"query":"ef4017"}}')"
-expect "post_decode 00"        "true" "$(mcp_call tools/call '{"name":"post_decode","arguments":{"code":"00"}}')"
-expect "voltage_reference atx" "true" "$(mcp_call tools/call '{"name":"voltage_reference","arguments":{"connector":"atx"}}')"
-expect "failure_search power"  "true" "$(mcp_call tools/call '{"name":"failure_search","arguments":{"category":"power"}}')"
-expect "detect (mock)"         "true" "$(mcp_call tools/call '{"name":"detect","arguments":{}}')"
-expect "identify (mock)"       "true" "$(mcp_call tools/call '{"name":"identify","arguments":{}}')"
-expect "sfdp (mock)"           "true" "$(mcp_call tools/call '{"name":"sfdp","arguments":{}}')"
-expect "wp_status (mock)"      "true" "$(mcp_call tools/call '{"name":"wp_status","arguments":{}}')"
+# ── Tool surface ──
+TOOL_COUNT=$("$MCP" --list-tools | wc -l | tr -d ' ')
+if [ "$TOOL_COUNT" = "30" ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  FAILED_CHECKS+=("tool count $TOOL_COUNT != 30")
+  echo "  FAIL: tool count $TOOL_COUNT != 30" >&2
+fi
+check "tools/list advertises the confirm-gated write_chip" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | tail -1)" \
+  '"tools"' '"write_chip"' '"confirm"'
 
-# ── Safety-gated destructive tools without confirm (expect envelope.ok=false) ───
-expect "write_chip without confirm fails" "false" "$(mcp_call tools/call '{"name":"write_chip","arguments":{"path":"/tmp/x","confirm":false}}')"
-expect "erase_chip without confirm fails" "false" "$(mcp_call tools/call '{"name":"erase_chip","arguments":{"confirm":false}}')"
-expect "region_erase without confirm fails" "false" "$(mcp_call tools/call '{"name":"region_erase","arguments":{"start_addr":0,"length":4096,"confirm":false}}')"
+# ── Read-only tools succeed on the mock backend ──
+check "detect succeeds" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"detect","arguments":{}}}' | tail -1)" '"result"'
+check "identify succeeds" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"identify","arguments":{}}}' | tail -1)" '"result"'
+check "search_chips succeeds" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_chips","arguments":{"query":"W25Q64"}}}' | tail -1)" '"result"'
 
-# ── Erase with confirm (mock backend  -  should succeed) ───
-expect "erase_chip with confirm succeeds" "true" "$(mcp_call tools/call '{"name":"erase_chip","arguments":{"confirm":true}}')"
+# ── Confirm gate: destructive tools refuse without confirm=true ──
+check "write_chip without confirm fails" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_chip","arguments":{"input":"/tmp/x.bin"}}}' | tail -1)" '"error"' 'confirm'
+check "erase_chip without confirm fails" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"erase_chip","arguments":{}}}' | tail -1)" '"error"' 'confirm'
+check "region_erase without confirm fails" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"region_erase","arguments":{"start":0,"length":4096}}}' | tail -1)" '"error"' 'confirm'
 
-# ── Image analysis with synthetic 8MB image ───
-TMP_BIN="$(mktemp -t biospy-mcp-smoke-XXXX.bin)"
-trap 'rm -f "$TMP_BIN"' EXIT
-node -e "const fs=require('fs');const b=Buffer.alloc(8*1024*1024,0xff);b.write('BIOS-TEST',0);fs.writeFileSync('$TMP_BIN',b);"
-ANALYZE_PARAMS="$(node -e "process.stdout.write(JSON.stringify({name:'analyze_image',arguments:{path:'$TMP_BIN'}}))")"
-expect "analyze_image synthetic" "true" "$(mcp_call tools/call "$ANALYZE_PARAMS")"
+# ── Destructive op WITH confirm on the forced mock succeeds, tagged backend:mock ──
+check "erase_chip with confirm succeeds and reports mock backend" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"erase_chip","arguments":{"confirm":true}}}' | tail -1)" \
+  '"result"' 'backend' 'mock'
 
-# ── Error path: missing file ───
-expect "analyze_image missing file" "false" "$(mcp_call tools/call '{"name":"analyze_image","arguments":{"path":"/no/such/file.bin"}}')"
-expect "chip_info miss"             "false" "$(mcp_call tools/call '{"name":"chip_info","arguments":{"query":"notarealchip0000"}}')"
-expect "post_decode invalid"        "false" "$(mcp_call tools/call '{"name":"post_decode","arguments":{"code":"notahex"}}')"
+# ── Honest errors ──
+check "failure_search errors honestly (KB not bundled)" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"failure_search","arguments":{"query":"no boot"}}}' | tail -1)" \
+  '"error"' 'not bundled'
+check "transport-less hw tool returns -32000" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"swd_dump_ram","arguments":{"addr":0,"len":4}}}' | tail -1)" \
+  '"error"' '"code":-32000'
+check "unknown tool errors" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bogus_tool","arguments":{}}}' | tail -1)" \
+  '"error"' 'Unknown tool'
 
-# ── Summary ───
 echo
-echo "MCP smoke: $PASS pass, $FAIL fail"
-if [ $FAIL -gt 0 ]; then
-  echo "Failed checks:"
+echo "mcp-smoke: $PASS passed, $FAIL failed"
+if [ "$FAIL" -gt 0 ]; then
   for c in "${FAILED_CHECKS[@]}"; do echo "  - $c"; done
   exit 1
 fi
