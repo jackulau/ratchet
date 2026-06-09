@@ -233,17 +233,13 @@ pub fn parse_intel_hex(text: &str) -> Result<HexImage> {
                 data.push((full_addr, payload.to_vec()));
             }
             0x01 => break, // EOF
-            0x02 => {
-                // Extended segment address.
-                if payload.len() == 2 {
-                    upper_addr = (((payload[0] as u32) << 8) | payload[1] as u32) << 4;
-                }
+            // Extended segment address.
+            0x02 if payload.len() == 2 => {
+                upper_addr = (((payload[0] as u32) << 8) | payload[1] as u32) << 4;
             }
-            0x04 => {
-                // Extended linear address.
-                if payload.len() == 2 {
-                    upper_addr = (((payload[0] as u32) << 8) | payload[1] as u32) << 16;
-                }
+            // Extended linear address.
+            0x04 if payload.len() == 2 => {
+                upper_addr = (((payload[0] as u32) << 8) | payload[1] as u32) << 16;
             }
             _ => { /* ignore others */ }
         }
