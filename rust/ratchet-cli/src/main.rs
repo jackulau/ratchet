@@ -506,6 +506,52 @@ fn open_dyn_with_kind() -> (Box<dyn Backend + Send>, BackendKind, Option<String>
     (r.backend, r.kind, r.warning, r.force_mock_env)
 }
 
+/// Open the backend for a DESTRUCTIVE verb (write / erase / region-erase /
+/// full-repair). Refuses to run when the factory silently fell back to mock:
+/// an agent that believes it flashed a BIOS while the bytes went to an
+/// in-memory fake is a bricked board waiting to happen. Explicitly setting
+/// RATCHET_FORCE_MOCK=1 remains allowed (test / smoke path).
+fn open_dyn_destructive(op: &str) -> anyhow::Result<(Box<dyn Backend + Send>, BackendKind)> {
+    let r = open_default();
+    if let Some(msg) = mock_fallback_error(op, r.kind, r.force_mock_env, r.warning.as_deref()) {
+        anyhow::bail!(msg);
+    }
+    Ok((r.backend, r.kind))
+}
+
+/// The refusal message for a destructive verb about to run on a silently-selected
+/// mock; None when the run is allowed (real silicon, or explicit force-mock).
+fn mock_fallback_error(
+    op: &str,
+    kind: BackendKind,
+    force_mock_env: bool,
+    warning: Option<&str>,
+) -> Option<String> {
+    (kind == BackendKind::Mock && !force_mock_env).then(|| {
+        format!(
+            "{op}: refusing to run against the mock fallback backend ({}). Plug in a \
+             CH341A/CH347 programmer, or set RATCHET_FORCE_MOCK=1 to target the mock explicitly.",
+            warning.unwrap_or("no CH341A or CH347 USB device detected")
+        )
+    })
+}
+
+/// Serialize `data` and tag it with the backend kind so agents can tell real
+/// silicon results from explicitly-mocked ones.
+fn with_backend_field<T: serde::Serialize>(
+    data: &T,
+    kind: BackendKind,
+) -> anyhow::Result<serde_json::Value> {
+    let mut v = serde_json::to_value(data)?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "backend".to_string(),
+            serde_json::Value::String(kind.as_str().to_string()),
+        );
+    }
+    Ok(v)
+}
+
 /// Convenience: emit envelope as JSON if `json=true`, otherwise print human text.
 fn emit_envelope<T: serde::Serialize>(
     env: &AgentEnvelope<T>,
@@ -1094,7 +1140,7 @@ fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
 
 fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> anyhow::Result<()> {
     use ratchet_core::backends::WriteOpts;
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("write")?;
     let r = m.write_chip(
         std::path::Path::new(input),
         WriteOpts {
@@ -1102,19 +1148,22 @@ fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> a
             skip_verify,
         },
     )?;
-    let env = AgentEnvelope::ok("write", r.clone());
+    let env = AgentEnvelope::ok("write", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || {
         println!(
-            "write success={} verified={} backup={:?}",
-            r.success, r.verified, r.backup_path
+            "write success={} verified={} backup={:?} backend={}",
+            r.success,
+            r.verified,
+            r.backup_path,
+            kind.as_str()
         );
     })
 }
 
 fn cmd_erase(json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("erase")?;
     let r = m.erase_chip()?;
-    let env = AgentEnvelope::ok("erase", r.clone());
+    let env = AgentEnvelope::ok("erase", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || println!("erase ok ({}ms)", r.duration_ms))
 }
 
@@ -1333,9 +1382,9 @@ fn cmd_wp_status(json: bool) -> anyhow::Result<()> {
 fn cmd_region_erase(start: &str, length: &str, json: bool) -> anyhow::Result<()> {
     let s = parse_addr(start)?;
     let l = parse_addr(length)?;
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("region-erase")?;
     let r = m.region_erase(s, l)?;
-    let env = AgentEnvelope::ok("region-erase", r.clone());
+    let env = AgentEnvelope::ok("region-erase", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || {
         println!("region-erase ok ({}ms)", r.duration_ms)
     })
@@ -1460,7 +1509,7 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
     use ratchet_core::workflows::pipeline::{build_repair_pipeline, run_pipeline, PipelineContext};
     use ratchet_core::workflows::pipeline_adapter::BackendPipelineAdapter;
 
-    let mut backend = open_dyn();
+    let (mut backend, kind) = open_dyn_destructive("full-repair")?;
     let mut adapter = BackendPipelineAdapter::new(&mut *backend);
     let mut ctx = PipelineContext::new(&mut adapter);
     if let Some(r) = reference {
@@ -1468,7 +1517,7 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
     }
     ctx.skip_write = skip_write;
     let result = run_pipeline(&build_repair_pipeline(), &mut ctx);
-    let env = AgentEnvelope::ok("full-repair", result.clone());
+    let env = AgentEnvelope::ok("full-repair", with_backend_field(&result, kind)?);
     emit_envelope(&env, json, || {
         println!(
             "full-repair: success={} steps={}/{}",
@@ -1592,5 +1641,34 @@ mod tests {
     #[test]
     fn enumerate_serial_ports_does_not_panic() {
         let _ = enumerate_serial_ports();
+    }
+
+    // Destructive verbs must refuse a silently-selected mock backend, allow an
+    // explicitly forced one, and never block real silicon. Tested through the
+    // pure decision fn so the suite is safe with or without hardware attached.
+    #[test]
+    fn mock_fallback_refused_unless_forced() {
+        let refusal = mock_fallback_error("write", BackendKind::Mock, false, Some("no device"));
+        let msg = refusal.expect("silent mock fallback must be refused");
+        assert!(msg.contains("mock fallback"));
+        assert!(msg.contains("RATCHET_FORCE_MOCK"));
+
+        assert!(
+            mock_fallback_error("write", BackendKind::Mock, true, None).is_none(),
+            "explicit RATCHET_FORCE_MOCK=1 stays allowed"
+        );
+        assert!(mock_fallback_error("erase", BackendKind::Ch341a, false, None).is_none());
+        assert!(mock_fallback_error("erase", BackendKind::Ch347, false, None).is_none());
+    }
+
+    #[test]
+    fn with_backend_field_tags_objects() {
+        #[derive(serde::Serialize)]
+        struct R {
+            success: bool,
+        }
+        let v = with_backend_field(&R { success: true }, BackendKind::Mock).unwrap();
+        assert_eq!(v["backend"], "mock");
+        assert_eq!(v["success"], true);
     }
 }

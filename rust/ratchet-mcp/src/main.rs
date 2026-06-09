@@ -27,6 +27,40 @@ fn open_dyn() -> Box<dyn Backend + Send> {
     r.backend
 }
 
+/// Open the backend for a DESTRUCTIVE tool (write_chip / erase_chip /
+/// region_erase). Refuses to run when the factory silently fell back to mock:
+/// an agent that believes it flashed a BIOS while the bytes went to an
+/// in-memory fake is a bricked board waiting to happen. Explicitly setting
+/// RATCHET_FORCE_MOCK=1 remains allowed (test / smoke path).
+#[allow(clippy::type_complexity)]
+fn open_dyn_destructive(op: &str) -> Result<(Box<dyn Backend + Send>, BackendKind), (i32, String)> {
+    let r = open_default();
+    if r.kind == BackendKind::Mock && !r.force_mock_env {
+        return Err((
+            -32000,
+            format!(
+                "{op}: refusing to run against the mock fallback backend ({}). Plug in a \
+                 CH341A/CH347 programmer, or set RATCHET_FORCE_MOCK=1 to target the mock \
+                 explicitly.",
+                r.warning
+                    .as_deref()
+                    .unwrap_or("no CH341A or CH347 USB device detected")
+            ),
+        ));
+    }
+    Ok((r.backend, r.kind))
+}
+
+/// Tag a destructive-op result with the backend kind so agents can tell real
+/// silicon results from explicitly-mocked ones.
+fn with_backend_field(v: Value, kind: BackendKind) -> Value {
+    let mut v = v;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("backend".to_string(), Value::String(kind.as_str().into()));
+    }
+    v
+}
+
 fn main() -> anyhow::Result<()> {
     // `--list-tools` short-circuits the JSON-RPC loop and prints just the
     // registered tool names  -  handy for shell smoke tests and discovery.
@@ -636,11 +670,14 @@ fn call_write_chip(args: &Value) -> Result<Value, (i32, String)> {
         skip_backup: arg_bool(args, "skip_backup"),
         skip_verify: arg_bool(args, "skip_verify"),
     };
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("write_chip")?;
     let r = m
         .write_chip(std::path::Path::new(&input), opts)
         .map_err(map_err)?;
-    Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&r).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_verify_chip(args: &Value) -> Result<Value, (i32, String)> {
@@ -653,17 +690,23 @@ fn call_verify_chip(args: &Value) -> Result<Value, (i32, String)> {
 }
 
 fn call_erase_chip() -> Result<Value, (i32, String)> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("erase_chip")?;
     let r = m.erase_chip().map_err(map_err)?;
-    Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&r).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_region_erase(args: &Value) -> Result<Value, (i32, String)> {
     let start = arg_u64(args, "start")?;
     let length = arg_u64(args, "length")?;
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_destructive("region_erase")?;
     let r = m.region_erase(start, length).map_err(map_err)?;
-    Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&r).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_blank_check() -> Result<Value, (i32, String)> {
