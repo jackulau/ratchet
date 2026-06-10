@@ -3,7 +3,7 @@
 # stdio. Runs entirely against the mock backend (RATCHET_FORCE_MOCK=1) so no
 # hardware is required and no destructive op can ever touch real silicon.
 #
-# Asserts: initialize handshake, 30-tool surface, read-only calls succeed,
+# Asserts: initialize handshake, 31-tool surface, read-only calls succeed,
 # the confirm gate blocks destructive tools, a confirmed erase on the forced
 # mock succeeds (tagged backend:mock), failure_search errors honestly, and
 # transport-less hardware tools return JSON-RPC -32000.
@@ -64,12 +64,12 @@ check "initialize answers with protocolVersion + serverInfo" \
 
 # ── Tool surface ──
 TOOL_COUNT=$("$MCP" --list-tools | wc -l | tr -d ' ')
-if [ "$TOOL_COUNT" = "30" ]; then
+if [ "$TOOL_COUNT" = "31" ]; then
   PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))
-  FAILED_CHECKS+=("tool count $TOOL_COUNT != 30")
-  echo "  FAIL: tool count $TOOL_COUNT != 30" >&2
+  FAILED_CHECKS+=("tool count $TOOL_COUNT != 31")
+  echo "  FAIL: tool count $TOOL_COUNT != 31" >&2
 fi
 check "tools/list advertises the confirm-gated write_chip" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | tail -1)" \
@@ -92,6 +92,11 @@ check "region_erase without confirm fails" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"region_erase","arguments":{"start":0,"length":4096}}}' | tail -1)" '"error"' 'confirm'
 check "i2c_write without confirm fails" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"i2c_write","arguments":{"addr":80,"data_hex":"00"}}}' | tail -1)" '"error"' 'confirm'
+check "wp_disable without confirm fails" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wp_disable","arguments":{}}}' | tail -1)" '"error"' 'confirm'
+check "wp_disable with confirm succeeds on forced mock" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wp_disable","arguments":{"confirm":true}}}' | tail -1)" \
+  '"result"' 'backend' 'mock'
 
 # ── Destructive op WITH confirm on the forced mock succeeds, tagged backend:mock ──
 check "erase_chip with confirm succeeds and reports mock backend" \

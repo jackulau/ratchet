@@ -143,6 +143,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Clear the chip's block-protect bits (the in-tool remedy for "write protected" errors).
+    WpDisable {
+        #[arg(long)]
+        json: bool,
+    },
     /// Erase a specific byte range.
     RegionErase {
         start: String,
@@ -616,6 +621,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Sfdp { json }) => cmd_sfdp(json)?,
         Some(Command::WpStatus { json }) => cmd_wp_status(json)?,
+        Some(Command::WpDisable { json }) => cmd_wp_disable(json)?,
         Some(Command::RegionErase {
             start,
             length,
@@ -1437,6 +1443,30 @@ fn cmd_blank_check(json: bool) -> anyhow::Result<()> {
     let code = check_exit_code(blank);
     if code != 0 {
         std::process::exit(code);
+    }
+    Ok(())
+}
+
+fn cmd_wp_disable(json: bool) -> anyhow::Result<()> {
+    // Mutates SR1 (clears the BP bits), so it runs behind the destructive gate:
+    // a user hitting BackendError::WriteProtected needs an in-tool remedy, but
+    // never against a silently-selected mock.
+    let (mut m, kind) = open_dyn_destructive("wp-disable")?;
+    let before = m.is_write_protected()?;
+    m.disable_write_protection()?;
+    let after = m.is_write_protected()?;
+    let env = AgentEnvelope::ok(
+        "wp-disable",
+        with_backend_field(
+            &json!({"was_protected": before, "write_protected": after, "success": !after}),
+            kind,
+        )?,
+    );
+    emit_envelope(&env, json, || {
+        println!("wp-disable: was_protected={before} now_protected={after}")
+    })?;
+    if after {
+        anyhow::bail!("write protection still active after WRSR (hardware WP pin or OTP lock?)");
     }
     Ok(())
 }
