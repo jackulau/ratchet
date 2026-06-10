@@ -244,6 +244,21 @@ impl<B: UsbBus> CH341ABackend<B> {
         decode_jedec_response(&rx).ok_or(BackendError::ChipNotDetected)
     }
 
+    /// Read SR1, failing CLOSED on a short/garbled RDSR response. A flaky bus
+    /// must never read as "ready" (WIP clear) or "unprotected" (BP clear): those
+    /// optimistic defaults green-light destructive ops exactly when the transport
+    /// is least trustworthy.
+    fn read_sr1_strict(&mut self) -> Result<u8> {
+        self.spi_command(&[SPI_RDSR, 0])?
+            .get(1)
+            .copied()
+            .ok_or_else(|| {
+                BackendError::Other(
+                    "short RDSR response — status register unreadable; failing closed".into(),
+                )
+            })
+    }
+
     /// Poll RDSR until the write-in-progress (WIP) bit clears, or `timeout` elapses.
     /// Every erase and page-program MUST be followed by this: SPI flash NAKs further
     /// commands while an internal write/erase is running, and chip-erase can take well
@@ -252,11 +267,7 @@ impl<B: UsbBus> CH341ABackend<B> {
         let start = Instant::now();
         let mut backoff = Duration::from_micros(50);
         loop {
-            let sr1 = self
-                .spi_command(&[SPI_RDSR, 0])?
-                .get(1)
-                .copied()
-                .unwrap_or(0);
+            let sr1 = self.read_sr1_strict()?;
             if sr1 & SR_WIP == 0 {
                 return Ok(());
             }
@@ -306,7 +317,17 @@ impl<B: UsbBus> CH341ABackend<B> {
             packet.extend_from_slice(&zeros[..n]);
             bus.bulk_write(&packet)?;
             let rx = bus.bulk_read(n)?;
-            buf.extend_from_slice(&rx[..n.min(rx.len())]);
+            if rx.len() < n {
+                // A short chunk would shift every subsequent byte left — an
+                // offset-misaligned dump that verify/backup would trust. Release
+                // CS best-effort and abort instead of returning corrupt data.
+                let _ = bus.bulk_write(&cs_deassert_packet());
+                return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
+                    expected: n,
+                    actual: rx.len(),
+                }));
+            }
+            buf.extend_from_slice(&rx[..n]);
         }
         bus.bulk_write(&cs_deassert_packet())?;
         Ok(buf)
@@ -377,13 +398,9 @@ impl<B: UsbBus> CH341ABackend<B> {
 
     /// Refuse destructive ops on write-protected silicon: protected chips silently
     /// ignore erase/program commands, which would otherwise read as fake success.
+    /// Reads SR1 strictly — a short response must not read as "unprotected".
     fn ensure_not_write_protected(&mut self) -> Result<()> {
-        let sr1 = self
-            .spi_command(&[SPI_RDSR, 0])?
-            .get(1)
-            .copied()
-            .unwrap_or(0);
-        if sr1 & SR_BP_MASK != 0 {
+        if self.read_sr1_strict()? & SR_BP_MASK != 0 {
             return Err(BackendError::WriteProtected);
         }
         Ok(())
@@ -1126,6 +1143,74 @@ mod tests {
         let pkt = &bus.writes[10];
         assert_eq!(pkt[1], SPI_SECTOR_ERASE_4B);
         assert_eq!(&pkt[2..6], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    /// A bus that always returns fewer bytes than requested — exercises the
+    /// fail-closed paths for garbled/short transport reads.
+    struct ShortReadBus;
+    impl UsbBus for ShortReadBus {
+        fn bulk_write(&mut self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn bulk_read(&mut self, _len: usize) -> Result<Vec<u8>> {
+            Ok(vec![0u8; 1])
+        }
+    }
+
+    #[test]
+    fn short_status_read_fails_closed() {
+        // A short RDSR response must NEVER be interpreted as "ready" — the old
+        // .get(1).unwrap_or(0) read a starved bus as WIP-clear, green-lighting
+        // the next destructive command exactly when the bus was flakiest.
+        let mut backend = CH341ABackend::with_bus(ShortReadBus);
+        let err = backend
+            .wait_until_ready(Duration::from_millis(10))
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("short RDSR"),
+            "ready-poll must fail closed on a short status read, got: {err}"
+        );
+
+        // Same for the write-protect guard: a short response must not read as
+        // "unprotected" (BP bits clear).
+        let mut backend = CH341ABackend::with_bus(ShortReadBus);
+        let err = backend.erase_chip().unwrap_err();
+        assert!(
+            format!("{err}").contains("short RDSR"),
+            "WP guard must fail closed on a short status read, got: {err}"
+        );
+    }
+
+    #[test]
+    fn short_bulk_read_is_hard_error() {
+        // A bus that answers the opcode/address echo fully but starves the data
+        // chunks. The old code appended the short slice and kept going — every
+        // subsequent byte shifted left, silently corrupting backups and verifies.
+        struct HeaderThenShortBus {
+            reads: usize,
+        }
+        impl UsbBus for HeaderThenShortBus {
+            fn bulk_write(&mut self, _d: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
+                self.reads += 1;
+                if self.reads == 1 {
+                    Ok(vec![0u8; len]) // header echo
+                } else {
+                    Ok(vec![0u8; len.saturating_sub(1)]) // short data chunk
+                }
+            }
+        }
+        let mut backend = CH341ABackend::with_bus(HeaderThenShortBus { reads: 0 });
+        let err = backend.read_range(0, 64).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BackendError::Usb(ratchet_usb::UsbError::ShortTransfer { .. })
+            ),
+            "short data chunk must abort the read, got: {err}"
+        );
     }
 
     /// A bus that always reports the chip busy (WIP=1) — used to exercise the timeout path.

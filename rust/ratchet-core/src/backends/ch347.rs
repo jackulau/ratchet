@@ -230,6 +230,17 @@ impl<T: Transport> Ch347Protocol<T> {
             pkt.extend_from_slice(chunk);
             self.transport.write(&pkt)?;
             let rx = self.transport.read(4 + chunk_len)?;
+            if rx.len() < 4 + chunk_len {
+                // A short transport read must be a hard error, not a panic (the
+                // old slice indexing) and never silent padding. Release CS
+                // best-effort so the chip is not left selected mid-command.
+                let _ = self.transport.write(&build_cs_xfer_packet(&[], false, 0));
+                let _ = self.transport.read(4);
+                return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
+                    expected: 4 + chunk_len,
+                    actual: rx.len(),
+                }));
+            }
             result[offset..offset + chunk_len].copy_from_slice(&rx[4..4 + chunk_len]);
 
             if is_last {
@@ -1082,6 +1093,31 @@ mod tests {
                 w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_ENTER_4BYTE
             });
         assert!(sent_en4b, "EN4B (0xb7) must be sent for a >16 MB chip");
+    }
+
+    #[test]
+    fn short_transport_read_is_error_not_panic() {
+        // The old code sliced rx[4..4+chunk_len] straight out of the transport
+        // read — a short read panicked the process mid-operation. It must be a
+        // hard ShortTransfer error instead.
+        struct ShortTransport;
+        impl Transport for ShortTransport {
+            fn write(&mut self, _d: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn read(&mut self, len: usize) -> Result<Vec<u8>> {
+                Ok(vec![0u8; len.saturating_sub(1)])
+            }
+        }
+        let mut p = Ch347Protocol::new(ShortTransport);
+        let err = p.spi_command(&[SPI_CMD_RDSR, 0]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BackendError::Usb(ratchet_usb::UsbError::ShortTransfer { .. })
+            ),
+            "short transport read must be a hard error, got: {err}"
+        );
     }
 
     #[test]
