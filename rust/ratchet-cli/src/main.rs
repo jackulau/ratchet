@@ -1151,6 +1151,7 @@ fn cmd_identify(json: bool) -> anyhow::Result<()> {
 
 fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
     let mut m = open_dyn();
+    with_progress(&mut *m, "read", json);
     let r = m.read_chip(std::path::Path::new(output))?;
     let env = AgentEnvelope::ok("read", r.clone());
     emit_envelope(&env, json, || {
@@ -1164,6 +1165,7 @@ fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
 fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> anyhow::Result<()> {
     use ratchet_core::backends::WriteOpts;
     let (mut m, kind) = open_dyn_destructive("write")?;
+    with_progress(&mut *m, "write", json);
     let r = m.write_chip(
         std::path::Path::new(input),
         WriteOpts {
@@ -1185,9 +1187,43 @@ fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> a
 
 fn cmd_erase(json: bool) -> anyhow::Result<()> {
     let (mut m, kind) = open_dyn_destructive("erase")?;
+    with_progress(&mut *m, "erase", json);
     let r = m.erase_chip()?;
     let env = AgentEnvelope::ok("erase", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || println!("erase ok ({}ms)", r.duration_ms))
+}
+
+/// Stderr progress ticker for multi-minute hardware operations: percentage +
+/// throughput, updated at most every 200 ms. stderr ONLY — stdout carries the
+/// JSON envelope contract, and smoke greps must stay byte-identical.
+fn progress_ticker(label: &'static str) -> ratchet_core::backends::ProgressFn {
+    let start = std::time::Instant::now();
+    let mut last_tick = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    Box::new(move |done, total| {
+        if done < total && last_tick.elapsed() < std::time::Duration::from_millis(200) {
+            return;
+        }
+        last_tick = std::time::Instant::now();
+        let pct = if total > 0 { done * 100 / total } else { 0 };
+        let secs = start.elapsed().as_secs_f64();
+        let rate_kib = if secs > 0.0 {
+            done as f64 / secs / 1024.0
+        } else {
+            0.0
+        };
+        eprint!("\r{label}: {pct}% ({done}/{total} bytes, {rate_kib:.0} KiB/s)");
+        if done >= total {
+            eprintln!();
+        }
+    })
+}
+
+/// Attach the stderr ticker to a backend for a long operation — human mode
+/// only (`--json` consumers poll their own state and must not get a ticker).
+fn with_progress(m: &mut (impl Backend + ?Sized), label: &'static str, json: bool) {
+    if !json {
+        m.set_progress_callback(progress_ticker(label));
+    }
 }
 
 /// Exit code for the verify / blank-check contract: scripts gate on these verbs
@@ -1203,6 +1239,7 @@ fn check_exit_code(ok: bool) -> i32 {
 
 fn cmd_verify(file: &str, json: bool) -> anyhow::Result<()> {
     let mut m = open_dyn();
+    with_progress(&mut *m, "verify", json);
     let r = m.verify_chip(std::path::Path::new(file))?;
     let env = AgentEnvelope::ok("verify", r.clone());
     emit_envelope(&env, json, || println!("matches={}", r.matches))?;

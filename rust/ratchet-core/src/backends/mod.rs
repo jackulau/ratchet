@@ -33,7 +33,17 @@ pub enum BackendError {
 
 pub type Result<T> = std::result::Result<T, BackendError>;
 
+/// Progress observer for long hardware operations: called with
+/// `(bytes_done, bytes_total)` at chunk granularity. Installed via
+/// [`Backend::set_progress_callback`]; consumers (the CLI ticker) throttle
+/// their own output.
+pub type ProgressFn = Box<dyn FnMut(u64, u64) + Send>;
+
 pub trait Backend: Send {
+    /// Install a progress observer for long read/write/erase operations. The
+    /// default ignores it, so mocks and adapters are unaffected; the live
+    /// backends report per-chunk progress through it.
+    fn set_progress_callback(&mut self, _cb: ProgressFn) {}
     fn detect_programmer(&mut self) -> Result<ProgrammerInfo>;
     fn open(&mut self) -> Result<()>;
     fn close(&mut self) -> Result<()>;

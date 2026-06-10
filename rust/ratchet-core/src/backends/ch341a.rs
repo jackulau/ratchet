@@ -227,6 +227,7 @@ impl UsbBus for MockBus {
 pub struct CH341ABackend<B: UsbBus> {
     bus: Option<B>,
     use_4byte_addr: bool,
+    progress: Option<super::ProgressFn>,
 }
 
 impl<B: UsbBus> CH341ABackend<B> {
@@ -234,6 +235,7 @@ impl<B: UsbBus> CH341ABackend<B> {
         Self {
             bus: Some(bus),
             use_4byte_addr: false,
+            progress: None,
         }
     }
 
@@ -332,9 +334,10 @@ impl<B: UsbBus> CH341ABackend<B> {
             return Ok(Vec::new());
         }
         let use_4byte = self.use_4byte_addr;
+        let progress = self.progress.as_mut();
         let bus = self.bus.as_mut().ok_or(BackendError::NotConnected)?;
         bus.bulk_write(&cs_assert_packet())?;
-        let res = Self::read_range_chunks(bus, start_addr, len, use_4byte);
+        let res = Self::read_range_chunks(bus, start_addr, len, use_4byte, progress);
         // CS must be released on success AND failure (see spi_command); the
         // original error takes precedence over a deassert failure.
         let deassert = bus.bulk_write(&cs_deassert_packet());
@@ -348,6 +351,7 @@ impl<B: UsbBus> CH341ABackend<B> {
         start_addr: u64,
         len: usize,
         use_4byte: bool,
+        mut progress: Option<&mut super::ProgressFn>,
     ) -> Result<Vec<u8>> {
         let max_payload = MAX_XFER - 1; // 31 SPI bytes per USB packet
         let mut packet: Vec<u8> = Vec::with_capacity(max_payload + 1);
@@ -375,6 +379,9 @@ impl<B: UsbBus> CH341ABackend<B> {
             bus.bulk_write(&packet)?;
             bus.bulk_read_into(&mut rx[..n])?;
             buf.extend_from_slice(&rx[..n]);
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(buf.len() as u64, len as u64);
+            }
         }
         Ok(buf)
     }
@@ -599,6 +606,9 @@ impl<B: UsbBus> CH341ABackend<B> {
             let chunk_end = page_end.min(firmware.len());
             self.page_program(offset as u64, &firmware[offset..chunk_end])?;
             offset = chunk_end;
+            if let Some(cb) = self.progress.as_mut() {
+                cb(offset as u64, firmware.len() as u64);
+            }
         }
 
         // 4. Read back and compare unless the caller opted out.
@@ -847,6 +857,10 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         // Reset returns the chip to power-on state, including 3-byte addressing.
         self.use_4byte_addr = false;
         Ok(())
+    }
+
+    fn set_progress_callback(&mut self, cb: super::ProgressFn) {
+        self.progress = Some(cb);
     }
 }
 
@@ -1320,6 +1334,34 @@ mod tests {
                 BackendError::Usb(ratchet_usb::UsbError::ShortTransfer { .. })
             ),
             "short data chunk must abort the read, got: {err}"
+        );
+    }
+
+    #[test]
+    fn progress_callback_reports_read_chunks() {
+        // The progress hook must observe monotonically increasing byte counts
+        // ending exactly at the requested length — the CLI ticker depends on
+        // the final (total, total) call to print its 100% line.
+        use std::sync::{Arc, Mutex};
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0u8; 8]); // header echo
+        for _ in 0..3 {
+            bus.queue_read(vec![0u8; 40]); // data chunks (31+31+2)
+        }
+        let mut backend = CH341ABackend::with_bus(bus);
+        let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        backend.set_progress_callback(Box::new(move |done, total| {
+            sink.lock().unwrap().push((done, total));
+        }));
+        backend.read_range(0, 64).unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "progress must be reported");
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "monotonic");
+        assert_eq!(
+            *seen.last().unwrap(),
+            (64, 64),
+            "final call is (total, total)"
         );
     }
 

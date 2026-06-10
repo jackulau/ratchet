@@ -189,6 +189,7 @@ pub struct Ch347Protocol<T: Transport> {
     transport: T,
     use_4byte_addr: bool,
     clock_divisor: u8,
+    progress: Option<crate::backends::ProgressFn>,
 }
 
 impl<T: Transport> Ch347Protocol<T> {
@@ -197,6 +198,7 @@ impl<T: Transport> Ch347Protocol<T> {
             transport,
             use_4byte_addr: false,
             clock_divisor: 3, // default 7.5MHz (safe for most chips)
+            progress: None,
         }
     }
 
@@ -450,6 +452,9 @@ impl<T: Transport> Ch347Protocol<T> {
             self.transport.read_into(&mut rx[..4 + n])?;
             out.extend_from_slice(&rx[4..4 + n]);
             remaining -= n;
+            if let Some(cb) = self.progress.as_mut() {
+                cb(out.len() as u64, length as u64);
+            }
         }
 
         // CS-deassert XFER (empty payload) terminates the transaction.
@@ -617,6 +622,9 @@ impl<T: Transport + Send> Ch347Backend<T> {
             self.proto
                 .page_program(offset as u32, &firmware[offset..chunk_end])?;
             offset = chunk_end;
+            if let Some(cb) = self.proto.progress.as_mut() {
+                cb(offset as u64, firmware.len() as u64);
+            }
         }
 
         // 4. Read back and compare unless skipped — no more hardcoded `verified: true`.
@@ -867,6 +875,10 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
         // Reset returns the chip to power-on state, including 3-byte addressing.
         self.proto.set_4byte_addr(false);
         Ok(())
+    }
+
+    fn set_progress_callback(&mut self, cb: crate::backends::ProgressFn) {
+        self.proto.progress = Some(cb);
     }
 }
 
