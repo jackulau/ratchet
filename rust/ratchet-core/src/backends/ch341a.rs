@@ -10,7 +10,7 @@ use crate::chips::{format_size, lookup_by_jedec_id, needs_4byte_addressing};
 use crate::types::*;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 // USB device IDs ─────────────────────────────────────────────────────────────
 pub const CH341A_VID: u16 = 0x1a86;
@@ -574,15 +574,13 @@ impl<B: UsbBus> CH341ABackend<B> {
         self.ensure_not_write_protected()?;
 
         // 1. Back up current chip contents BEFORE touching anything (unless told to skip).
-        //    A user reflashing a motherboard should never lose their only copy of the old BIOS.
+        //    A user reflashing a motherboard should never lose their only copy of the old
+        //    BIOS — the backup goes to the persistent, owner-only per-user dir (temp_dir
+        //    is wiped on reboot and world-readable; dumps can carry NVRAM secrets).
         let backup_path = if opts.skip_backup {
             None
         } else {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("ratchet-backup-{}.bin", ts));
+            let path = super::backup::create_private_backup_path("ratchet-backup")?;
             self.read_chip_to_file(&path)?;
             Some(path.display().to_string())
         };

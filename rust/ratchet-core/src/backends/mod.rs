@@ -2,6 +2,7 @@
 // Keep surface minimal: anything specific to one programmer (e.g. CH341A SPI mode)
 // stays in that backend's module.
 
+pub mod backup;
 pub mod ch341a;
 pub mod ch347;
 pub mod errors;

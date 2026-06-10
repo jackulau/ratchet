@@ -7,7 +7,7 @@ use crate::types::*;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 // ─── USB device IDs ──────────────────────────────────────────────────────────
 
@@ -588,15 +588,13 @@ impl<T: Transport + Send> Ch347Backend<T> {
         // a protected chip ignores erase/program and would fake-succeed.
         self.ensure_not_write_protected()?;
 
-        // 1. Back up current contents before overwriting (unless skipped).
+        // 1. Back up current contents before overwriting (unless skipped). The backup
+        //    goes to the persistent, owner-only per-user dir (temp_dir is wiped on
+        //    reboot and world-readable; dumps can carry NVRAM secrets).
         let backup_path = if opts.skip_backup {
             None
         } else {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("ratchet-backup-{}.bin", ts));
+            let path = super::backup::create_private_backup_path("ratchet-backup")?;
             self.read_chip_to_file(&path)?;
             Some(path.display().to_string())
         };
