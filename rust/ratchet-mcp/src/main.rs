@@ -319,12 +319,13 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "i2c_write",
-            "Write hex-encoded bytes to an I2C device",
+            "Write hex-encoded bytes to an I2C device (destructive: requires confirm=true)",
             json!({
-                "type":"object","required":["addr","data_hex"],
+                "type":"object","required":["addr","data_hex","confirm"],
                 "properties":{
                     "addr":{"type":"integer"},
-                    "data_hex":{"type":"string"}
+                    "data_hex":{"type":"string"},
+                    "confirm":{"type":"boolean","description":"Must be true: arbitrary I2C writes can reconfigure EEPROMs, EC and PMIC registers"}
                 }
             }),
         ),
@@ -477,7 +478,12 @@ fn tool_call(params: &Value) -> Result<Value, (i32, String)> {
         // the rest fail honestly until their transport adapter is wired.
         "i2c_scan" => call_i2c_scan()?,
         "i2c_read" => call_i2c_read(&args)?,
-        "i2c_write" => call_i2c_write(&args)?,
+        "i2c_write" => {
+            // Arbitrary I2C writes hit EEPROMs, EC and PMIC registers — as
+            // destructive as a flash write. Same explicit-confirm contract.
+            require_confirm("i2c_write", &args)?;
+            call_i2c_write(&args)?
+        }
         "jtag_idcode_scan" => call_jtag_idcode_scan(&args)?,
         "uart_capture" => hw_unavailable_mcp(
             "uart_capture",
@@ -859,10 +865,30 @@ mod tests {
         }
     }
 
+    // i2c_write reaches EEPROMs, EC and PMIC registers — it shares the exact
+    // confirm contract of the flash-destructive tools.
+    #[test]
+    fn i2c_write_requires_confirm() {
+        let (code, msg) = require_confirm("i2c_write", &json!({})).unwrap_err();
+        assert_eq!(code, -32602);
+        assert!(msg.contains("confirm"));
+        assert!(require_confirm("i2c_write", &json!({"confirm": true})).is_ok());
+        let tools = tool_list();
+        let t = tools.iter().find(|t| t["name"] == "i2c_write").unwrap();
+        let required: Vec<&str> = t["inputSchema"]["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            required.contains(&"confirm"),
+            "i2c_write schema must require confirm"
+        );
+    }
+
     #[test]
     fn destructive_tool_schemas_require_confirm() {
         let tools = tool_list();
-        for name in ["write_chip", "erase_chip", "region_erase"] {
+        for name in ["write_chip", "erase_chip", "region_erase", "i2c_write"] {
             let t = tools
                 .iter()
                 .find(|t| t["name"] == name)
@@ -891,7 +917,7 @@ mod tests {
 
     #[test]
     fn confirm_gate_blocks_destructive_tools() {
-        for tool in ["write_chip", "erase_chip", "region_erase"] {
+        for tool in ["write_chip", "erase_chip", "region_erase", "i2c_write"] {
             let (code, msg) = require_confirm(tool, &json!({})).unwrap_err();
             assert_eq!(code, -32602);
             assert!(msg.contains("confirm"), "gate message must explain: {msg}");

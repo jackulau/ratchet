@@ -90,6 +90,8 @@ check "erase_chip without confirm fails" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"erase_chip","arguments":{}}}' | tail -1)" '"error"' 'confirm'
 check "region_erase without confirm fails" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"region_erase","arguments":{"start":0,"length":4096}}}' | tail -1)" '"error"' 'confirm'
+check "i2c_write without confirm fails" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"i2c_write","arguments":{"addr":80,"data_hex":"00"}}}' | tail -1)" '"error"' 'confirm'
 
 # ── Destructive op WITH confirm on the forced mock succeeds, tagged backend:mock ──
 check "erase_chip with confirm succeeds and reports mock backend" \
