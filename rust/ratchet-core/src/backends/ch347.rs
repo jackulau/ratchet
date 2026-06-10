@@ -57,6 +57,8 @@ pub const SPI_CMD_EWSR: u8 = 0x50;
 pub const SPI_CMD_SFDP: u8 = 0x5a;
 
 // 4-byte addressing
+pub const SPI_CMD_RESET_ENABLE: u8 = 0x66;
+pub const SPI_CMD_RESET: u8 = 0x99;
 pub const SPI_CMD_ENTER_4BYTE: u8 = 0xb7;
 pub const SPI_CMD_EXIT_4BYTE: u8 = 0xe9;
 pub const SPI_CMD_READ_4BYTE: u8 = 0x13;
@@ -372,9 +374,15 @@ impl<T: Transport> Ch347Protocol<T> {
     }
 
     pub fn chip_erase(&mut self) -> Result<()> {
+        self.chip_erase_with_timeout(ERASE_TIMEOUT)
+    }
+
+    /// Chip-erase with a caller-sized WIP timeout: 16-32 MB parts take 200-400 s,
+    /// far past the fixed default. The backend sizes this from chip capacity.
+    pub fn chip_erase_with_timeout(&mut self, timeout: Duration) -> Result<()> {
         self.write_enable()?;
         self.spi_command(&[SPI_CMD_CHIP_ERASE])?;
-        self.wait_until_ready(ERASE_TIMEOUT)
+        self.wait_until_ready(timeout)
     }
 
     pub fn read_data(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
@@ -673,13 +681,26 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
 
     fn erase_chip(&mut self) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        self.proto.chip_erase()?;
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        // Identify to size the WIP timeout — chip-erase on 16-32 MB parts runs
+        // 200-400 s, far past the old fixed default. Unknown capacity gets the
+        // largest supported part's budget.
+        let res = self.identify_chip().and_then(|chip| {
+            let timeout = match chip {
+                Some(c) if c.size_bytes > 0 => {
+                    crate::backends::ch341a::erase_timeout_for(c.size_bytes)
+                }
+                _ => crate::backends::ch341a::erase_timeout_for(32 * 1024 * 1024),
+            };
+            let start = Instant::now();
+            self.proto.chip_erase_with_timeout(timeout)?;
+            Ok(EraseResult {
+                success: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+                error: None,
+            })
+        });
+        self.exit_4byte_if_entered();
+        res
     }
 
     fn sector_erase(&mut self, address: u64) -> Result<EraseResult> {
@@ -781,6 +802,15 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
     }
 
     fn reset_chip(&mut self) -> Result<()> {
+        // JEDEC software reset: 0x66 (enable reset) then 0x99 (reset), each in
+        // its own CS frame, then a settle delay (tRST is ≤30 µs on common parts;
+        // 1 ms is comfortably safe). The previous implementation was a no-op
+        // that reported success.
+        self.proto.spi_command(&[SPI_CMD_RESET_ENABLE])?;
+        self.proto.spi_command(&[SPI_CMD_RESET])?;
+        std::thread::sleep(Duration::from_millis(1));
+        // Reset returns the chip to power-on state, including 3-byte addressing.
+        self.proto.set_4byte_addr(false);
         Ok(())
     }
 }

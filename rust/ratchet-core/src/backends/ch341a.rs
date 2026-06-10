@@ -59,6 +59,8 @@ pub const SPI_READ_4B: u8 = 0x13;
 pub const SPI_PAGE_PROGRAM_4B: u8 = 0x12;
 pub const SPI_SECTOR_ERASE_4B: u8 = 0x21;
 pub const SPI_BLOCK_ERASE_4B: u8 = 0xdc;
+pub const SPI_RESET_ENABLE: u8 = 0x66;
+pub const SPI_RESET: u8 = 0x99;
 
 // Status register bits
 pub const SR_WIP: u8 = 0x01;
@@ -70,6 +72,15 @@ pub const SR_BP_MASK: u8 = 0x1c;
 pub const USB_TIMEOUT: Duration = Duration::from_millis(5000);
 pub const PAGE_PROGRAM_TIMEOUT: Duration = Duration::from_millis(10000);
 pub const ERASE_TIMEOUT: Duration = Duration::from_millis(120000);
+
+/// Chip-erase duration scales with capacity: ~100 s worst-case for an 8 MB part
+/// but 200-400 s for 16-32 MB parts (vendor datasheets). A fixed 120 s timeout
+/// declares a healthy 32 MB chip dead mid-erase. Floor of 120 s, ~13 s per MB
+/// above that (32 MB → 416 s, comfortably past the worst datasheet maximum).
+pub fn erase_timeout_for(size_bytes: u64) -> Duration {
+    let mb = size_bytes / (1024 * 1024);
+    Duration::from_secs((mb * 13).max(120))
+}
 
 pub const SIZE_16MB: u64 = 16 * 1024 * 1024;
 
@@ -701,15 +712,27 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
     }
     fn erase_chip(&mut self) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        self.spi_command(&[SPI_WREN])?;
-        self.spi_command(&[SPI_CHIP_ERASE])?;
-        self.wait_until_ready(ERASE_TIMEOUT)?;
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        // Identify to size the WIP timeout — chip-erase on 16-32 MB parts runs
+        // 200-400 s, far past the old fixed 120 s. Unknown capacity gets the
+        // largest supported part's budget (a longer wait is harmless; a timeout
+        // mid-erase reads as a dead chip).
+        let res = self.identify_chip().and_then(|chip| {
+            let timeout = match chip {
+                Some(c) if c.size_bytes > 0 => erase_timeout_for(c.size_bytes),
+                _ => erase_timeout_for(32 * 1024 * 1024),
+            };
+            let start = Instant::now();
+            self.spi_command(&[SPI_WREN])?;
+            self.spi_command(&[SPI_CHIP_ERASE])?;
+            self.wait_until_ready(timeout)?;
+            Ok(EraseResult {
+                success: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+                error: None,
+            })
+        });
+        self.exit_4byte_if_entered();
+        res
     }
     fn sector_erase(&mut self, address: u64) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
@@ -801,6 +824,15 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         })
     }
     fn reset_chip(&mut self) -> Result<()> {
+        // JEDEC software reset: 0x66 (enable reset) then 0x99 (reset), each in
+        // its own CS frame, then a settle delay (tRST is ≤30 µs on common parts;
+        // 1 ms is comfortably safe). The previous implementation was a no-op
+        // that reported success.
+        self.spi_command(&[SPI_RESET_ENABLE])?;
+        self.spi_command(&[SPI_RESET])?;
+        std::thread::sleep(Duration::from_millis(1));
+        // Reset returns the chip to power-on state, including 3-byte addressing.
+        self.use_4byte_addr = false;
         Ok(())
     }
 }
@@ -922,22 +954,65 @@ mod tests {
     #[test]
     fn backend_erase_chip_sends_wren_then_chip_erase_then_polls_wip() {
         let mut bus = MockBus::new();
-        // Write-protect guard RDSR, WREN read, CHIP_ERASE read, then one RDSR poll
-        // whose byte[1]=0 → WIP clear.
-        for _ in 0..4 {
+        // Write-protect guard RDSR, identify RDID (zeros → unknown), WREN read,
+        // CHIP_ERASE read, then one RDSR poll whose byte[1]=0 → WIP clear.
+        for _ in 0..5 {
             bus.queue_read(vec![0; 8]);
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.erase_chip().unwrap();
         let bus = backend.bus.as_ref().unwrap();
-        // Frames: [guard RDSR][WREN][CHIP_ERASE][poll RDSR], 3 writes each (cs, pkt, cs).
-        assert_eq!(bus.writes[4][1], SPI_WREN);
-        assert_eq!(bus.writes[7][1], SPI_CHIP_ERASE);
+        // Frames: [guard RDSR][RDID][WREN][CHIP_ERASE][poll RDSR], 3 writes each (cs, pkt, cs).
+        assert_eq!(bus.writes[7][1], SPI_WREN);
+        assert_eq!(bus.writes[10][1], SPI_CHIP_ERASE);
         // A WIP poll (RDSR 0x05) must follow the erase — otherwise we'd race the busy chip.
         assert!(bus
             .writes
             .iter()
             .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_RDSR));
+    }
+
+    #[test]
+    fn reset_chip_sends_enable_reset_then_reset() {
+        // JEDEC software reset is 0x66 then 0x99 in separate CS frames. The old
+        // implementation was a no-op Ok(()) — the REPL printed "reset ok" while
+        // nothing reached the chip.
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0u8; 8]); // 0x66 echo
+        bus.queue_read(vec![0u8; 8]); // 0x99 echo
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.use_4byte_addr = true;
+        backend.reset_chip().unwrap();
+        assert!(
+            !backend.use_4byte_addr,
+            "reset returns the chip to power-on 3-byte addressing"
+        );
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        let ops: Vec<u8> = writes
+            .iter()
+            .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM)
+            .map(|w| w[1])
+            .collect();
+        assert_eq!(
+            ops,
+            vec![SPI_RESET_ENABLE, SPI_RESET],
+            "must send 0x66 then 0x99, in that order"
+        );
+    }
+
+    #[test]
+    fn erase_timeout_scales_with_capacity() {
+        // 8 MB stays at the 120 s floor; 16/32 MB scale up past their worst-case
+        // datasheet erase times (200 s / 400 s).
+        assert_eq!(erase_timeout_for(8 * 1024 * 1024), Duration::from_secs(120));
+        assert!(erase_timeout_for(16 * 1024 * 1024) >= Duration::from_secs(200));
+        assert!(erase_timeout_for(32 * 1024 * 1024) >= Duration::from_secs(400));
+        assert!(
+            erase_timeout_for(32 * 1024 * 1024) > erase_timeout_for(16 * 1024 * 1024),
+            "timeout must grow with capacity"
+        );
+        // Unknown (0) capacity must still get a sane floor, never zero.
+        assert_eq!(erase_timeout_for(0), Duration::from_secs(120));
     }
 
     #[test]
