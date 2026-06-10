@@ -209,8 +209,22 @@ fn try_open_ch347(ctx: &Context) -> Option<OpenResult> {
         });
     }
     let bus = LibusbBus::new(handle, CH347_EP_IN, CH347_EP_OUT);
+    let mut backend = Ch347Backend::new(bus);
+    // Send the SPI config packet (clock divisor, mode 0, MSB-first, CS0). Without
+    // this the chip runs at whatever power-on config it happened to have —
+    // Backend::open() was previously never called outside tests.
+    if let Err(e) = backend.open() {
+        return Some(OpenResult {
+            backend: Box::new(MockBackend::default()),
+            kind: BackendKind::Mock,
+            warning: Some(format!(
+                "CH347 claimed but SPI init failed ({e}); using mock"
+            )),
+            force_mock_env: false,
+        });
+    }
     Some(OpenResult {
-        backend: Box::new(Ch347Backend::new(bus)),
+        backend: Box::new(backend),
         kind: BackendKind::Ch347,
         warning: None,
         force_mock_env: false,
@@ -230,8 +244,22 @@ fn try_open_ch341a(ctx: &Context) -> Option<OpenResult> {
         });
     }
     let bus = LibusbBus::new(handle, CH341A_EP_IN, CH341A_EP_OUT);
+    let mut backend = CH341ABackend::with_bus(bus);
+    // Send the enable-SPI pin-direction packet (MOSI/SCK/CS outputs, MISO input).
+    // Without it the CH341A's pins are never configured for SPI — Backend::open()
+    // was previously never called outside tests.
+    if let Err(e) = backend.open() {
+        return Some(OpenResult {
+            backend: Box::new(MockBackend::default()),
+            kind: BackendKind::Mock,
+            warning: Some(format!(
+                "CH341A claimed but SPI init failed ({e}); using mock"
+            )),
+            force_mock_env: false,
+        });
+    }
     Some(OpenResult {
-        backend: Box::new(CH341ABackend::with_bus(bus)),
+        backend: Box::new(backend),
         kind: BackendKind::Ch341a,
         warning: None,
         force_mock_env: false,
