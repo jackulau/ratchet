@@ -191,7 +191,7 @@ fakes success).
 | Group | Commands |
 |-------|----------|
 | Hardware | `status` [live], `detect` [live], `identify` [live], `monitor` [n/w] |
-| Chip ops | `read` `write` `verify` `erase` `region-erase` `blank-check` `sfdp` `wp-status` [live] |
+| Chip ops | `read` `write` `verify` `erase` `region-erase` `blank-check` `sfdp` `wp-status` `wp-disable` [live] |
 | Analysis | `analyze` `diff` `checksum` [offline] |
 | Knowledge base | `search` `chip-info` `post-decode` `voltage-reference` [offline]; `failure-search` [n/w] |
 | Serial | `serial-list` [offline]; `serial` connect [n/w] |
@@ -213,7 +213,7 @@ ratchet analyze backup.bin --json | jq '.data.regions'
 
 ## Agent Interface (MCP)
 
-ratchet ships a built-in **MCP server** (`ratchet-mcp`) so AI agents (Claude Desktop, mcp-cli, custom SDK clients) can connect to the tool surface over stdio. Hand-rolled JSON-RPC 2.0. **30 tools total**: 18 SPI-flash / BIOS analysis tools + 12 hardware-protocol tools. The SPI-flash/BIOS tools and `i2c_scan` / `i2c_read` / `i2c_write` / `jtag_idcode_scan` run against the live backend (or an honest JSON-RPC error when no device is present); the remaining hardware tools return an honest JSON-RPC error until their transport is wired (they never return a fake success). The JSON-RPC dispatch, schema descriptors, and argument shapes are real.
+ratchet ships a built-in **MCP server** (`ratchet-mcp`) so AI agents (Claude Desktop, mcp-cli, custom SDK clients) can connect to the tool surface over stdio. Hand-rolled JSON-RPC 2.0. **31 tools total**: 19 SPI-flash / BIOS analysis tools + 12 hardware-protocol tools. The SPI-flash/BIOS tools and `i2c_scan` / `i2c_read` / `i2c_write` / `jtag_idcode_scan` run against the live backend (or an honest JSON-RPC error when no device is present); the remaining hardware tools return an honest JSON-RPC error until their transport is wired (they never return a fake success). The JSON-RPC dispatch, schema descriptors, and argument shapes are real.
 
 ```bash
 ratchet-mcp                              # start the server (stdio; live backend, mock fallback)
@@ -239,6 +239,7 @@ Register with Claude Desktop (`~/Library/Application Support/Claude/claude_deskt
 | `detect` | Scan USB for CH34x programmers |
 | `identify` | Read JEDEC ID + SFDP + DB lookup |
 | `read_chip` / `write_chip` / `verify_chip` / `erase_chip` | SPI flash ops |
+| `wp_disable` | Clear block-protect bits (confirm-gated) |
 | `analyze_image` / `bios_regions` / `nvram_vars` | BIOS image inspection |
 | `search_chips` / `chip_info` | 806-chip database |
 | `post_decode` / `failure_search` / `voltage_reference` | Diagnostics knowledge base |
@@ -259,6 +260,12 @@ ratchet is built to not brick your board. Every item below is enforced in code (
   programming. Opt out with `--skip-backup`.
 - **Read-back verify after every write.** `write` reads the chip back and compares it to the
   file; the result is reported as `verified`. Opt out with `--skip-verify`.
+- **Gateable exit codes.** `verify` exits non-zero on a mismatch and `blank-check` exits
+  non-zero when the chip is not blank (the JSON envelope is still emitted first), so shell
+  scripts can branch on them like flashrom.
+- **`wp-disable` remedy.** A `write protected` refusal has an in-tool fix: `wp-disable`
+  clears the block-protect bits (confirm-gated on MCP, destructive-gated on the CLI) and
+  exits non-zero if protection survives (hardware WP pin or OTP lock).
 - **Erase-before-program + WIP polling.** Sectors are erased before programming (SPI program can
   only clear bits 1→0), and the write-in-progress status bit is polled after every erase and page
   program, so the next command never races a still-busy chip (chip-erase can take tens of seconds).
@@ -304,8 +311,8 @@ rust/
 │                       debug (ADIv5/Cortex-M/ELF/boundary-scan),
 │                       instruments (logic-analyzer/export/Bus-Pirate/slcan),
 │                       workflow pipeline, REPL state, agent envelope
-├── ratchet-cli       ← clap-based CLI, 39 top-level subcommands + --self-test flag
-├── ratchet-mcp       ← MCP JSON-RPC 2.0 server (30 tools, stdio)
+├── ratchet-cli       ← clap-based CLI, 40 top-level subcommands + --self-test flag
+├── ratchet-mcp       ← MCP JSON-RPC 2.0 server (31 tools, stdio)
 └── ratchet-node      ← optional napi-rs bridge for Node consumers
 ```
 
@@ -315,9 +322,9 @@ rust/
 
 ### Programmers
 
-- **CH341A** (`1a86:5512`): most common, SPI + UIO bit-bang for I2C / JTAG / SWD / 1-Wire, ~$3 on AliExpress.
+- **CH341A** (`1a86:5512`): most common, SPI plus bit-bang I2C, ~$3 on AliExpress. (JTAG/SWD/1-Wire bit-bang transports are not wired; those verbs fail honestly.)
 - **CH347** (`1a86:55db`, `55de`): newer, up to 60 MHz SPI, native I2C + UART, JTAG. (The HID-mode CH347 variant uses a different endpoint layout and is not supported.)
-- **CH343** (`1a86:55d3`): UART serial-debug only.
+- **CH343** (`1a86:55d3`): recognized in `serial-list` enumeration only; the `serial connect` verb is not wired.
 
 ### Flash Chips (806 in database)
 
