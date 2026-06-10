@@ -1184,11 +1184,27 @@ fn cmd_erase(json: bool) -> anyhow::Result<()> {
     emit_envelope(&env, json, || println!("erase ok ({}ms)", r.duration_ms))
 }
 
+/// Exit code for the verify / blank-check contract: scripts gate on these verbs
+/// like flashrom -v, so a mismatch (or non-blank chip) must exit non-zero. The
+/// JSON envelope is always emitted before exiting.
+fn check_exit_code(ok: bool) -> i32 {
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
 fn cmd_verify(file: &str, json: bool) -> anyhow::Result<()> {
     let mut m = open_dyn();
     let r = m.verify_chip(std::path::Path::new(file))?;
     let env = AgentEnvelope::ok("verify", r.clone());
-    emit_envelope(&env, json, || println!("matches={}", r.matches))
+    emit_envelope(&env, json, || println!("matches={}", r.matches))?;
+    let code = check_exit_code(r.matches);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 fn cmd_analyze(file: &str, json: bool) -> anyhow::Result<()> {
@@ -1417,7 +1433,12 @@ fn cmd_blank_check(json: bool) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&tmp);
     let blank = data.iter().all(|b| *b == 0xff);
     let env = AgentEnvelope::ok("blank-check", json!({"blank": blank}));
-    emit_envelope(&env, json, || println!("blank={blank}"))
+    emit_envelope(&env, json, || println!("blank={blank}"))?;
+    let code = check_exit_code(blank);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 fn cmd_repl() -> anyhow::Result<()> {
@@ -1699,6 +1720,15 @@ mod tests {
         );
         assert!(mock_fallback_error("erase", BackendKind::Ch341a, false, None).is_none());
         assert!(mock_fallback_error("erase", BackendKind::Ch347, false, None).is_none());
+    }
+
+    // `ratchet verify` / `blank-check` are gateable like flashrom -v: a
+    // mismatch (or non-blank chip) must exit non-zero so scripts can branch on
+    // the result instead of parsing JSON.
+    #[test]
+    fn verify_exits_nonzero_on_mismatch() {
+        assert_eq!(check_exit_code(true), 0);
+        assert_ne!(check_exit_code(false), 0);
     }
 
     // The self-test erases its target as a health check, so it must be

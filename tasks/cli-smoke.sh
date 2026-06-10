@@ -82,7 +82,11 @@ head -c $((4 * 1024 * 1024)) "$RATCHET" > "$IMG"
 run "write (auto backup + verify)"      $RATCHET write "$IMG"
 run "write --skip-backup --skip-verify" $RATCHET write "$IMG" --skip-backup --skip-verify
 expect_fail "write refuses blank image" $RATCHET write "$DUMP"
-run "verify"             $RATCHET verify "$DUMP"
+# Exit-code contract (flashrom-style): verify exits 0 on a match, non-zero on a
+# mismatch — scripts gate on the exit code instead of parsing JSON. Mock state
+# is per-process, so the pristine dump matches and the derived image does not.
+run "verify matches"     $RATCHET verify "$DUMP"
+expect_fail "verify mismatch exits non-zero" $RATCHET verify "$IMG"
 run "erase"              $RATCHET erase
 
 # ── Whole-chip workflows (the pipelines a repair drives) ─────
