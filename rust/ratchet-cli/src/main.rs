@@ -1447,7 +1447,7 @@ fn cmd_repl() -> anyhow::Result<()> {
     use std::path::Path;
 
     println!("ratchet REPL  -  type 'help' or 'quit'");
-    let mut backend = open_dyn();
+    let (mut backend, kind, warning, force_mock_env) = open_dyn_with_kind();
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -1457,7 +1457,17 @@ fn cmd_repl() -> anyhow::Result<()> {
         if stdin.read_line(&mut line)? == 0 {
             break; // EOF (piped input or Ctrl-D)
         }
-        match parse_line(&line) {
+        let cmd = parse_line(&line);
+        // Destructive REPL commands share the CLI verbs' gate: refuse a
+        // silently-selected mock fallback (a "write success=true" against an
+        // in-memory fake is a bricked board waiting to happen). Explicit
+        // RATCHET_FORCE_MOCK=1 stays allowed.
+        if let Some(msg) = repl_destructive_refusal(&cmd, kind, force_mock_env, warning.as_deref())
+        {
+            println!("error: {msg}");
+            continue;
+        }
+        match cmd {
             ReplCommand::Quit => break,
             ReplCommand::Help => println!(
                 "commands: identify jedec status read <f> write <f> erase \
@@ -1509,6 +1519,25 @@ fn cmd_repl() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The REPL's destructive-command gate: write / erase / sector-erase must refuse
+/// a silently-selected mock fallback exactly like the CLI verbs do. Returns the
+/// refusal message, or None when the command may run.
+fn repl_destructive_refusal(
+    cmd: &ratchet_core::repl::ReplCommand,
+    kind: BackendKind,
+    force_mock_env: bool,
+    warning: Option<&str>,
+) -> Option<String> {
+    use ratchet_core::repl::ReplCommand;
+    let op = match cmd {
+        ReplCommand::Write { .. } => "write",
+        ReplCommand::Erase => "erase",
+        ReplCommand::SectorErase { .. } => "sector-erase",
+        _ => return None,
+    };
+    mock_fallback_error(op, kind, force_mock_env, warning)
 }
 
 /// The backend the self-test runs against. The return type is the compile-time
@@ -1720,6 +1749,38 @@ mod tests {
         );
         assert!(mock_fallback_error("erase", BackendKind::Ch341a, false, None).is_none());
         assert!(mock_fallback_error("erase", BackendKind::Ch347, false, None).is_none());
+    }
+
+    // REPL write/erase/sector-erase go through the same mock-fallback gate as
+    // the CLI verbs: silent mock → refused; explicit force-mock → allowed;
+    // real silicon and read-only commands → untouched.
+    #[test]
+    fn repl_refuses_destructive_on_silent_mock() {
+        use ratchet_core::repl::ReplCommand;
+        let write = ReplCommand::Write {
+            path: "x.bin".into(),
+        };
+        let msg = repl_destructive_refusal(&write, BackendKind::Mock, false, Some("no device"))
+            .expect("silent-mock REPL write must be refused");
+        assert!(msg.contains("mock fallback"));
+        assert!(
+            repl_destructive_refusal(&ReplCommand::Erase, BackendKind::Mock, false, None).is_some()
+        );
+        assert!(repl_destructive_refusal(
+            &ReplCommand::SectorErase { address: 0 },
+            BackendKind::Mock,
+            false,
+            None
+        )
+        .is_some());
+        // Explicit force-mock and real silicon stay allowed.
+        assert!(repl_destructive_refusal(&write, BackendKind::Mock, true, None).is_none());
+        assert!(repl_destructive_refusal(&write, BackendKind::Ch341a, false, None).is_none());
+        // Read-only commands never hit the gate, even on silent mock.
+        assert!(
+            repl_destructive_refusal(&ReplCommand::Identify, BackendKind::Mock, false, None)
+                .is_none()
+        );
     }
 
     // `ratchet verify` / `blank-check` are gateable like flashrom -v: a
