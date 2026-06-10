@@ -1,7 +1,7 @@
 // Mock backend  -  in-memory flash emulation. Used for tests and `RATCHET_FORCE_MOCK=1`.
 // Mirrors src/backends/mock.ts.
 
-use super::{Backend, BackendError, Result, WriteOpts};
+use super::{Backend, Result, WriteOpts};
 use crate::chips::{format_size, lookup_by_jedec_id};
 use crate::types::*;
 use sha2::{Digest, Sha256};
@@ -329,12 +329,6 @@ impl Backend for MockBackend {
     fn reset_chip(&mut self) -> Result<()> {
         Ok(())
     }
-}
-
-// Silence unused-import warnings if BackendError isn't referenced in this file directly.
-#[allow(dead_code)]
-fn _ensure_error_in_use() -> Option<BackendError> {
-    None
 }
 
 #[cfg(test)]

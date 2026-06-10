@@ -1,8 +1,6 @@
 // CH347 backend  -  USB-HS SPI programmer (up to 60MHz, 510-byte SPI packets, 4-byte addr).
 // Ports src/backends/ch347.ts. Transport-abstracted for hardware-free tests.
 
-#![allow(dead_code)]
-
 use super::{Backend, BackendError, Result, WriteOpts};
 use crate::chips::{format_size, lookup_by_jedec_id};
 use crate::types::*;
