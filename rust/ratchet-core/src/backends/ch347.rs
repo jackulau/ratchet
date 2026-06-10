@@ -15,6 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const CH347_VID: u16 = 0x1a86;
 pub const CH347_PID: u16 = 0x55db;
+/// CH347F (the QFN/full-featured variant) enumerates as 0x55de with the same
+/// bulk SPI protocol and endpoint layout. 0x55dc is the HID-mode CH347 with a
+/// different endpoint layout and is deliberately NOT probed.
+pub const CH347F_PID: u16 = 0x55de;
 pub const CH347_SPI_INTERFACE: u8 = 2;
 pub const CH347_EP_OUT: u8 = 0x06;
 pub const CH347_EP_IN: u8 = 0x86;

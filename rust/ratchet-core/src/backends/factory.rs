@@ -171,7 +171,10 @@ pub fn open_raw_bus() -> std::result::Result<RawBus, RawBusError> {
 
     let ctx = Context::new().map_err(|e| RawBusError::LibusbInit(e.to_string()))?;
 
-    if let Ok(handle) = ctx.find_by_ids(CH347_VID, CH347_PID) {
+    if let Some(handle) = CH347_PIDS
+        .iter()
+        .find_map(|pid| ctx.find_by_ids(CH347_VID, *pid).ok())
+    {
         handle.claim_interface(CH347_SPI_INTERFACE).map_err(|e| {
             RawBusError::ClaimFailed(format!("CH347 interface {CH347_SPI_INTERFACE}: {e}"))
         })?;
@@ -196,8 +199,15 @@ pub fn open_raw_bus() -> std::result::Result<RawBus, RawBusError> {
     Err(RawBusError::NoDevice)
 }
 
+/// PIDs probed for the CH347, in order: 0x55db (CH347T, vendor bulk mode) then
+/// 0x55de (CH347F — same bulk SPI protocol and endpoint layout). 0x55dc is the
+/// HID-mode CH347 with a different endpoint layout and is deliberately absent.
+pub const CH347_PIDS: [u16; 2] = [CH347_PID, crate::backends::ch347::CH347F_PID];
+
 fn try_open_ch347(ctx: &Context) -> Option<OpenResult> {
-    let handle = ctx.find_by_ids(CH347_VID, CH347_PID).ok()?;
+    let handle = CH347_PIDS
+        .iter()
+        .find_map(|pid| ctx.find_by_ids(CH347_VID, *pid).ok())?;
     if let Err(e) = handle.claim_interface(CH347_SPI_INTERFACE) {
         return Some(OpenResult {
             backend: Box::new(MockBackend::default()),
@@ -293,6 +303,14 @@ mod tests {
             Some(v) => std::env::set_var(FORCE_MOCK_ENV, v),
             None => std::env::remove_var(FORCE_MOCK_ENV),
         }
+    }
+
+    #[test]
+    fn ch347_probe_covers_both_bulk_pids() {
+        // Probe order: CH347T vendor-bulk (0x55db) first, then CH347F (0x55de,
+        // same bulk protocol). 0x55dc is HID mode (different endpoints) and must
+        // stay excluded — README's claimed PID list mirrors this array.
+        assert_eq!(CH347_PIDS, [0x55db, 0x55de]);
     }
 
     #[test]

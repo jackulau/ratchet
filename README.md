@@ -316,7 +316,7 @@ rust/
 ### Programmers
 
 - **CH341A** (`1a86:5512`): most common, SPI + UIO bit-bang for I2C / JTAG / SWD / 1-Wire, ~$3 on AliExpress.
-- **CH347** (`1a86:55db`, `55dc`, `55de`): newer, up to 60 MHz SPI, native I2C + UART, JTAG.
+- **CH347** (`1a86:55db`, `55de`): newer, up to 60 MHz SPI, native I2C + UART, JTAG. (The HID-mode CH347 variant uses a different endpoint layout and is not supported.)
 - **CH343** (`1a86:55d3`): UART serial-debug only.
 
 ### Flash Chips (806 in database)
