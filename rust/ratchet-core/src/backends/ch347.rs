@@ -88,6 +88,22 @@ pub const ADDR_4BYTE_THRESHOLD: u64 = 16 * 1024 * 1024;
 pub trait Transport {
     fn write(&mut self, data: &[u8]) -> Result<()>;
     fn read(&mut self, len: usize) -> Result<Vec<u8>>;
+
+    /// Read exactly `buf.len()` bytes into a caller-provided buffer. Streaming
+    /// reads call this once per 510-byte chunk; the live bus overrides it to
+    /// fill the slice directly — the default wraps `read` for mocks/tests.
+    /// Fails closed with `ShortTransfer` on a short read.
+    fn read_into(&mut self, buf: &mut [u8]) -> Result<()> {
+        let rx = self.read(buf.len())?;
+        if rx.len() < buf.len() {
+            return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
+                expected: buf.len(),
+                actual: rx.len(),
+            }));
+        }
+        buf.copy_from_slice(&rx[..buf.len()]);
+        Ok(())
+    }
 }
 
 pub struct CapturingTransport {
@@ -390,21 +406,56 @@ impl<T: Transport> Ch347Protocol<T> {
     }
 
     pub fn read_data(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
-        let mut tx: Vec<u8> = Vec::with_capacity(5 + length);
-        tx.push(if self.use_4byte_addr {
+        // Stream the read in 510-byte chunks instead of materializing a
+        // chip-size tx of zeros plus a chip-size echo (the old path held ~3x
+        // the chip size in transient memory for a full dump). CS stays
+        // asserted across chunks exactly as spi_transfer framed it; a failure
+        // mid-stream still releases CS.
+        let mut out = Vec::with_capacity(length);
+        let res = self.read_data_stream(address, length, &mut out);
+        if res.is_err() {
+            let _ = self.transport.write(&build_cs_xfer_packet(&[], false, 0));
+            let _ = self.transport.read(4);
+        }
+        res.map(|()| out)
+    }
+
+    fn read_data_stream(&mut self, address: u32, length: usize, out: &mut Vec<u8>) -> Result<()> {
+        // Opcode + address in the first CS-asserted packet; echo discarded.
+        let mut hdr: Vec<u8> = Vec::with_capacity(5);
+        hdr.push(if self.use_4byte_addr {
             SPI_CMD_READ_4BYTE
         } else {
             SPI_CMD_READ
         });
-        tx.extend(address_bytes(address, self.use_4byte_addr));
-        tx.extend(std::iter::repeat_n(0u8, length));
-        let mut rx = self.spi_command(&tx)?;
-        let addr_len = if self.use_4byte_addr { 4 } else { 3 };
-        // Reuse rx's allocation: drop the leading opcode+address echo and trailing
-        // bytes in place rather than copying the data slice into a fresh Vec.
-        rx.truncate(1 + addr_len + length);
-        rx.drain(..1 + addr_len);
-        Ok(rx)
+        hdr.extend(address_bytes(address, self.use_4byte_addr));
+        let mut rx = vec![0u8; 4 + CH347_MAX_SPI_PAYLOAD];
+        self.transport.write(&build_cs_xfer_packet(&hdr, true, 0))?;
+        self.transport.read_into(&mut rx[..4 + hdr.len()])?;
+
+        // Clock the data out: zeros shifted in clock bytes out, one reused
+        // packet + rx buffer per chunk.
+        let zeros = [0u8; CH347_MAX_SPI_PAYLOAD];
+        let mut pkt: Vec<u8> = Vec::with_capacity(4 + CH347_MAX_SPI_PAYLOAD);
+        let mut remaining = length;
+        while remaining > 0 {
+            let n = remaining.min(CH347_MAX_SPI_PAYLOAD);
+            pkt.clear();
+            pkt.push(CH347_CMD_SPI_CS_XFER);
+            pkt.push((n & 0xff) as u8);
+            pkt.push(((n >> 8) & 0xff) as u8);
+            pkt.push(0x00); // cs_assert=true, cs_index=0
+            pkt.extend_from_slice(&zeros[..n]);
+            self.transport.write(&pkt)?;
+            self.transport.read_into(&mut rx[..4 + n])?;
+            out.extend_from_slice(&rx[4..4 + n]);
+            remaining -= n;
+        }
+
+        // CS-deassert XFER (empty payload) terminates the transaction.
+        self.transport.write(&build_cs_xfer_packet(&[], false, 0))?;
+        let _drain = self.transport.read(4)?;
+        Ok(())
     }
 
     pub fn enter_4byte_mode(&mut self) -> Result<()> {
@@ -1069,13 +1120,24 @@ mod tests {
 
     #[test]
     fn read_data_returns_payload_after_opcode_and_addr() {
-        // SPI echo: 4-byte CH347 header + 1 opcode + 3 addr + N data
-        let mut payload = vec![0u8; 4 + 1 + 3];
-        payload.extend(0..32u8);
-        let t = primed_transport(vec![payload, vec![0u8; 4]]);
+        // Streamed framing: read 1 echoes the opcode+address header (discarded),
+        // read 2 carries the data chunk behind the 4-byte CH347 header, read 3
+        // drains the CS-deassert.
+        let mut chunk = vec![0u8; 4];
+        chunk.extend(0..32u8);
+        let t = primed_transport(vec![
+            vec![0u8; 4 + 4], // header echo: CH347 hdr + opcode + 3 addr
+            chunk,
+            vec![0u8; 4], // deassert drain
+        ]);
         let mut p = Ch347Protocol::new(t);
         let out = p.read_data(0x10_0000, 32).unwrap();
         assert_eq!(out, (0..32u8).collect::<Vec<_>>());
+        // The header packet must carry READ (0x03) + the 3-byte address, and a
+        // trailing CS-deassert packet must terminate the stream.
+        let writes = &p.transport_mut().writes;
+        assert_eq!(&writes[0][4..8], &[SPI_CMD_READ, 0x10, 0x00, 0x00]);
+        assert_eq!(writes.last().unwrap(), &build_cs_xfer_packet(&[], false, 0));
     }
 
     #[test]

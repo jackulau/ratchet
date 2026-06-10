@@ -160,6 +160,22 @@ pub fn decode_jedec_response(rx: &[u8]) -> Option<JedecId> {
 pub trait UsbBus: Send {
     fn bulk_write(&mut self, data: &[u8]) -> Result<()>;
     fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>>;
+
+    /// Read exactly `buf.len()` bytes into a caller-provided buffer. Hot paths
+    /// (read_range) call this once per 31-byte USB packet, so the live bus
+    /// overrides it to fill the slice directly — the default wraps `bulk_read`
+    /// for mocks/tests. Fails closed with `ShortTransfer` on a short read.
+    fn bulk_read_into(&mut self, buf: &mut [u8]) -> Result<()> {
+        let rx = self.bulk_read(buf.len())?;
+        if rx.len() < buf.len() {
+            return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
+                expected: buf.len(),
+                actual: rx.len(),
+            }));
+        }
+        buf.copy_from_slice(&rx[..buf.len()]);
+        Ok(())
+    }
 }
 
 /// In-memory bus for tests. Captures every write and serves pre-queued reads.
@@ -341,7 +357,13 @@ impl<B: UsbBus> CH341ABackend<B> {
         packet.extend(address_bytes(start_addr, use_4byte));
         let header_len = packet.len() - 1;
         bus.bulk_write(&packet)?;
-        let _echo = bus.bulk_read(header_len)?;
+        // One reused rx buffer for the echo and every data chunk: an 8 MB dump
+        // is ~270k packets, and a fresh Vec per packet was pure allocator churn.
+        // bulk_read_into fails closed (ShortTransfer) on a short chunk — a short
+        // read would shift every subsequent byte left, an offset-misaligned dump
+        // that verify/backup would trust. Caller releases CS on error.
+        let mut rx = [0u8; MAX_XFER - 1];
+        bus.bulk_read_into(&mut rx[..header_len])?;
         // Clock out the data: every dummy byte shifted in clocks one byte out.
         let zeros = [0u8; MAX_XFER - 1];
         let mut buf = Vec::with_capacity(len);
@@ -351,16 +373,7 @@ impl<B: UsbBus> CH341ABackend<B> {
             packet.push(CMD_SPI_STREAM);
             packet.extend_from_slice(&zeros[..n]);
             bus.bulk_write(&packet)?;
-            let rx = bus.bulk_read(n)?;
-            if rx.len() < n {
-                // A short chunk would shift every subsequent byte left — an
-                // offset-misaligned dump that verify/backup would trust. Abort
-                // instead of returning corrupt data (caller releases CS).
-                return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
-                    expected: n,
-                    actual: rx.len(),
-                }));
-            }
+            bus.bulk_read_into(&mut rx[..n])?;
             buf.extend_from_slice(&rx[..n]);
         }
         Ok(buf)
