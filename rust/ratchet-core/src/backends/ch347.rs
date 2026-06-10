@@ -421,6 +421,22 @@ impl<T: Transport + Send> Ch347Backend<T> {
         }
     }
 
+    /// Standalone erase verbs arrive without a prior identify, so a >16 MB chip
+    /// would still be in power-on 3-byte mode and the erase address would silently
+    /// wrap at 16 MB — destroying the wrong sector. Identify first (which enters
+    /// 4-byte mode for big chips), then hard-refuse any range the active 3-byte
+    /// framing cannot express. `end` is exclusive.
+    fn prepare_erase_addressing(&mut self, end: u64) -> Result<()> {
+        self.identify_chip()?;
+        if !self.proto.use_4byte_addr() && end > ADDR_4BYTE_THRESHOLD {
+            return Err(BackendError::Other(format!(
+                "erase range ends at {end:#x} but the chip is in 3-byte address mode \
+                 (16 MB limit); a 3-byte frame would silently wrap and erase the wrong sector"
+            )));
+        }
+        Ok(())
+    }
+
     /// Whole-chip read without the trailing EX4B: write_chip's backup step runs this
     /// mid-operation while 4-byte mode must stay active.
     fn read_chip_to_file(&mut self, output_path: &Path) -> Result<ReadResult> {
@@ -539,6 +555,17 @@ fn sha256_hex(data: &[u8]) -> String {
     hex_encode(&h.finalize())
 }
 
+/// The CH347 wire protocol carries 32-bit addresses; refuse anything wider
+/// instead of silently truncating with `as u32` (which would target the
+/// wrong sector on a hypothetical >4 GB part or a caller bug).
+fn checked_addr32(address: u64) -> Result<u32> {
+    u32::try_from(address).map_err(|_| {
+        BackendError::Other(format!(
+            "address {address:#x} exceeds the 32-bit range of the CH347 SPI framing"
+        ))
+    })
+}
+
 impl<T: Transport + Send> Backend for Ch347Backend<T> {
     fn detect_programmer(&mut self) -> Result<ProgrammerInfo> {
         Ok(ProgrammerInfo {
@@ -633,41 +660,61 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
 
     fn sector_erase(&mut self, address: u64) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        self.proto.sector_erase(address as u32)?;
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        let res = self
+            .prepare_erase_addressing(address.saturating_add(1))
+            .and_then(|()| {
+                let start = Instant::now();
+                self.proto.sector_erase(checked_addr32(address)?)?;
+                Ok(EraseResult {
+                    success: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                })
+            });
+        self.exit_4byte_if_entered();
+        res
     }
 
     fn block_erase(&mut self, address: u64) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        self.proto.block_erase_64k(address as u32)?;
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        let res = self
+            .prepare_erase_addressing(address.saturating_add(1))
+            .and_then(|()| {
+                let start = Instant::now();
+                self.proto.block_erase_64k(checked_addr32(address)?)?;
+                Ok(EraseResult {
+                    success: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                })
+            });
+        self.exit_4byte_if_entered();
+        res
     }
 
     fn region_erase(&mut self, start_addr: u64, length: u64) -> Result<EraseResult> {
         // Protection is checked once up front, not per sector.
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        let mut addr = start_addr;
-        let end = start_addr + length;
-        while addr < end {
-            self.proto.sector_erase(addr as u32)?;
-            addr += 4096;
-        }
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        let res = self
+            .prepare_erase_addressing(start_addr.saturating_add(length))
+            .and_then(|()| {
+                let start = Instant::now();
+                // Align down to the 4 KB sector grid like CH341A — the erase opcode
+                // wipes the whole containing sector regardless of the byte offset.
+                let mut addr = start_addr & !0xfff;
+                let end = start_addr + length;
+                while addr < end {
+                    self.proto.sector_erase(checked_addr32(addr)?)?;
+                    addr += 4096;
+                }
+                Ok(EraseResult {
+                    success: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                })
+            });
+        self.exit_4byte_if_entered();
+        res
     }
 
     fn is_write_protected(&mut self) -> Result<bool> {
@@ -1033,6 +1080,73 @@ mod tests {
                 w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_ENTER_4BYTE
             });
         assert!(sent_en4b, "EN4B (0xb7) must be sent for a >16 MB chip");
+    }
+
+    #[test]
+    fn region_erase_uses_4byte_addressing_above_16mb() {
+        // W25Q256 (ef4019) = 32 MB. A standalone region-erase above 16 MB must
+        // identify first, enter 4-byte mode, issue the 4-byte sector-erase opcode
+        // (0x21) with all four address bytes, and exit 4-byte mode afterwards.
+        // The old path stayed in 3-byte mode and truncated the address (`as u32`),
+        // erasing the WRONG sector.
+        let t = primed_transport(vec![
+            vec![0u8; 4 + 2], // WP guard RDSR → unprotected
+            vec![0u8; 4],
+            vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x19], // RDID → W25Q256
+            vec![0u8; 4],
+        ]);
+        let mut b = Ch347Backend::new(t);
+        Backend::region_erase(&mut b, 0x0100_0000, 4096).unwrap();
+        assert!(
+            !b.protocol().use_4byte_addr(),
+            "must exit 4-byte mode afterwards"
+        );
+        let writes = &b.protocol().transport_mut().writes;
+        let sent = |op: u8| {
+            writes
+                .iter()
+                .any(|w| w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == op)
+        };
+        assert!(
+            sent(SPI_CMD_ENTER_4BYTE),
+            "EN4B must be sent before erasing above 16 MB"
+        );
+        assert!(
+            writes.iter().any(|w| w.len() >= 9
+                && w[0] == CH347_CMD_SPI_CS_XFER
+                && w[4] == SPI_CMD_SECTOR_ERASE_4BYTE
+                && w[5..9] == [0x01, 0x00, 0x00, 0x00]),
+            "erase must use the 4-byte opcode (0x21) with the full 4-byte address"
+        );
+        assert!(
+            sent(SPI_CMD_EXIT_4BYTE),
+            "EX4B must restore 3-byte mode after the erase"
+        );
+    }
+
+    #[test]
+    fn region_erase_refuses_out_of_range_in_3byte_mode() {
+        // W25Q128 (ef4018) = 16 MB stays in 3-byte mode; a region beyond 16 MB
+        // cannot be expressed in a 3-byte frame and must be refused, not wrapped.
+        let t = primed_transport(vec![
+            vec![0u8; 4 + 2], // WP guard RDSR → unprotected
+            vec![0u8; 4],
+            vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x18], // RDID → W25Q128
+            vec![0u8; 4],
+        ]);
+        let mut b = Ch347Backend::new(t);
+        let err = Backend::region_erase(&mut b, 0x0100_0000, 4096).unwrap_err();
+        assert!(
+            format!("{err}").contains("3-byte"),
+            "refusal must explain the 3-byte addressing limit, got: {err}"
+        );
+        let writes = &b.protocol().transport_mut().writes;
+        assert!(
+            !writes.iter().any(|w| w.len() > 4
+                && w[0] == CH347_CMD_SPI_CS_XFER
+                && (w[4] == SPI_CMD_SECTOR_ERASE || w[4] == SPI_CMD_SECTOR_ERASE_4BYTE)),
+            "no erase opcode may reach the chip for an unaddressable range"
+        );
     }
 
     #[test]

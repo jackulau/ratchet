@@ -389,6 +389,22 @@ impl<B: UsbBus> CH341ABackend<B> {
         Ok(())
     }
 
+    /// Standalone erase verbs arrive without a prior identify, so a >16 MB chip
+    /// would still be in power-on 3-byte mode and the erase address would silently
+    /// wrap at 16 MB — destroying the wrong sector. Identify first (which enters
+    /// 4-byte mode for big chips), then hard-refuse any range the active 3-byte
+    /// framing cannot express. `end` is exclusive.
+    fn prepare_erase_addressing(&mut self, end: u64) -> Result<()> {
+        self.identify_chip()?;
+        if !self.use_4byte_addr && end > SIZE_16MB {
+            return Err(BackendError::Other(format!(
+                "erase range ends at {end:#x} but the chip is in 3-byte address mode \
+                 (16 MB limit); a 3-byte frame would silently wrap and erase the wrong sector"
+            )));
+        }
+        Ok(())
+    }
+
     /// Erase one sector without the write-protect pre-check. Callers that loop over
     /// many sectors (write_chip, region_erase) check protection once up front.
     fn sector_erase_inner(&mut self, address: u64) -> Result<EraseResult> {
@@ -656,42 +672,58 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
     }
     fn sector_erase(&mut self, address: u64) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
-        self.sector_erase_inner(address)
+        let res = self
+            .prepare_erase_addressing(address.saturating_add(1))
+            .and_then(|()| self.sector_erase_inner(address));
+        self.exit_4byte_if_entered();
+        res
     }
     fn block_erase(&mut self, address: u64) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        self.spi_command(&[SPI_WREN])?;
-        let mut cmd = vec![if self.use_4byte_addr {
-            SPI_BLOCK_ERASE_4B
-        } else {
-            SPI_BLOCK_ERASE
-        }];
-        cmd.extend(address_bytes(address, self.use_4byte_addr));
-        self.spi_command(&cmd)?;
-        self.wait_until_ready(ERASE_TIMEOUT)?;
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        let res = self
+            .prepare_erase_addressing(address.saturating_add(1))
+            .and_then(|()| {
+                let start = Instant::now();
+                self.spi_command(&[SPI_WREN])?;
+                let mut cmd = vec![if self.use_4byte_addr {
+                    SPI_BLOCK_ERASE_4B
+                } else {
+                    SPI_BLOCK_ERASE
+                }];
+                cmd.extend(address_bytes(address, self.use_4byte_addr));
+                self.spi_command(&cmd)?;
+                self.wait_until_ready(ERASE_TIMEOUT)?;
+                Ok(EraseResult {
+                    success: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                })
+            });
+        self.exit_4byte_if_entered();
+        res
     }
     fn region_erase(&mut self, start_addr: u64, length: u64) -> Result<EraseResult> {
         // Sector-by-sector erase across the range; each sector_erase waits for WIP to clear.
         // Protection is checked once up front, not per sector.
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        let mut addr = start_addr & !0xfff;
-        let end = start_addr + length;
-        while addr < end {
-            self.sector_erase_inner(addr)?;
-            addr += 4096;
-        }
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        let res = self
+            .prepare_erase_addressing(start_addr.saturating_add(length))
+            .and_then(|()| {
+                let start = Instant::now();
+                let mut addr = start_addr & !0xfff;
+                let end = start_addr + length;
+                while addr < end {
+                    self.sector_erase_inner(addr)?;
+                    addr += 4096;
+                }
+                Ok(EraseResult {
+                    success: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                })
+            });
+        self.exit_4byte_if_entered();
+        res
     }
     fn is_write_protected(&mut self) -> Result<bool> {
         let sr = self.read_status_registers()?;
@@ -937,6 +969,67 @@ mod tests {
     }
 
     #[test]
+    fn region_erase_uses_4byte_addressing_above_16mb() {
+        // W25Q256 (ef4019) = 32 MB. A standalone region-erase above 16 MB must
+        // identify first, enter 4-byte mode, issue the 4-byte sector-erase opcode
+        // (0x21) with all four address bytes, and exit 4-byte mode afterwards.
+        // Without that, the 3-byte frame wraps and the WRONG sector is destroyed.
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0x00, 0x00]); // WP guard RDSR → unprotected
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x19]); // RDID → W25Q256
+        bus.queue_read(vec![0u8; 8]); // EN4B
+        bus.queue_read(vec![0u8; 8]); // WREN
+        bus.queue_read(vec![0u8; 8]); // sector erase cmd
+        bus.queue_read(vec![0x00, 0x00]); // WIP poll → ready
+        bus.queue_read(vec![0u8; 8]); // EX4B
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.region_erase(0x0100_0000, 4096).unwrap();
+        assert!(!backend.use_4byte_addr, "must exit 4-byte mode afterwards");
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        assert!(
+            writes
+                .iter()
+                .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EN4B),
+            "EN4B must be sent before erasing above 16 MB"
+        );
+        assert!(
+            writes.iter().any(|w| w.len() >= 6
+                && w[0] == CMD_SPI_STREAM
+                && w[1] == SPI_SECTOR_ERASE_4B
+                && w[2..6] == [0x01, 0x00, 0x00, 0x00]),
+            "erase must use the 4-byte opcode (0x21) with the full 4-byte address"
+        );
+        assert!(
+            writes
+                .iter()
+                .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EX4B),
+            "EX4B must restore 3-byte mode after the erase"
+        );
+    }
+
+    #[test]
+    fn region_erase_refuses_out_of_range_in_3byte_mode() {
+        // W25Q128 (ef4018) = 16 MB stays in 3-byte mode; a region beyond 16 MB
+        // cannot be expressed in a 3-byte frame and must be refused, not wrapped.
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0x00, 0x00]); // WP guard RDSR → unprotected
+        bus.queue_read(vec![0x00, 0xef, 0x40, 0x18]); // RDID → W25Q128
+        let mut backend = CH341ABackend::with_bus(bus);
+        let err = backend.region_erase(0x0100_0000, 4096).unwrap_err();
+        assert!(
+            format!("{err}").contains("3-byte"),
+            "refusal must explain the 3-byte addressing limit, got: {err}"
+        );
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        assert!(
+            !writes.iter().any(|w| w.len() >= 2
+                && w[0] == CMD_SPI_STREAM
+                && (w[1] == SPI_SECTOR_ERASE || w[1] == SPI_SECTOR_ERASE_4B)),
+            "no erase opcode may reach the chip for an unaddressable range"
+        );
+    }
+
+    #[test]
     fn verify_chip_exits_4byte_mode_after_completion() {
         // >16 MB chip (ef4019): verify enters 4-byte mode for the read-back, then must
         // exit (EX4B 0xe9) so the chip is not left misaddressing for the next tool.
@@ -966,15 +1059,15 @@ mod tests {
     #[test]
     fn backend_sector_erase_uses_3byte_addr_by_default() {
         let mut bus = MockBus::new();
-        // Guard RDSR, WREN, SECTOR_ERASE, RDSR poll (WIP clear).
-        for _ in 0..4 {
+        // Guard RDSR, identify RDID (zeros → no chip), WREN, SECTOR_ERASE, RDSR poll.
+        for _ in 0..5 {
             bus.queue_read(vec![0; 8]);
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.sector_erase(0x123456).unwrap();
         let bus = backend.bus.as_ref().unwrap();
-        // writes[7] = stream packet for SECTOR_ERASE (after guard + WREN frames)
-        let pkt = &bus.writes[7];
+        // writes[10] = stream packet for SECTOR_ERASE (after guard + RDID + WREN frames)
+        let pkt = &bus.writes[10];
         assert_eq!(pkt[0], CMD_SPI_STREAM);
         assert_eq!(pkt[1], SPI_SECTOR_ERASE);
         assert_eq!(&pkt[2..5], &[0x12, 0x34, 0x56]);
@@ -983,15 +1076,15 @@ mod tests {
     #[test]
     fn backend_sector_erase_uses_4byte_when_enabled() {
         let mut bus = MockBus::new();
-        // Guard RDSR, WREN, SECTOR_ERASE, RDSR poll (WIP clear).
-        for _ in 0..4 {
+        // Guard RDSR, identify RDID, WREN, SECTOR_ERASE, RDSR poll, trailing EX4B.
+        for _ in 0..6 {
             bus.queue_read(vec![0; 8]);
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.use_4byte_addr = true;
         backend.sector_erase(0x01020304).unwrap();
         let bus = backend.bus.as_ref().unwrap();
-        let pkt = &bus.writes[7];
+        let pkt = &bus.writes[10];
         assert_eq!(pkt[1], SPI_SECTOR_ERASE_4B);
         assert_eq!(&pkt[2..6], &[0x01, 0x02, 0x03, 0x04]);
     }
