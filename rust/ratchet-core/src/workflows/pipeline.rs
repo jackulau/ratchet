@@ -68,6 +68,20 @@ pub trait PipelineBackend {
     fn verify_chip(&mut self, data: &[u8]) -> Result<VerifyOutcome, String>;
     fn is_write_protected(&mut self) -> Result<bool, String>;
     fn disable_write_protection(&mut self) -> Result<(), String>;
+
+    /// SR1 snapshot taken BEFORE the Write step clears the BP bits, so they
+    /// can be re-applied afterwards. `None` = the backend cannot report SR1;
+    /// restoration is then skipped (and reported) rather than guessed.
+    fn read_status_register(&mut self) -> Result<Option<u8>, String> {
+        Ok(None)
+    }
+
+    /// Re-apply previously saved BP bits after a successful repair write. The
+    /// default refuses so an adapter that never implemented restore cannot
+    /// silently pretend the chip was re-protected.
+    fn restore_write_protection(&mut self, _sr1: u8) -> Result<(), String> {
+        Err("write-protection restore not supported by this backend".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -372,6 +386,14 @@ fn execute_step(step: &Step, ctx: &mut PipelineContext) -> Result<String, String
                 .clone()
                 .ok_or_else(|| "No repaired data to write".to_string())?;
             let wp = ctx.backend.is_write_protected()?;
+            // Snapshot SR1 BEFORE clearing protection so the prior BP bits can
+            // be re-applied after the write — the old behavior left the chip
+            // permanently unprotected after every repair.
+            let saved_sr1 = if wp {
+                ctx.backend.read_status_register()?
+            } else {
+                None
+            };
             if wp {
                 ctx.backend.disable_write_protection()?;
             }
@@ -379,11 +401,21 @@ fn execute_step(step: &Step, ctx: &mut PipelineContext) -> Result<String, String
             if !r.success {
                 return Err(r.error.unwrap_or_else(|| "Write failed".to_string()));
             }
-            Ok(if wp {
-                "Write complete (write protection auto-disabled)".to_string()
+            if wp {
+                match saved_sr1 {
+                    Some(sr1) => {
+                        ctx.backend.restore_write_protection(sr1).map_err(|e| {
+                            format!("write succeeded but restoring write protection failed: {e}")
+                        })?;
+                        Ok("Write complete (write protection restored)".to_string())
+                    }
+                    None => Ok("Write complete (write protection auto-disabled; \
+                                 restore unsupported by backend)"
+                        .to_string()),
+                }
             } else {
-                "Write complete".to_string()
-            })
+                Ok("Write complete".to_string())
+            }
         }
         StepKind::PostVerify => {
             if !ctx.repairs_needed || ctx.skip_write {
@@ -482,6 +514,8 @@ mod tests {
         chip: Option<ChipInfo>,
         read_data: Vec<u8>,
         write_protected: bool,
+        sr1: u8,
+        restored_sr1: Option<u8>,
         write_should_match: bool,
         write_call_count: u32,
         verify_call_count: u32,
@@ -519,6 +553,8 @@ mod tests {
                     v
                 },
                 write_protected: false,
+                sr1: 0x00,
+                restored_sr1: None,
                 write_should_match: true,
                 write_call_count: 0,
                 verify_call_count: 0,
@@ -564,6 +600,16 @@ mod tests {
         }
         fn disable_write_protection(&mut self) -> Result<(), String> {
             self.write_protected = false;
+            self.sr1 = 0x00;
+            Ok(())
+        }
+        fn read_status_register(&mut self) -> Result<Option<u8>, String> {
+            Ok(Some(self.sr1))
+        }
+        fn restore_write_protection(&mut self, sr1: u8) -> Result<(), String> {
+            self.restored_sr1 = Some(sr1);
+            self.sr1 = sr1;
+            self.write_protected = sr1 & 0x1c != 0;
             Ok(())
         }
     }
@@ -633,6 +679,40 @@ mod tests {
             .find(|s| s.name == "Write repaired image")
             .unwrap();
         assert!(write_step.detail.contains("Write complete"));
+    }
+
+    #[test]
+    fn write_protection_restored_after_repair() {
+        let mut backend = StubBackend::new_healthy();
+        // Protected chip with BP bits set in SR1; trigger auto-repair.
+        backend.write_protected = true;
+        backend.sr1 = 0x0c;
+        let n = backend.read_data.len();
+        backend.read_data[n - 16..].fill(0);
+        let mut ctx = PipelineContext::new(&mut backend);
+        let steps = build_repair_pipeline();
+        let result = run_pipeline(&steps, &mut ctx);
+        assert!(result.success, "{result:?}");
+        drop(ctx);
+        let write_step = result
+            .step_results
+            .iter()
+            .find(|s| s.name == "Write repaired image")
+            .unwrap();
+        assert!(
+            write_step.detail.contains("write protection restored"),
+            "step must report the restoration, got: {}",
+            write_step.detail
+        );
+        assert_eq!(
+            backend.restored_sr1,
+            Some(0x0c),
+            "the EXACT prior BP bits must be re-applied"
+        );
+        assert!(
+            backend.write_protected,
+            "chip must be protected again after the repair"
+        );
     }
 
     #[test]

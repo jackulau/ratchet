@@ -823,6 +823,13 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         // next command before it completes races the register update.
         self.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
     }
+    fn restore_write_protection(&mut self, sr1: u8) -> Result<()> {
+        // Re-apply only the BP bits — writing the raw saved SR1 could set
+        // unrelated control bits (SRP, QE on some parts) by accident.
+        self.spi_command(&[SPI_EWSR])?;
+        self.spi_command(&[SPI_WRSR, sr1 & SR_BP_MASK])?;
+        self.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
+    }
     fn connection_test(&mut self) -> Result<ConnectionTestResult> {
         let mut ids = Vec::with_capacity(10);
         let mut timings = Vec::with_capacity(10);
@@ -1206,6 +1213,34 @@ mod tests {
                 && w[0] == CMD_SPI_STREAM
                 && (w[1] == SPI_SECTOR_ERASE || w[1] == SPI_SECTOR_ERASE_4B)),
             "no erase opcode may reach the chip for an unaddressable range"
+        );
+    }
+
+    #[test]
+    fn restore_write_protection_writes_bp_bits_only() {
+        // Restore must re-apply the saved BP bits via EWSR+WRSR (masked to the
+        // BP field so stray SRP/QE bits are never written) and poll WIP.
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0u8; 8]); // EWSR
+        bus.queue_read(vec![0u8; 8]); // WRSR
+        bus.queue_read(vec![0x00, 0x00]); // WIP poll → done
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.restore_write_protection(0xfc).unwrap();
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        let wrsr = writes
+            .iter()
+            .find(|w| w.len() >= 3 && w[0] == CMD_SPI_STREAM && w[1] == SPI_WRSR)
+            .expect("WRSR frame must be sent");
+        assert_eq!(
+            wrsr[2],
+            0xfc & SR_BP_MASK,
+            "only the BP bits may be re-applied"
+        );
+        assert!(
+            writes
+                .iter()
+                .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_EWSR),
+            "EWSR must precede the status-register write"
         );
     }
 

@@ -120,6 +120,19 @@ impl<'a> PipelineBackend for BackendPipelineAdapter<'a> {
             .disable_write_protection()
             .map_err(|e| e.to_string())
     }
+
+    fn read_status_register(&mut self) -> Result<Option<u8>, String> {
+        self.backend
+            .read_status_registers()
+            .map(|sr| Some(sr.sr1))
+            .map_err(|e| e.to_string())
+    }
+
+    fn restore_write_protection(&mut self, sr1: u8) -> Result<(), String> {
+        self.backend
+            .restore_write_protection(sr1)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]

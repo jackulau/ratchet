@@ -60,6 +60,14 @@ pub trait Backend: Send {
     fn region_erase(&mut self, start_addr: u64, length: u64) -> Result<EraseResult>;
     fn is_write_protected(&mut self) -> Result<bool>;
     fn disable_write_protection(&mut self) -> Result<()>;
+    /// Re-apply previously saved SR1 block-protect bits (the counterpart of
+    /// `disable_write_protection`, used by full-repair to leave the chip as
+    /// protected as it found it). Default refuses rather than fake-succeeding.
+    fn restore_write_protection(&mut self, _sr1: u8) -> Result<()> {
+        Err(BackendError::Other(
+            "write-protection restore not supported by this backend".into(),
+        ))
+    }
     fn connection_test(&mut self) -> Result<ConnectionTestResult>;
     fn reset_chip(&mut self) -> Result<()>;
 }

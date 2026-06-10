@@ -837,6 +837,15 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
         self.proto.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
     }
 
+    fn restore_write_protection(&mut self, sr1: u8) -> Result<()> {
+        // Re-apply only the BP bits — writing the raw saved SR1 could set
+        // unrelated control bits (SRP, QE on some parts) by accident.
+        self.proto.spi_command(&[SPI_CMD_EWSR])?;
+        self.proto
+            .spi_command(&[SPI_CMD_WRSR, sr1 & SPI_SR_BP_MASK])?;
+        self.proto.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
+    }
+
     fn connection_test(&mut self) -> Result<ConnectionTestResult> {
         let mut ids: Vec<String> = Vec::with_capacity(10);
         for _ in 0..10 {

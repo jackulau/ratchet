@@ -329,6 +329,11 @@ impl Backend for MockBackend {
     fn reset_chip(&mut self) -> Result<()> {
         Ok(())
     }
+
+    fn restore_write_protection(&mut self, sr1: u8) -> Result<()> {
+        self.write_protected = sr1 & 0x1c != 0;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
