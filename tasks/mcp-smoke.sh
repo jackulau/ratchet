@@ -82,6 +82,30 @@ check "identify succeeds" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"identify","arguments":{}}}' | tail -1)" '"result"'
 check "search_chips succeeds" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_chips","arguments":{"query":"W25Q64"}}}' | tail -1)" '"result"'
+check "sfdp succeeds" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sfdp","arguments":{}}}' | tail -1)" '"result"' 'density'
+check "wp_status reports protection fields" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wp_status","arguments":{}}}' | tail -1)" '"result"' 'write_protected'
+
+# read_chip → verify_chip → analyze_image against the same dump file.
+# NOTE: requests with an interpolated path are built in a variable FIRST —
+# macOS bash 3.2 mis-parses escaped quotes nested inside "$( ... )" and
+# brace-expands the request into fragments.
+SMOKE_TMP="$(mktemp -d)"
+trap 'rm -rf "$SMOKE_TMP"' EXIT
+DUMP="$SMOKE_TMP/mcp-dump.bin"
+REQ_READ='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_chip","arguments":{"output":"'$DUMP'"}}}'
+RESP_READ=$(rpc "$REQ_READ" | tail -1)
+check "read_chip dumps the mock chip" "$RESP_READ" '"result"' 'checksum'
+if [ -s "$DUMP" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILED_CHECKS+=("read_chip produced empty dump"); echo "  FAIL: read_chip produced empty dump" >&2
+fi
+REQ_VERIFY='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"verify_chip","arguments":{"file":"'$DUMP'"}}}'
+RESP_VERIFY=$(rpc "$REQ_VERIFY" | tail -1)
+check "verify_chip matches the fresh dump" "$RESP_VERIFY" '"result"' 'matches\\":true'
+REQ_ANALYZE='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analyze_image","arguments":{"file":"'$DUMP'"}}}'
+RESP_ANALYZE=$(rpc "$REQ_ANALYZE" | tail -1)
+check "analyze_image reports file size" "$RESP_ANALYZE" '"result"' 'fileSize'
 
 # ── Confirm gate: destructive tools refuse without confirm=true ──
 check "write_chip without confirm fails" \
