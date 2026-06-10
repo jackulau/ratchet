@@ -210,6 +210,19 @@ impl<T: Transport> Ch347Protocol<T> {
     }
 
     fn spi_transfer(&mut self, tx: &[u8]) -> Result<Vec<u8>> {
+        let res = self.spi_transfer_inner(tx);
+        if res.is_err() {
+            // CS must be released even when a chunk write/read fails mid-stream:
+            // a chip left selected treats the next command's clocks as
+            // continuation data. Best-effort — the original error is what the
+            // caller must see.
+            let _ = self.transport.write(&build_cs_xfer_packet(&[], false, 0));
+            let _ = self.transport.read(4);
+        }
+        res
+    }
+
+    fn spi_transfer_inner(&mut self, tx: &[u8]) -> Result<Vec<u8>> {
         let mut result = vec![0u8; tx.len()];
         // Reused CS-assert packet buffer: only the payload bytes change per chunk,
         // so we rewrite it in place instead of allocating a fresh Vec per 510-byte chunk.
@@ -232,10 +245,8 @@ impl<T: Transport> Ch347Protocol<T> {
             let rx = self.transport.read(4 + chunk_len)?;
             if rx.len() < 4 + chunk_len {
                 // A short transport read must be a hard error, not a panic (the
-                // old slice indexing) and never silent padding. Release CS
-                // best-effort so the chip is not left selected mid-command.
-                let _ = self.transport.write(&build_cs_xfer_packet(&[], false, 0));
-                let _ = self.transport.read(4);
+                // old slice indexing) and never silent padding. The wrapper
+                // releases CS.
                 return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
                     expected: 4 + chunk_len,
                     actual: rx.len(),
@@ -1093,6 +1104,33 @@ mod tests {
                 w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == SPI_CMD_ENTER_4BYTE
             });
         assert!(sent_en4b, "EN4B (0xb7) must be sent for a >16 MB chip");
+    }
+
+    #[test]
+    fn cs_deasserted_after_midstream_error() {
+        // A transport whose reads fail mid-command (USB timeout). The CS-deassert
+        // framing (empty CS_XFER with the deassert bit) must still be written so
+        // the chip is not left selected for the next command.
+        struct FailReadTransport {
+            writes: Vec<Vec<u8>>,
+        }
+        impl Transport for FailReadTransport {
+            fn write(&mut self, d: &[u8]) -> Result<()> {
+                self.writes.push(d.to_vec());
+                Ok(())
+            }
+            fn read(&mut self, _len: usize) -> Result<Vec<u8>> {
+                Err(BackendError::Other("usb timeout".into()))
+            }
+        }
+        let mut p = Ch347Protocol::new(FailReadTransport { writes: Vec::new() });
+        p.spi_command(&[SPI_CMD_RDSR, 0]).unwrap_err();
+        let writes = &p.transport_mut().writes;
+        assert_eq!(
+            writes.last().unwrap(),
+            &build_cs_xfer_packet(&[], false, 0),
+            "CS must be deasserted after a mid-command transport error"
+        );
     }
 
     #[test]

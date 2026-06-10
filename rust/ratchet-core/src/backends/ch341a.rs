@@ -219,6 +219,17 @@ impl<B: UsbBus> CH341ABackend<B> {
     pub fn spi_command(&mut self, cmd: &[u8]) -> Result<Vec<u8>> {
         let bus = self.bus.as_mut().ok_or(BackendError::NotConnected)?;
         bus.bulk_write(&cs_assert_packet())?;
+        let res = Self::spi_command_chunks(bus, cmd);
+        // CS must be released on success AND failure: a chip left selected after
+        // a mid-stream USB error treats the next command's clocks as continuation
+        // data. The original error takes precedence over a deassert failure.
+        let deassert = bus.bulk_write(&cs_deassert_packet());
+        let rx = res?;
+        deassert?;
+        Ok(rx)
+    }
+
+    fn spi_command_chunks(bus: &mut B, cmd: &[u8]) -> Result<Vec<u8>> {
         let mut rx = Vec::with_capacity(cmd.len());
         // Chunk inline with a single reused packet buffer: only the payload bytes
         // change per chunk, so we avoid building a fresh Vec<Vec<u8>> of sub-packets.
@@ -235,7 +246,6 @@ impl<B: UsbBus> CH341ABackend<B> {
             rx.extend_from_slice(&r);
             offset += chunk_len;
         }
-        bus.bulk_write(&cs_deassert_packet())?;
         Ok(rx)
     }
 
@@ -296,10 +306,24 @@ impl<B: UsbBus> CH341ABackend<B> {
         }
         let use_4byte = self.use_4byte_addr;
         let bus = self.bus.as_mut().ok_or(BackendError::NotConnected)?;
+        bus.bulk_write(&cs_assert_packet())?;
+        let res = Self::read_range_chunks(bus, start_addr, len, use_4byte);
+        // CS must be released on success AND failure (see spi_command); the
+        // original error takes precedence over a deassert failure.
+        let deassert = bus.bulk_write(&cs_deassert_packet());
+        let buf = res?;
+        deassert?;
+        Ok(buf)
+    }
+
+    fn read_range_chunks(
+        bus: &mut B,
+        start_addr: u64,
+        len: usize,
+        use_4byte: bool,
+    ) -> Result<Vec<u8>> {
         let max_payload = MAX_XFER - 1; // 31 SPI bytes per USB packet
         let mut packet: Vec<u8> = Vec::with_capacity(max_payload + 1);
-
-        bus.bulk_write(&cs_assert_packet())?;
         // Opcode + address, echoed back full-duplex and discarded.
         packet.push(CMD_SPI_STREAM);
         packet.push(SPI_READ);
@@ -319,9 +343,8 @@ impl<B: UsbBus> CH341ABackend<B> {
             let rx = bus.bulk_read(n)?;
             if rx.len() < n {
                 // A short chunk would shift every subsequent byte left — an
-                // offset-misaligned dump that verify/backup would trust. Release
-                // CS best-effort and abort instead of returning corrupt data.
-                let _ = bus.bulk_write(&cs_deassert_packet());
+                // offset-misaligned dump that verify/backup would trust. Abort
+                // instead of returning corrupt data (caller releases CS).
                 return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
                     expected: n,
                     actual: rx.len(),
@@ -329,7 +352,6 @@ impl<B: UsbBus> CH341ABackend<B> {
             }
             buf.extend_from_slice(&rx[..n]);
         }
-        bus.bulk_write(&cs_deassert_packet())?;
         Ok(buf)
     }
 
@@ -1210,6 +1232,45 @@ mod tests {
                 BackendError::Usb(ratchet_usb::UsbError::ShortTransfer { .. })
             ),
             "short data chunk must abort the read, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cs_deasserted_after_midstream_error() {
+        // A bus whose reads fail mid-command (USB timeout). The chip must not be
+        // left selected: the CS-deassert framing must still go out, or the next
+        // command's clocks are interpreted as continuation data by the flash.
+        struct FailReadBus {
+            writes: Vec<Vec<u8>>,
+        }
+        impl UsbBus for FailReadBus {
+            fn bulk_write(&mut self, d: &[u8]) -> Result<()> {
+                self.writes.push(d.to_vec());
+                Ok(())
+            }
+            fn bulk_read(&mut self, _len: usize) -> Result<Vec<u8>> {
+                Err(BackendError::Other("usb timeout".into()))
+            }
+        }
+
+        // spi_command path
+        let mut backend = CH341ABackend::with_bus(FailReadBus { writes: Vec::new() });
+        backend.spi_command(&[SPI_RDSR, 0]).unwrap_err();
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        assert_eq!(
+            writes.last().unwrap(),
+            &cs_deassert_packet().to_vec(),
+            "CS must be deasserted after a mid-command bulk error"
+        );
+
+        // read_range path (header echo read fails)
+        let mut backend = CH341ABackend::with_bus(FailReadBus { writes: Vec::new() });
+        backend.read_range(0, 64).unwrap_err();
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        assert_eq!(
+            writes.last().unwrap(),
+            &cs_deassert_packet().to_vec(),
+            "CS must be deasserted after a mid-read bulk error"
         );
     }
 
