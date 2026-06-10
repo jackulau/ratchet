@@ -1490,8 +1490,17 @@ fn cmd_repl() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_self_test(json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+/// The backend the self-test runs against. The return type is the compile-time
+/// guarantee that a self-test can NEVER touch live silicon: it constructs the
+/// in-memory mock directly and never consults the factory (`open_dyn` /
+/// `open_default`), which could hand back a real CH341A/CH347 whose chip the
+/// erase step below would wipe.
+fn self_test_backend() -> ratchet_core::backends::mock::MockBackend {
+    ratchet_core::backends::mock::MockBackend::default()
+}
+
+/// Run the self-test checks against `m`, returning one message per failure.
+fn run_self_test(m: &mut dyn Backend) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
     if let Err(e) = m.detect_programmer() {
         errors.push(format!("detect: {e}"));
@@ -1505,6 +1514,12 @@ fn cmd_self_test(json: bool) -> anyhow::Result<()> {
     if let Err(e) = m.erase_chip() {
         errors.push(format!("erase: {e}"));
     }
+    errors
+}
+
+fn cmd_self_test(json: bool) -> anyhow::Result<()> {
+    let mut m = self_test_backend();
+    let errors = run_self_test(&mut m);
     let ok = errors.is_empty();
     let env = AgentEnvelope::ok("self-test", json!({"ok": ok, "errors": errors}));
     emit_envelope(&env, json, || {
@@ -1684,6 +1699,19 @@ mod tests {
         );
         assert!(mock_fallback_error("erase", BackendKind::Ch341a, false, None).is_none());
         assert!(mock_fallback_error("erase", BackendKind::Ch347, false, None).is_none());
+    }
+
+    // The self-test erases its target as a health check, so it must be
+    // physically incapable of opening live silicon. self_test_backend()'s
+    // return type (MockBackend, not Box<dyn Backend>) is the compile-time
+    // proof it never goes through the factory; this test exercises the same
+    // routine cmd_self_test runs and pins that it passes fully offline,
+    // without RATCHET_FORCE_MOCK set.
+    #[test]
+    fn self_test_never_opens_live_backend() {
+        let mut m = self_test_backend();
+        let errors = run_self_test(&mut m);
+        assert!(errors.is_empty(), "self-test on mock failed: {errors:?}");
     }
 
     #[test]
