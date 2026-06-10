@@ -59,13 +59,17 @@ fn sha256_hex(data: &[u8]) -> String {
 
 impl Backend for MockBackend {
     fn detect_programmer(&mut self) -> Result<ProgrammerInfo> {
+        // The mock must never masquerade as real hardware in machine-readable
+        // output: it previously reported kind "ch341a" with the real VID/PID
+        // 1a86:5512, so an agent checking `detect` believed a programmer was
+        // attached. Every field now says mock.
         Ok(ProgrammerInfo {
-            kind: "ch341a".to_string(),
+            kind: "mock".to_string(),
             connected: true,
-            vendor_id: "1a86".to_string(),
-            product_id: "5512".to_string(),
-            description: "Mock CH341A (dry-run mode)".to_string(),
-            backend: "native".to_string(),
+            vendor_id: "0000".to_string(),
+            product_id: "0000".to_string(),
+            description: "Mock programmer (in-memory, no hardware)".to_string(),
+            backend: "mock".to_string(),
         })
     }
 
@@ -340,6 +344,18 @@ mod tests {
 
     fn tmp_file(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ratchet-mock-test-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn detect_reports_mock_kind() {
+        // Machine-readable honesty: an agent inspecting detect output must be
+        // able to tell the mock from real silicon. No real kind, VID, or PID.
+        let mut m = MockBackend::default();
+        let info = m.detect_programmer().unwrap();
+        assert_eq!(info.kind, "mock");
+        assert_eq!(info.backend, "mock");
+        assert_ne!(info.vendor_id, "1a86", "mock must not claim the WCH VID");
+        assert_ne!(info.product_id, "5512", "mock must not claim a real PID");
     }
 
     #[test]
