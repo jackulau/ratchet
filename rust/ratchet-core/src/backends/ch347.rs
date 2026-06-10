@@ -495,7 +495,6 @@ impl<T: Transport + Send> Ch347Backend<T> {
             )));
         }
         let page_size = chip.page_size.unwrap_or(256).max(1) as usize;
-        let sector_size = chip.sector_size.unwrap_or(4096).max(1);
 
         // Refuse protected silicon before the (possibly minutes-long) backup read:
         // a protected chip ignores erase/program and would fake-succeed.
@@ -515,11 +514,14 @@ impl<T: Transport + Send> Ch347Backend<T> {
         };
 
         // 2. Erase the sectors the image covers — program can only flip 1→0 (each sector_erase
-        //    now WREN + erase + WIP-wait). Previously write skipped erase entirely.
+        //    now WREN + erase + WIP-wait). The stride MUST match the issued opcode:
+        //    proto.sector_erase sends the 4 KB sector-erase (0x20/0x21), so stepping by the
+        //    DB's sectorSize (64 KB on 155 of 806 chips) would leave unerased gaps that AND
+        //    stale data into the image.
         let mut addr: u32 = 0;
         while (addr as usize) < firmware.len() {
             self.proto.sector_erase(addr)?;
-            addr = addr.saturating_add(sector_size);
+            addr = addr.saturating_add(4096);
         }
 
         // 3. Program page-by-page, never crossing a page boundary.

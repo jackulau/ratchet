@@ -498,7 +498,6 @@ impl<B: UsbBus> CH341ABackend<B> {
             )));
         }
         let page_size = chip.page_size.unwrap_or(256).max(1) as usize;
-        let sector_size = chip.sector_size.unwrap_or(4096).max(1) as u64;
 
         // Refuse protected silicon before the (possibly minutes-long) backup read:
         // a protected chip ignores erase/program and would fake-succeed.
@@ -520,10 +519,13 @@ impl<B: UsbBus> CH341ABackend<B> {
 
         // 2. Erase every sector the image touches — SPI program can only flip 1→0, so the
         //    target must be 0xFF first. (Each sector_erase issues WREN + erase + WIP-wait.)
+        //    The stride MUST match the issued opcode: sector_erase_inner sends the 4 KB
+        //    sector-erase (0x20/0x21), so stepping by the DB's sectorSize (64 KB on 155
+        //    of 806 chips) would leave unerased gaps that AND stale data into the image.
         let mut addr: u64 = 0;
         while (addr as usize) < firmware.len() {
             self.sector_erase_inner(addr)?;
-            addr += sector_size;
+            addr += 4096;
         }
 
         // 3. Program page-by-page, never letting a PAGE_PROGRAM cross a page boundary (the chip
@@ -966,6 +968,43 @@ mod tests {
             rdsr_polls >= 2,
             "WRSR must be followed by WIP polling (saw {rdsr_polls} RDSR frames)"
         );
+    }
+
+    #[test]
+    fn write_chip_erases_full_range_when_sector_size_not_4k() {
+        // EN25P05 (1c2010) reports sectorSize=65536 in the DB, but the erase loop
+        // issues the 4 KB sector-erase opcode (0x20). Striding by 64 KB would erase
+        // only the first 4 KB of each 64 KB step, AND-ing stale data into the rest
+        // of the image. Every 4 KB of the programmed range must receive an erase.
+        let path = std::env::temp_dir().join("ratchet-test-erase-stride.bin");
+        std::fs::write(&path, vec![0xa5u8; 8192]).unwrap();
+        let mut bus = MockBus::new();
+        bus.queue_read(vec![0x00, 0x1c, 0x20, 0x10]); // RDID → EN25P05 (64 KB, sectorSize 64 KB)
+        for _ in 0..600 {
+            bus.queue_read(vec![0u8; 40]); // WP guard, WREN/erase/poll, program chunks
+        }
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap();
+        let writes = &backend.bus.as_ref().unwrap().writes;
+        let erase_addrs: Vec<u32> = writes
+            .iter()
+            .filter(|w| w.len() >= 5 && w[0] == CMD_SPI_STREAM && w[1] == SPI_SECTOR_ERASE)
+            .map(|w| u32::from_be_bytes([0, w[2], w[3], w[4]]))
+            .collect();
+        assert_eq!(
+            erase_addrs,
+            vec![0x0000, 0x1000],
+            "every 4 KB of the 8 KB image must be erased (got {erase_addrs:x?})"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
