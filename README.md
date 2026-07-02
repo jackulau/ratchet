@@ -1,33 +1,31 @@
 # ratchet
 
-Multi-protocol **hardware debug + programming toolkit** built on **CH341A / CH347** USB programmers.
+A hardware debug and flash-programming toolkit for CH341A and CH347 USB programmers.
 
-SPI flash programming + BIOS analysis is the part that drives live silicon end to end today. On top of that sits a unit-tested protocol layer for **I2C / UART / 1-Wire / passive SPI sniff / JTAG / SWD / CAN**, target-MCU programmers (**AVR ISP, STK500 / Arduino bootloader, 24Cxx EEPROM, 93xxx Microwire EEPROM, ESP32 / ESP8266 esptool, STM32 SWD, STM32 UART AN3155**), ARM debug (**ADIv5, Cortex-M halt/resume/step, ELF symbol-aware peek**), JTAG IDCODE chain + BSDL boundary scan, a multi-channel logic-analyzer model with Saleae / sigrok export, and bridges for **Bus Pirate** + **slcan CAN**. The subset wired to live hardware from the CLI/MCP today is called out precisely in [Status](#status); commands without a live transport fail honestly rather than faking success.
+Its core is SPI flash programming and BIOS analysis, the path that drives live silicon end to end. Around it sits a unit-tested protocol layer (I2C, UART, 1-Wire, passive SPI sniff, JTAG, SWD, CAN), target-MCU programmers (AVR ISP, STK500 / Arduino bootloader, 24Cxx and 93xxx EEPROM, ESP32 / ESP8266, STM32 over SWD and AN3155 UART), an ARM debug surface (ADIv5, Cortex-M halt/resume/step, ELF-aware memory peek), JTAG IDCODE and BSDL boundary scan, a logic-analyzer model with Saleae / sigrok export, and Bus Pirate / slcan CAN bridges.
 
-**Rust-first.** Single self-contained binary, custom libusb FFI, custom JSON-RPC MCP server, no Node runtime required.
+Not all of that is wired to live hardware yet. [Status](#status) marks every command `[live]`, `[offline]`, or `[n/w]` (not wired). The rule throughout: a command with no live transport exits non-zero with a clear message; it never fakes success.
 
-Replaces AsProgrammer / NeoProgrammer for the SPI-flash path, and overlaps with flashrom / avrdude / esptool / stm32flash / OpenOCD-as-bit-bang for the broader hardware surface, with one binary, native USB, image analysis, knowledge-base diagnostics, real progress reporting, and a built-in MCP server for AI agents.
+Written in Rust: a single self-contained binary with custom libusb FFI and a hand-rolled JSON-RPC MCP server, no Node or Python runtime. It replaces AsProgrammer and NeoProgrammer on the SPI-flash path, and covers ground otherwise split across flashrom, avrdude, esptool, stm32flash, and OpenOCD: native USB, image analysis, a knowledge base of diagnostics, and a built-in MCP server for AI agents.
 
 ## Status
 
-Pre-release. Goal-005 shipped the multi-protocol scaffolding; goals 006 / 007 rebranded and audited; goals 008 / 010 reconciled the README with reality; goal 014 wired the genuinely-wireable protocol verbs to live hardware and made every remaining verb fail honestly instead of faking success; goal 015 made the SPI **write** path genuinely complete and safe on both programmers — real page-program with per-operation write-in-progress (WIP) polling, erase-before-program, read-back verify, automatic 4-byte addressing for chips over 16 MB, and a blank-image guard.
+Pre-release. No GitHub Releases are published yet, so the only install route today is from source (see [Install](#install)).
 
 What drives live hardware today (CLI + MCP):
-- **SPI flash + BIOS path, end to end.** `status`, `detect`, `identify`, `read`, `write`, `verify`, `erase`, `region-erase`, `blank-check`, `sfdp`, `wp-status`, `full-repair`, `full-backup` all run against the live backend (CH341A and CH347). `write` erases the affected sectors before programming (SPI program can only clear bits 1→0), programs page-by-page on page boundaries, polls the WIP status bit after every erase/program so it never races the busy chip, takes an automatic pre-write backup, and reads back to verify. `read`/`write`/`erase`/`verify` enter 4-byte addressing automatically on chips larger than 16 MB. `full-repair` drives `BackendPipelineAdapter`; `full-backup` is a full-chip read to a named file.
-- **I2C, over CH341A bit-bang or CH347 native.** `i2c scan`, `i2c read`, `i2c write`, and `eeprom-i2c read/write` (24Cxx) construct the real `Ch341aI2c` / `Ch347I2c` master over the live bus.
-- **JTAG IDCODE scan, over the CH347 JTAG engine.** `jtag idcode-scan` drives the real `Ch347Jtag` adapter (CH347 only; CH341A has no JTAG engine).
-- **Backend auto-select.** `RATCHET_FORCE_MOCK=1` forces mock; otherwise `open_default()` probes CH347 (`1a86:55db`) then CH341A (`1a86:5512`), falling back to mock with a stderr warning. Protocol verbs use `open_raw_bus()`, which returns an honest error (never a silent mock fallback) when no device is present. `ratchet status` reports the live backend via the `backend` JSON field; `ratchet-node` picks up live silicon automatically.
+
+- **SPI flash + BIOS, end to end.** `status`, `detect`, `identify`, `read`, `write`, `verify`, `erase`, `region-erase`, `blank-check`, `sfdp`, `wp-status`, `full-repair`, and `full-backup` run against a live CH341A or CH347. `write` erases the affected sectors first (SPI program can only clear bits 1→0), programs page by page, polls the write-in-progress (WIP) bit after every erase and program so it never races a busy chip, takes an automatic pre-write backup, and reads back to verify. Chips larger than 16 MB switch to 4-byte addressing automatically. `full-repair` runs the guided pipeline; `full-backup` is a full-chip read to a named file.
+- **I2C**, over CH341A bit-bang or CH347 native. `i2c scan`, `i2c read`, `i2c write`, and `eeprom-i2c read/write` (24Cxx) use the real `Ch341aI2c` / `Ch347I2c` master over the live bus.
+- **JTAG IDCODE scan**, over the CH347 JTAG engine (CH341A has none). `jtag idcode-scan` drives the real `Ch347Jtag` adapter.
+- **Backend auto-select.** `open_default()` probes CH347 (`1a86:55db`), then CH341A (`1a86:5512`), then falls back to mock with a stderr warning; `RATCHET_FORCE_MOCK=1` forces mock. Protocol verbs use `open_raw_bus()`, which returns an honest error rather than a silent mock fallback when no device is present. `ratchet status` reports the active backend in its `backend` JSON field.
 
 Offline tools that need no hardware:
-- `i2c sniff <trace.json>` decodes a captured (t_us, scl, sda) trace; `jtag bsdl-scan <file.bsdl>` parses a BSDL file and reports its boundary register; `la export <capture.json> <out> --format csv|jsonl` converts a capture; `serial-list` enumerates serial ports (POSIX); `repl` is a working stdin REPL over the SPI backend; plus all the pure analysis verbs (`analyze`, `diff`, `checksum`, `chip-info`, `search`, `post-decode`, `voltage-reference`).
 
-What is NOT wired to live hardware yet (these fail honestly: non-zero exit / JSON-RPC error, never a fake success):
-- `uart open/sniff`, `onewire scan/temp`, `swd connect/halt/resume/step/dump`, `avr signature/program/fuses/erase`, `eeprom-microwire read/write`, `esp detect/flash`, `stm32 swd-flash/uart-flash`, `la capture`, `buspirate bridge/probe`, `can sniff/send`. The protocol logic for each is implemented and unit-tested against a mock, but no live CH341A/CH347 transport adapter is wired (SWD/1-Wire/AVR-ISP/Microwire bit-bang, native UART RX, external serial/CAN devices). `monitor`, `serial` connect, and `failure-search` likewise return honest errors rather than placeholder envelopes.
-- **No GitHub Releases are published yet**, so the only supported install route today is from source via `cargo install`.
+- `i2c sniff <trace.json>` decodes a captured (t_us, scl, sda) trace; `jtag bsdl-scan <file.bsdl>` parses a BSDL file and reports its boundary register; `la export <capture.json> <out> --format csv|jsonl` converts a capture; `serial-list` enumerates serial ports (POSIX); `repl` is a stdin REPL over the SPI backend; plus the analysis verbs `analyze`, `diff`, `checksum`, `chip-info`, `search`, `post-decode`, and `voltage-reference`.
 
-497 unit + integration tests pass. The SPI write path is proven without hardware by a `LoopbackFlash` test bus that emulates a real SPI NOR chip behind the CH341A USB framing (full-duplex reads, erase/program with AND-into-flash semantics), so a write → read-back → verify round-trip is exercised end to end. Without hardware, the mock backend keeps the SPI-flash surface exercisable for development and CI; protocol verbs report honestly that a device is required.
+Not wired to live hardware yet: `uart`, `onewire`, `swd`, `avr`, `eeprom-microwire`, `esp`, `stm32`, `la capture`, `buspirate`, `can`, plus `monitor`, `serial` connect, and `failure-search`. Each one's protocol logic is implemented and unit-tested against a mock, but no live CH341A/CH347 transport adapter is wired for it yet (SWD / 1-Wire / AVR-ISP / Microwire bit-bang, native UART RX, external serial/CAN devices). They exit non-zero (or return a JSON-RPC error), never a fake success.
 
-Goal 016 hardened the destructive surface further: short USB reads are a hard error instead of silent zero-padding, erase/write refuse write-protected silicon and unknown-capacity chips, chips entered into 4-byte mode are always exited, whole-range reads stream inside a single chip-select assertion, and the CLI/MCP refuse to run destructive verbs against a silently-selected mock backend.
+The destructive paths are hardened: a short USB read is a hard error instead of silent zero-padding; erase and write refuse write-protected silicon, unknown-capacity chips, and a silently-selected mock backend; 4-byte mode is always exited after use; whole-range reads stream inside a single chip-select assertion. The SPI write path is proven without hardware by a `LoopbackFlash` test bus that emulates an SPI NOR chip behind the CH341A USB framing (full-duplex reads, erase/program with AND-into-flash semantics), so a write → read-back → verify round-trip runs end to end. The mock backend keeps the SPI-flash surface exercisable in CI when no device is attached. 497 unit and integration tests pass.
 
 ## Install
 
@@ -99,10 +97,10 @@ CH341A (the common ~$3 programmer) or a CH347.
 - A CH341A or CH347 USB programmer and a SOIC-8 / SOIC-16 test clip (or a ZIF adapter if you
   desolder the chip). The BIOS flash is the 8-pin SPI chip near the chipset, usually a Winbond
   `W25Q…`, Macronix `MX25L…`, or GigaDevice `GD25Q…`.
-- A **known-good BIOS image** for your exact board revision — download it from the motherboard
+- A known-good BIOS image for your exact board revision - download it from the motherboard
   vendor's support page, or keep the backup `ratchet` makes in step 2.
 - **Voltage check:** most BIOS chips are 3.3 V (what a stock CH341A drives). Some are 1.8 V and
-  need a level-shifter adapter — `ratchet chip-info <chip>` reports the chip's voltage so you can
+  need a level-shifter adapter - `ratchet chip-info <chip>` reports the chip's voltage so you can
   check before connecting.
 
 **Steps** (clip onto the chip with the board powered off and unplugged):
@@ -112,7 +110,7 @@ CH341A (the common ~$3 programmer) or a CH347.
 ratchet status                # programmer detected? which backend?
 ratchet identify              # reads the JEDEC ID and looks the chip up in the 806-chip DB
 
-# 2. Back up the current contents FIRST — always, even if the BIOS looks dead.
+# 2. Back up the current contents FIRST - always, even if the BIOS looks dead.
 ratchet read backup.bin       # full-chip dump → file
 ratchet analyze backup.bin    # optional: UEFI volumes, ME region, integrity
 
@@ -123,7 +121,7 @@ ratchet analyze backup.bin    # optional: UEFI volumes, ME region, integrity
 #      • reads the chip back and verifies it matches the file.
 ratchet write new_bios.bin
 
-# 4. Re-verify independently (optional — `write` already verified).
+# 4. Re-verify independently (optional - `write` already verified).
 ratchet verify new_bios.bin
 ```
 
@@ -132,9 +130,9 @@ refuses an image larger than the chip. If anything goes wrong mid-write, your or
 timestamped backup printed by step 3. To recover a board after a bad flash, just
 `ratchet write backup.bin` from that file.
 
-**One-shot pipeline.** `ratchet full-repair --reference new_bios.bin` runs the whole thing —
+**One-shot pipeline.** `ratchet full-repair --reference new_bios.bin` runs the whole thing -
 connection-quality check → double-verify read → health analysis → repair → write → post-write
-verify — as a single guided workflow.
+verify - as a single guided workflow.
 
 ### Verifying on real hardware
 
@@ -176,16 +174,15 @@ ratchet la export capture.json out.csv --format csv
 ratchet serial-list
 ```
 
-Verbs whose live transport is not yet wired (`uart`, `onewire`, `swd`, `avr`,
+Verbs whose live transport isn't wired yet (`uart`, `onewire`, `swd`, `avr`,
 `eeprom-microwire`, `esp`, `stm32`, `la capture`, `buspirate`, `can`) exit
-non-zero with an explanation; they never print a fake success. See
-[Status](#status).
+non-zero with an explanation (see [Status](#status)).
 
 ## Commands
 
-`ratchet --help` exposes 39 top-level subcommands plus `help`. Status legend:
-**[live]** drives hardware (honest error if no device), **[offline]** needs no
-hardware, **[n/w]** not wired to a live transport yet (exits non-zero, never
+`ratchet --help` exposes 40 top-level subcommands plus `help`. Status legend:
+`[live]` drives hardware (honest error if no device), `[offline]` needs no
+hardware, `[n/w]` not wired to a live transport yet (exits non-zero, never
 fakes success).
 
 | Group | Commands |
@@ -213,7 +210,12 @@ ratchet analyze backup.bin --json | jq '.data.regions'
 
 ## Agent Interface (MCP)
 
-ratchet ships a built-in **MCP server** (`ratchet-mcp`) so AI agents (Claude Desktop, mcp-cli, custom SDK clients) can connect to the tool surface over stdio. Hand-rolled JSON-RPC 2.0. **31 tools total**: 19 SPI-flash / BIOS analysis tools + 12 hardware-protocol tools. The SPI-flash/BIOS tools and `i2c_scan` / `i2c_read` / `i2c_write` / `jtag_idcode_scan` run against the live backend (or an honest JSON-RPC error when no device is present); the remaining hardware tools return an honest JSON-RPC error until their transport is wired (they never return a fake success). The JSON-RPC dispatch, schema descriptors, and argument shapes are real.
+ratchet ships a built-in MCP server (`ratchet-mcp`) that exposes the tool surface to AI agents
+(Claude Desktop, mcp-cli, custom SDK clients) over stdio, using hand-rolled JSON-RPC 2.0. It
+serves 31 tools: 19 for SPI-flash / BIOS analysis and 12 for hardware protocols. The
+SPI-flash/BIOS tools plus `i2c_scan`, `i2c_read`, `i2c_write`, and `jtag_idcode_scan` run against
+the live backend; the remaining hardware tools return a JSON-RPC error until their transport is
+wired. The JSON-RPC dispatch, schema descriptors, and argument shapes are real.
 
 ```bash
 ratchet-mcp                              # start the server (stdio; live backend, mock fallback)
@@ -265,16 +267,16 @@ ratchet is built to not brick your board. Every item below is enforced in code (
   scripts can branch on them like flashrom.
 - **`wp-disable` remedy.** A `write protected` refusal has an in-tool fix: `wp-disable`
   clears the block-protect bits (confirm-gated on MCP, destructive-gated on the CLI) and
-  exits non-zero if protection survives (hardware WP pin or OTP lock).
+  exits non-zero if protection survives (a hardware WP pin or OTP lock).
 - **Erase-before-program + WIP polling.** Sectors are erased before programming (SPI program can
   only clear bits 1→0), and the write-in-progress status bit is polled after every erase and page
   program, so the next command never races a still-busy chip (chip-erase can take tens of seconds).
-- **Blank-image guard.** `write` refuses an all-0xFF or all-0x00 image — a blank or failed dump
+- **Blank-image guard.** `write` refuses an all-0xFF or all-0x00 image - a blank or failed dump
   that would wipe a working BIOS. Use `erase` to intentionally blank a chip.
 - **Capacity check.** Writes larger than the chip are rejected, not silently truncated; chips the
   database cannot size (`unknown chip capacity`) are refused outright instead of written blind.
 - **Write-protect guard.** Erase and write refuse a chip whose block-protect bits are set
-  (`write protected`) — protected silicon silently ignores program commands, which would
+  (`write protected`) - protected silicon silently ignores program commands, which would
   otherwise read as a fake success.
 - **No silent mock writes.** The CLI `write`/`erase`/`region-erase`/`full-repair` verbs and the
   MCP `write_chip`/`erase_chip`/`region_erase` tools refuse to run when the factory silently fell
@@ -283,19 +285,19 @@ ratchet is built to not brick your board. Every item below is enforced in code (
 - **MCP confirm gate.** The destructive MCP tools require `"confirm": true` in their arguments;
   calls without it get a JSON-RPC error, so an agent can never write or erase by accident.
 - **Short-read detection.** A USB transfer that delivers fewer bytes than requested is a hard
-  `short transfer` error, never zero-padded data — protecting reads, verifies, and backups.
+  `short transfer` error, never zero-padded data - protecting reads, verifies, and backups.
 - **Automatic 4-byte addressing** on chips over 16 MB, so large BIOS images aren't half-addressed
-  — and 4-byte mode is always exited when the operation completes, so the chip is never left
+  - and 4-byte mode is always exited when the operation completes, so the chip is never left
   misaddressing for the next tool (or the board itself).
 - **Backup no-clobber.** `full-backup` refuses to overwrite an existing
-  `ratchet-backup-<chip>.bin` without `--force` — it may be your only copy of a working BIOS.
+  `ratchet-backup-<chip>.bin` without `--force` - it may be your only copy of a working BIOS.
 - **Post-read flags.** `read` reports `all_ff` / `all_zero` so a blank (0xFF) or dead (0x00) read
   is obvious in the output.
 
 Advisory (not an automatic block): `identify` / `chip-info` report the chip's rated voltage so you
 can confirm a 1.8 V part isn't being driven by a stock 3.3 V CH341A before you connect. The CLI
 `erase` verb has no interactive prompt (it's meant for scripting; the MCP surface has the confirm
-gate instead) — but `write`'s automatic pre-write backup means a normal reflash is always
+gate instead) - but `write`'s automatic pre-write backup means a normal reflash is always
 recoverable.
 
 ## Architecture
@@ -316,19 +318,21 @@ rust/
 └── ratchet-node      ← optional napi-rs bridge for Node consumers
 ```
 
-**Fully native.** Direct SPI / I2C / UART / JTAG / SWD over libusb. No external tools shelled out. No `flashrom` / `avrdude` / `esptool` / `stm32flash` / `OpenOCD` dependency at runtime; ratchet is an alternative to those, not a wrapper around them.
+Fully native: direct SPI / I2C / UART / JTAG / SWD over libusb, with nothing shelled out at
+runtime. ratchet is an alternative to flashrom / avrdude / esptool / stm32flash / OpenOCD, not a
+wrapper around them.
 
 ## Supported Hardware
 
 ### Programmers
 
-- **CH341A** (`1a86:5512`): most common, SPI plus bit-bang I2C, ~$3 on AliExpress. (JTAG/SWD/1-Wire bit-bang transports are not wired; those verbs fail honestly.)
+- **CH341A** (`1a86:5512`): most common, SPI plus bit-bang I2C, ~$3 on AliExpress. (The JTAG/SWD/1-Wire bit-bang transports are not wired; those verbs fail honestly.)
 - **CH347** (`1a86:55db`, `55de`): newer, up to 60 MHz SPI, native I2C + UART, JTAG. (The HID-mode CH347 variant uses a different endpoint layout and is not supported.)
 - **CH343** (`1a86:55d3`): recognized in `serial-list` enumeration only; the `serial connect` verb is not wired.
 
 ### Flash Chips (806 in database)
 
-Winbond, Macronix, GigaDevice, SST / Microchip, EON, Spansion / Cypress / Infineon, Micron / Numonyx, ISSI, AMIC, XMC, PUYA, ESMT, Intel, Atmel / Adesto, and more. Both 3.3V and 1.8V variants.
+Winbond, Macronix, GigaDevice, SST / Microchip, EON, Spansion / Cypress / Infineon, Micron / Numonyx, ISSI, AMIC, XMC, PUYA, ESMT, Intel, Atmel / Adesto, and more. Both 3.3 V and 1.8 V variants.
 
 ### Target MCUs
 
@@ -341,7 +345,7 @@ Winbond, Macronix, GigaDevice, SST / Microchip, EON, Spansion / Cypress / Infine
 
 - **End user (cargo-install path)**: Rust 1.82+ and libusb-1.0 (system package).
 - **macOS**: `brew install libusb`. The CH341A / CH347 are vendor-specific USB devices, so macOS
-  loads no kernel driver for them and libusb (via IOKit) opens them directly — no kext, no Zadig,
+  loads no kernel driver for them and libusb (via IOKit) opens them directly - no kext, no Zadig,
   no extra entitlements when you run `ratchet` from a terminal. If the build can't find libusb,
   make sure Homebrew's `lib`/`include` are on the pkg-config path
   (`export PKG_CONFIG_PATH="$(brew --prefix libusb)/lib/pkgconfig"`). If a programmer doesn't
@@ -352,7 +356,10 @@ Winbond, Macronix, GigaDevice, SST / Microchip, EON, Spansion / Cypress / Infine
 
 ## History
 
-This repo started life as `biosMCP`, a CH341A-focused BIOS chip programmer that replaced AsProgrammer / NeoProgrammer. The TypeScript prototype was fully replaced by a native Rust workspace in goal 004 (the `ts-final` git tag preserves the prior state). Goal 005 expanded the scope from SPI-flash-only into the multi-protocol hardware toolkit; goal 006 rebranded the project to `ratchet` to reflect the broader surface; goal 007 audited the full capability matrix; goal 008 added the LICENSE file and reconciled README claims with reality; goal 014 wired the genuinely-wireable protocol verbs (I2C, I2C EEPROM, JTAG IDCODE, plus offline trace/BSDL/capture tools and a working REPL) to live hardware, replaced every remaining fake-success stub with an honest non-zero failure, and tightened the read/repair/scan hot paths; goal 015 completed the SPI **write** path that actually repairs a motherboard — real page-program with write-in-progress polling, erase-before-write, read-back verify, automatic 4-byte addressing over 16 MB, and a blank-image guard, all on both CH341A and CH347 (the CH341A write/verify were previously unimplemented stubs), and rewrote the stale CLI smoke test to drive the real `ratchet` binary.
+ratchet began as **biosMCP**, a CH341A-focused BIOS programmer built to replace AsProgrammer and
+NeoProgrammer. The original TypeScript prototype was rewritten as a native Rust workspace (the
+prior state is preserved at the `ts-final` git tag), then grew from a SPI-flash-only tool into the
+broader multi-protocol toolkit and was renamed ratchet to match its wider scope.
 
 ## License
 
