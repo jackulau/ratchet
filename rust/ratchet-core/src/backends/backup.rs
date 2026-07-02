@@ -67,12 +67,11 @@ pub fn create_private_backup_path(prefix: &str) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Serializes env-mutating tests (same hazard as the factory's ENV_GUARD).
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn backup_dir_is_persistent_and_private() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        // Crate-wide env lock: a module-local guard still races factory.rs's
+        // env-mutating tests on parallel test threads.
+        let _guard = crate::backends::test_env::lock();
 
         // Default resolution (no override): must NOT land in the reboot-wiped
         // temp dir while a home directory exists.

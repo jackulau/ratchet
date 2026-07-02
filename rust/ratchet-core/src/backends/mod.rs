@@ -102,3 +102,16 @@ pub fn reject_blank_image(firmware: &[u8]) -> Result<()> {
     }
     Ok(())
 }
+
+/// Crate-wide lock for tests that mutate process environment variables.
+/// The libtest harness runs a crate's tests on parallel threads; two modules
+/// each holding their OWN env guard still race each other's set/remove/restore
+/// sequences (this bit backup.rs vs factory.rs under concurrent audit load).
+/// Every env-mutating test must hold THIS lock.
+#[cfg(test)]
+pub(crate) mod test_env {
+    pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}

@@ -282,12 +282,10 @@ mod tests {
 
     /// Serializes the tests that mutate RATCHET_FORCE_MOCK: the test harness runs
     /// them on parallel threads, and an unsynchronized set/remove race can make
-    /// open_default() probe REAL hardware mid-suite. A poisoned lock is fine —
-    /// the env var is restored by each test regardless.
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// open_default() probe REAL hardware mid-suite. Delegates to the crate-wide
+    /// env lock so backup.rs's env-mutating tests can't interleave either.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+        crate::backends::test_env::lock()
     }
 
     #[test]

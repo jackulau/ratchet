@@ -1343,7 +1343,10 @@ mod tests {
         // A standalone verify of a >16 MB chip must identify first and enter 4-byte mode
         // (else it misaddresses the read-back), then EXIT 4-byte mode on completion so
         // the chip is not left misaddressing for the next tool.
-        let path = std::env::temp_dir().join("ratchet-ch347-verify-4b.bin");
+        let path = std::env::temp_dir().join(format!(
+            "ratchet-ch347-verify-4b-{}.bin",
+            std::process::id()
+        ));
         std::fs::write(&path, vec![0xa5u8; 32]).unwrap();
         let t = primed_transport(vec![vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x19]]); // RDID → ef4019 (32 MB)
         let mut b = Ch347Backend::new(t);

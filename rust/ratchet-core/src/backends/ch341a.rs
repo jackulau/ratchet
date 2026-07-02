@@ -870,6 +870,13 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
 mod tests {
     use super::*;
 
+    /// Per-process temp path: two concurrent `cargo test` processes (CI shards,
+    /// parallel audits) racing on ONE fixed filename gave spurious ENOENT when
+    /// one process deleted the other's input mid-test.
+    fn test_tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ratchet-test-{}-{}", std::process::id(), name))
+    }
+
     #[test]
     fn enable_spi_mode_packet_layout() {
         let pkt = enable_spi_mode_packet();
@@ -1075,7 +1082,7 @@ mod tests {
         // JEDEC id aabb11 is not in the chip DB → size_bytes 0 → must refuse, not
         // skip the oversize guard and write blind. (Capacity byte 0x11 < 0x19 keeps
         // the 4-byte-addressing heuristic quiet.)
-        let path = std::env::temp_dir().join("ratchet-test-unknown-capacity.bin");
+        let path = test_tmp("unknown-capacity.bin");
         std::fs::write(&path, vec![0xa5u8; 64]).unwrap();
         let mut bus = MockBus::new();
         bus.queue_read(vec![0x00, 0xaa, 0xbb, 0x11]);
@@ -1119,7 +1126,7 @@ mod tests {
         // issues the 4 KB sector-erase opcode (0x20). Striding by 64 KB would erase
         // only the first 4 KB of each 64 KB step, AND-ing stale data into the rest
         // of the image. Every 4 KB of the programmed range must receive an erase.
-        let path = std::env::temp_dir().join("ratchet-test-erase-stride.bin");
+        let path = test_tmp("erase-stride.bin");
         std::fs::write(&path, vec![0xa5u8; 8192]).unwrap();
         let mut bus = MockBus::new();
         bus.queue_read(vec![0x00, 0x1c, 0x20, 0x10]); // RDID → EN25P05 (64 KB, sectorSize 64 KB)
@@ -1243,7 +1250,7 @@ mod tests {
     fn verify_chip_exits_4byte_mode_after_completion() {
         // >16 MB chip (ef4019): verify enters 4-byte mode for the read-back, then must
         // exit (EX4B 0xe9) so the chip is not left misaddressing for the next tool.
-        let path = std::env::temp_dir().join("ratchet-test-ex4b-verify.bin");
+        let path = test_tmp("ex4b-verify.bin");
         std::fs::write(&path, vec![0xa5u8; 32]).unwrap();
         let mut bus = MockBus::new();
         bus.queue_read(vec![0x00, 0xef, 0x40, 0x19]); // RDID → W25Q256
@@ -1502,7 +1509,7 @@ mod tests {
         // 300-byte image → spans two 256-byte pages, so we must see PAGE_PROGRAM at addr 0
         // AND at addr 256 (0x000100). Erase must precede the first program.
         let firmware: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
-        let path = std::env::temp_dir().join("ratchet-test-d2-write.bin");
+        let path = test_tmp("d2-write.bin");
         std::fs::write(&path, &firmware).unwrap();
 
         let mut bus = MockBus::new();
@@ -1546,7 +1553,7 @@ mod tests {
     fn write_chip_rejects_image_larger_than_chip() {
         // Winbond W25Q64 (ef4017) = 8 MB. A 9 MB image must be rejected, not silently truncated.
         let big = vec![0xa5u8; 9 * 1024 * 1024];
-        let path = std::env::temp_dir().join("ratchet-test-d2-oversize.bin");
+        let path = test_tmp("d2-oversize.bin");
         std::fs::write(&path, &big).unwrap();
 
         let mut bus = MockBus::new();
@@ -1675,7 +1682,7 @@ mod tests {
     fn write_then_verify_round_trip_via_loopback_flash() {
         // Emulate a W25Q128 (ef4018). Image spans 2 sectors + 17 pages to exercise boundaries.
         let firmware: Vec<u8> = (0..(4096u32 + 100)).map(|i| (i % 251) as u8).collect();
-        let path = std::env::temp_dir().join("ratchet-test-d3-roundtrip.bin");
+        let path = test_tmp("d3-roundtrip.bin");
         std::fs::write(&path, &firmware).unwrap();
 
         let bus = LoopbackFlash::new(16 * 1024 * 1024, [0xef, 0x40, 0x18]);
@@ -1708,8 +1715,8 @@ mod tests {
     #[test]
     fn verify_chip_detects_mismatch_via_loopback() {
         let firmware: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
-        let written = std::env::temp_dir().join("ratchet-test-d3-written.bin");
-        let other = std::env::temp_dir().join("ratchet-test-d3-other.bin");
+        let written = test_tmp("d3-written.bin");
+        let other = test_tmp("d3-other.bin");
         std::fs::write(&written, &firmware).unwrap();
         std::fs::write(&other, vec![0x5au8; 1000]).unwrap();
 
@@ -1846,7 +1853,7 @@ mod tests {
     #[test]
     fn write_chip_refuses_blank_all_ff_image() {
         // Flashing an all-0xFF (blank) image would wipe a working BIOS — must be refused.
-        let path = std::env::temp_dir().join("ratchet-test-blank-ff.bin");
+        let path = test_tmp("blank-ff.bin");
         std::fs::write(&path, vec![0xffu8; 4096]).unwrap();
         let mut backend = CH341ABackend::with_bus(MockBus::new());
         let err = backend
