@@ -283,12 +283,14 @@ impl<B: UsbBus> CH341ABackend<B> {
         decode_jedec_response(&rx).ok_or(BackendError::ChipNotDetected)
     }
 
-    /// Read SR1, failing CLOSED on a short/garbled RDSR response. A flaky bus
-    /// must never read as "ready" (WIP clear) or "unprotected" (BP clear): those
-    /// optimistic defaults green-light destructive ops exactly when the transport
-    /// is least trustworthy.
-    fn read_sr1_strict(&mut self) -> Result<u8> {
-        self.spi_command(&[SPI_RDSR, 0])?
+    /// Read one status register, failing CLOSED on a short/garbled RDSR
+    /// response. A flaky bus must never read as "ready" (WIP clear) or
+    /// "unprotected" (BP clear): those optimistic defaults green-light
+    /// destructive ops exactly when the transport is least trustworthy — and a
+    /// short read snapshotted as 0x00 would make the post-repair WP restore
+    /// re-apply "no protection" to a chip that was protected.
+    fn read_status_strict(&mut self, opcode: u8) -> Result<u8> {
+        self.spi_command(&[opcode, 0])?
             .get(1)
             .copied()
             .ok_or_else(|| {
@@ -296,6 +298,10 @@ impl<B: UsbBus> CH341ABackend<B> {
                     "short RDSR response — status register unreadable; failing closed".into(),
                 )
             })
+    }
+
+    fn read_sr1_strict(&mut self) -> Result<u8> {
+        self.read_status_strict(SPI_RDSR)
     }
 
     /// Poll RDSR until the write-in-progress (WIP) bit clears, or `timeout` elapses.
@@ -694,21 +700,12 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         Ok(Some(info))
     }
     fn read_status_registers(&mut self) -> Result<StatusRegisters> {
-        let sr1 = self
-            .spi_command(&[SPI_RDSR, 0])?
-            .get(1)
-            .copied()
-            .unwrap_or(0);
-        let sr2 = self
-            .spi_command(&[SPI_RDSR2, 0])?
-            .get(1)
-            .copied()
-            .unwrap_or(0);
-        let sr3 = self
-            .spi_command(&[SPI_RDSR3, 0])?
-            .get(1)
-            .copied()
-            .unwrap_or(0);
+        // Strict reads: this snapshot feeds the write-protection restore after
+        // full-repair — a short response read as 0x00 would silently strip a
+        // chip's BP bits instead of restoring them.
+        let sr1 = self.read_status_strict(SPI_RDSR)?;
+        let sr2 = self.read_status_strict(SPI_RDSR2)?;
+        let sr3 = self.read_status_strict(SPI_RDSR3)?;
         Ok(StatusRegisters { sr1, sr2, sr3 })
     }
     fn read_sfdp(&mut self) -> Result<Option<SfdpInfo>> {
@@ -1335,6 +1332,20 @@ mod tests {
         assert!(
             format!("{err}").contains("short RDSR"),
             "WP guard must fail closed on a short status read, got: {err}"
+        );
+    }
+
+    #[test]
+    fn status_register_snapshot_fails_closed() {
+        // read_status_registers feeds the post-repair write-protection restore:
+        // a short RDSR snapshotted as sr1=0x00 would make full-repair re-apply
+        // BP=0 and leave a protected BIOS chip silently UNPROTECTED. The
+        // snapshot must hard-error instead of defaulting to zeros.
+        let mut backend = CH341ABackend::with_bus(ShortReadBus);
+        let err = backend.read_status_registers().unwrap_err();
+        assert!(
+            format!("{err}").contains("short RDSR"),
+            "status snapshot must fail closed on a short read, got: {err}"
         );
     }
 
