@@ -1,6 +1,6 @@
 // ratchet MCP server  -  hand-rolled JSON-RPC 2.0 over stdio.
 // Skips third-party MCP crates per the project's "fully custom" objective.
-// Surface: 30 tools  -  18 SPI-flash / BIOS analysis + 12 hardware-protocol tools
+// Surface: 31 tools  -  19 SPI-flash / BIOS analysis + 12 hardware-protocol tools
 // (I2C, UART, JTAG, SWD, AVR/ESP/STM32 programmers, logic analyzer, Bus Pirate,
 // slcan CAN). SPI-flash, I2C, and JTAG tools run against the live CH341A/CH347
 // backend (or the mock when RATCHET_FORCE_MOCK=1); every tool without a wired
