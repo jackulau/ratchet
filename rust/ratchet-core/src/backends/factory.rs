@@ -171,7 +171,10 @@ pub fn open_raw_bus() -> std::result::Result<RawBus, RawBusError> {
 
     let ctx = Context::new().map_err(|e| RawBusError::LibusbInit(e.to_string()))?;
 
-    if let Ok(handle) = ctx.find_by_ids(CH347_VID, CH347_PID) {
+    if let Some(handle) = CH347_PIDS
+        .iter()
+        .find_map(|pid| ctx.find_by_ids(CH347_VID, *pid).ok())
+    {
         handle.claim_interface(CH347_SPI_INTERFACE).map_err(|e| {
             RawBusError::ClaimFailed(format!("CH347 interface {CH347_SPI_INTERFACE}: {e}"))
         })?;
@@ -196,8 +199,15 @@ pub fn open_raw_bus() -> std::result::Result<RawBus, RawBusError> {
     Err(RawBusError::NoDevice)
 }
 
+/// PIDs probed for the CH347, in order: 0x55db (CH347T, vendor bulk mode) then
+/// 0x55de (CH347F — same bulk SPI protocol and endpoint layout). 0x55dc is the
+/// HID-mode CH347 with a different endpoint layout and is deliberately absent.
+pub const CH347_PIDS: [u16; 2] = [CH347_PID, crate::backends::ch347::CH347F_PID];
+
 fn try_open_ch347(ctx: &Context) -> Option<OpenResult> {
-    let handle = ctx.find_by_ids(CH347_VID, CH347_PID).ok()?;
+    let handle = CH347_PIDS
+        .iter()
+        .find_map(|pid| ctx.find_by_ids(CH347_VID, *pid).ok())?;
     if let Err(e) = handle.claim_interface(CH347_SPI_INTERFACE) {
         return Some(OpenResult {
             backend: Box::new(MockBackend::default()),
@@ -209,8 +219,22 @@ fn try_open_ch347(ctx: &Context) -> Option<OpenResult> {
         });
     }
     let bus = LibusbBus::new(handle, CH347_EP_IN, CH347_EP_OUT);
+    let mut backend = Ch347Backend::new(bus);
+    // Send the SPI config packet (clock divisor, mode 0, MSB-first, CS0). Without
+    // this the chip runs at whatever power-on config it happened to have —
+    // Backend::open() was previously never called outside tests.
+    if let Err(e) = backend.open() {
+        return Some(OpenResult {
+            backend: Box::new(MockBackend::default()),
+            kind: BackendKind::Mock,
+            warning: Some(format!(
+                "CH347 claimed but SPI init failed ({e}); using mock"
+            )),
+            force_mock_env: false,
+        });
+    }
     Some(OpenResult {
-        backend: Box::new(Ch347Backend::new(bus)),
+        backend: Box::new(backend),
         kind: BackendKind::Ch347,
         warning: None,
         force_mock_env: false,
@@ -230,8 +254,22 @@ fn try_open_ch341a(ctx: &Context) -> Option<OpenResult> {
         });
     }
     let bus = LibusbBus::new(handle, CH341A_EP_IN, CH341A_EP_OUT);
+    let mut backend = CH341ABackend::with_bus(bus);
+    // Send the enable-SPI pin-direction packet (MOSI/SCK/CS outputs, MISO input).
+    // Without it the CH341A's pins are never configured for SPI — Backend::open()
+    // was previously never called outside tests.
+    if let Err(e) = backend.open() {
+        return Some(OpenResult {
+            backend: Box::new(MockBackend::default()),
+            kind: BackendKind::Mock,
+            warning: Some(format!(
+                "CH341A claimed but SPI init failed ({e}); using mock"
+            )),
+            force_mock_env: false,
+        });
+    }
     Some(OpenResult {
-        backend: Box::new(CH341ABackend::with_bus(bus)),
+        backend: Box::new(backend),
         kind: BackendKind::Ch341a,
         warning: None,
         force_mock_env: false,
@@ -244,12 +282,10 @@ mod tests {
 
     /// Serializes the tests that mutate RATCHET_FORCE_MOCK: the test harness runs
     /// them on parallel threads, and an unsynchronized set/remove race can make
-    /// open_default() probe REAL hardware mid-suite. A poisoned lock is fine —
-    /// the env var is restored by each test regardless.
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// open_default() probe REAL hardware mid-suite. Delegates to the crate-wide
+    /// env lock so backup.rs's env-mutating tests can't interleave either.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+        crate::backends::test_env::lock()
     }
 
     #[test]
@@ -265,6 +301,14 @@ mod tests {
             Some(v) => std::env::set_var(FORCE_MOCK_ENV, v),
             None => std::env::remove_var(FORCE_MOCK_ENV),
         }
+    }
+
+    #[test]
+    fn ch347_probe_covers_both_bulk_pids() {
+        // Probe order: CH347T vendor-bulk (0x55db) first, then CH347F (0x55de,
+        // same bulk protocol). 0x55dc is HID mode (different endpoints) and must
+        // stay excluded — README's claimed PID list mirrors this array.
+        assert_eq!(CH347_PIDS, [0x55db, 0x55de]);
     }
 
     #[test]

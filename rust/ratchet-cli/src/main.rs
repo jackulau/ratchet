@@ -143,6 +143,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Clear the chip's block-protect bits (the in-tool remedy for "write protected" errors).
+    WpDisable {
+        #[arg(long)]
+        json: bool,
+    },
     /// Erase a specific byte range.
     RegionErase {
         start: String,
@@ -616,6 +621,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Sfdp { json }) => cmd_sfdp(json)?,
         Some(Command::WpStatus { json }) => cmd_wp_status(json)?,
+        Some(Command::WpDisable { json }) => cmd_wp_disable(json)?,
         Some(Command::RegionErase {
             start,
             length,
@@ -1145,6 +1151,7 @@ fn cmd_identify(json: bool) -> anyhow::Result<()> {
 
 fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
     let mut m = open_dyn();
+    with_progress(&mut *m, "read", json);
     let r = m.read_chip(std::path::Path::new(output))?;
     let env = AgentEnvelope::ok("read", r.clone());
     emit_envelope(&env, json, || {
@@ -1158,6 +1165,7 @@ fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
 fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> anyhow::Result<()> {
     use ratchet_core::backends::WriteOpts;
     let (mut m, kind) = open_dyn_destructive("write")?;
+    with_progress(&mut *m, "write", json);
     let r = m.write_chip(
         std::path::Path::new(input),
         WriteOpts {
@@ -1179,16 +1187,67 @@ fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> a
 
 fn cmd_erase(json: bool) -> anyhow::Result<()> {
     let (mut m, kind) = open_dyn_destructive("erase")?;
+    with_progress(&mut *m, "erase", json);
     let r = m.erase_chip()?;
     let env = AgentEnvelope::ok("erase", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || println!("erase ok ({}ms)", r.duration_ms))
 }
 
+/// Stderr progress ticker for multi-minute hardware operations: percentage +
+/// throughput, updated at most every 200 ms. stderr ONLY — stdout carries the
+/// JSON envelope contract, and smoke greps must stay byte-identical.
+fn progress_ticker(label: &'static str) -> ratchet_core::backends::ProgressFn {
+    let start = std::time::Instant::now();
+    let mut last_tick = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    Box::new(move |done, total| {
+        if done < total && last_tick.elapsed() < std::time::Duration::from_millis(200) {
+            return;
+        }
+        last_tick = std::time::Instant::now();
+        let pct = (done * 100).checked_div(total).unwrap_or(0);
+        let secs = start.elapsed().as_secs_f64();
+        let rate_kib = if secs > 0.0 {
+            done as f64 / secs / 1024.0
+        } else {
+            0.0
+        };
+        eprint!("\r{label}: {pct}% ({done}/{total} bytes, {rate_kib:.0} KiB/s)");
+        if done >= total {
+            eprintln!();
+        }
+    })
+}
+
+/// Attach the stderr ticker to a backend for a long operation — human mode
+/// only (`--json` consumers poll their own state and must not get a ticker).
+fn with_progress(m: &mut (impl Backend + ?Sized), label: &'static str, json: bool) {
+    if !json {
+        m.set_progress_callback(progress_ticker(label));
+    }
+}
+
+/// Exit code for the verify / blank-check contract: scripts gate on these verbs
+/// like flashrom -v, so a mismatch (or non-blank chip) must exit non-zero. The
+/// JSON envelope is always emitted before exiting.
+fn check_exit_code(ok: bool) -> i32 {
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
 fn cmd_verify(file: &str, json: bool) -> anyhow::Result<()> {
     let mut m = open_dyn();
+    with_progress(&mut *m, "verify", json);
     let r = m.verify_chip(std::path::Path::new(file))?;
     let env = AgentEnvelope::ok("verify", r.clone());
-    emit_envelope(&env, json, || println!("matches={}", r.matches))
+    emit_envelope(&env, json, || println!("matches={}", r.matches))?;
+    let code = check_exit_code(r.matches);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 fn cmd_analyze(file: &str, json: bool) -> anyhow::Result<()> {
@@ -1417,7 +1476,36 @@ fn cmd_blank_check(json: bool) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&tmp);
     let blank = data.iter().all(|b| *b == 0xff);
     let env = AgentEnvelope::ok("blank-check", json!({"blank": blank}));
-    emit_envelope(&env, json, || println!("blank={blank}"))
+    emit_envelope(&env, json, || println!("blank={blank}"))?;
+    let code = check_exit_code(blank);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+fn cmd_wp_disable(json: bool) -> anyhow::Result<()> {
+    // Mutates SR1 (clears the BP bits), so it runs behind the destructive gate:
+    // a user hitting BackendError::WriteProtected needs an in-tool remedy, but
+    // never against a silently-selected mock.
+    let (mut m, kind) = open_dyn_destructive("wp-disable")?;
+    let before = m.is_write_protected()?;
+    m.disable_write_protection()?;
+    let after = m.is_write_protected()?;
+    let env = AgentEnvelope::ok(
+        "wp-disable",
+        with_backend_field(
+            &json!({"was_protected": before, "write_protected": after, "success": !after}),
+            kind,
+        )?,
+    );
+    emit_envelope(&env, json, || {
+        println!("wp-disable: was_protected={before} now_protected={after}")
+    })?;
+    if after {
+        anyhow::bail!("write protection still active after WRSR (hardware WP pin or OTP lock?)");
+    }
+    Ok(())
 }
 
 fn cmd_repl() -> anyhow::Result<()> {
@@ -1426,7 +1514,7 @@ fn cmd_repl() -> anyhow::Result<()> {
     use std::path::Path;
 
     println!("ratchet REPL  -  type 'help' or 'quit'");
-    let mut backend = open_dyn();
+    let (mut backend, kind, warning, force_mock_env) = open_dyn_with_kind();
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -1436,7 +1524,17 @@ fn cmd_repl() -> anyhow::Result<()> {
         if stdin.read_line(&mut line)? == 0 {
             break; // EOF (piped input or Ctrl-D)
         }
-        match parse_line(&line) {
+        let cmd = parse_line(&line);
+        // Destructive REPL commands share the CLI verbs' gate: refuse a
+        // silently-selected mock fallback (a "write success=true" against an
+        // in-memory fake is a bricked board waiting to happen). Explicit
+        // RATCHET_FORCE_MOCK=1 stays allowed.
+        if let Some(msg) = repl_destructive_refusal(&cmd, kind, force_mock_env, warning.as_deref())
+        {
+            println!("error: {msg}");
+            continue;
+        }
+        match cmd {
             ReplCommand::Quit => break,
             ReplCommand::Help => println!(
                 "commands: identify jedec status read <f> write <f> erase \
@@ -1490,8 +1588,36 @@ fn cmd_repl() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_self_test(json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+/// The REPL's destructive-command gate: write / erase / sector-erase must refuse
+/// a silently-selected mock fallback exactly like the CLI verbs do. Returns the
+/// refusal message, or None when the command may run.
+fn repl_destructive_refusal(
+    cmd: &ratchet_core::repl::ReplCommand,
+    kind: BackendKind,
+    force_mock_env: bool,
+    warning: Option<&str>,
+) -> Option<String> {
+    use ratchet_core::repl::ReplCommand;
+    let op = match cmd {
+        ReplCommand::Write { .. } => "write",
+        ReplCommand::Erase => "erase",
+        ReplCommand::SectorErase { .. } => "sector-erase",
+        _ => return None,
+    };
+    mock_fallback_error(op, kind, force_mock_env, warning)
+}
+
+/// The backend the self-test runs against. The return type is the compile-time
+/// guarantee that a self-test can NEVER touch live silicon: it constructs the
+/// in-memory mock directly and never consults the factory (`open_dyn` /
+/// `open_default`), which could hand back a real CH341A/CH347 whose chip the
+/// erase step below would wipe.
+fn self_test_backend() -> ratchet_core::backends::mock::MockBackend {
+    ratchet_core::backends::mock::MockBackend::default()
+}
+
+/// Run the self-test checks against `m`, returning one message per failure.
+fn run_self_test(m: &mut dyn Backend) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
     if let Err(e) = m.detect_programmer() {
         errors.push(format!("detect: {e}"));
@@ -1505,6 +1631,12 @@ fn cmd_self_test(json: bool) -> anyhow::Result<()> {
     if let Err(e) = m.erase_chip() {
         errors.push(format!("erase: {e}"));
     }
+    errors
+}
+
+fn cmd_self_test(json: bool) -> anyhow::Result<()> {
+    let mut m = self_test_backend();
+    let errors = run_self_test(&mut m);
     let ok = errors.is_empty();
     let env = AgentEnvelope::ok("self-test", json!({"ok": ok, "errors": errors}));
     emit_envelope(&env, json, || {
@@ -1684,6 +1816,60 @@ mod tests {
         );
         assert!(mock_fallback_error("erase", BackendKind::Ch341a, false, None).is_none());
         assert!(mock_fallback_error("erase", BackendKind::Ch347, false, None).is_none());
+    }
+
+    // REPL write/erase/sector-erase go through the same mock-fallback gate as
+    // the CLI verbs: silent mock → refused; explicit force-mock → allowed;
+    // real silicon and read-only commands → untouched.
+    #[test]
+    fn repl_refuses_destructive_on_silent_mock() {
+        use ratchet_core::repl::ReplCommand;
+        let write = ReplCommand::Write {
+            path: "x.bin".into(),
+        };
+        let msg = repl_destructive_refusal(&write, BackendKind::Mock, false, Some("no device"))
+            .expect("silent-mock REPL write must be refused");
+        assert!(msg.contains("mock fallback"));
+        assert!(
+            repl_destructive_refusal(&ReplCommand::Erase, BackendKind::Mock, false, None).is_some()
+        );
+        assert!(repl_destructive_refusal(
+            &ReplCommand::SectorErase { address: 0 },
+            BackendKind::Mock,
+            false,
+            None
+        )
+        .is_some());
+        // Explicit force-mock and real silicon stay allowed.
+        assert!(repl_destructive_refusal(&write, BackendKind::Mock, true, None).is_none());
+        assert!(repl_destructive_refusal(&write, BackendKind::Ch341a, false, None).is_none());
+        // Read-only commands never hit the gate, even on silent mock.
+        assert!(
+            repl_destructive_refusal(&ReplCommand::Identify, BackendKind::Mock, false, None)
+                .is_none()
+        );
+    }
+
+    // `ratchet verify` / `blank-check` are gateable like flashrom -v: a
+    // mismatch (or non-blank chip) must exit non-zero so scripts can branch on
+    // the result instead of parsing JSON.
+    #[test]
+    fn verify_exits_nonzero_on_mismatch() {
+        assert_eq!(check_exit_code(true), 0);
+        assert_ne!(check_exit_code(false), 0);
+    }
+
+    // The self-test erases its target as a health check, so it must be
+    // physically incapable of opening live silicon. self_test_backend()'s
+    // return type (MockBackend, not Box<dyn Backend>) is the compile-time
+    // proof it never goes through the factory; this test exercises the same
+    // routine cmd_self_test runs and pins that it passes fully offline,
+    // without RATCHET_FORCE_MOCK set.
+    #[test]
+    fn self_test_never_opens_live_backend() {
+        let mut m = self_test_backend();
+        let errors = run_self_test(&mut m);
+        assert!(errors.is_empty(), "self-test on mock failed: {errors:?}");
     }
 
     #[test]

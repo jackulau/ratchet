@@ -192,7 +192,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)] // helper for upcoming mem_read tests
     fn queue_mem_read(t: &mut SwdMockTransport, value: u32) {
         // mem_read32 = SELECT (maybe) + CSW write + TAR write + DRW read.
         for _ in 0..3 {
@@ -201,6 +200,21 @@ mod tests {
         // First AP read returns stale, second from RDBUFF returns the value.
         t.queue_ok_read(0);
         t.queue_ok_read(value);
+    }
+
+    #[test]
+    fn is_halted_decodes_dhcsr_via_mem_read() {
+        // S_HALT set in DHCSR → halted.
+        let mut t = SwdMockTransport::new();
+        queue_mem_read(&mut t, S_HALT);
+        let mut cm = CortexM::new(Adiv5::new(Swd::new(&mut t)));
+        assert!(cm.is_halted().unwrap());
+
+        // S_HALT clear → running.
+        let mut t = SwdMockTransport::new();
+        queue_mem_read(&mut t, 0);
+        let mut cm = CortexM::new(Adiv5::new(Swd::new(&mut t)));
+        assert!(!cm.is_halted().unwrap());
     }
 
     #[test]

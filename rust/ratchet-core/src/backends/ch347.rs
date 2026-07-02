@@ -1,20 +1,22 @@
 // CH347 backend  -  USB-HS SPI programmer (up to 60MHz, 510-byte SPI packets, 4-byte addr).
 // Ports src/backends/ch347.ts. Transport-abstracted for hardware-free tests.
 
-#![allow(dead_code)]
-
 use super::{Backend, BackendError, Result, WriteOpts};
 use crate::chips::{format_size, lookup_by_jedec_id};
 use crate::types::*;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 // ─── USB device IDs ──────────────────────────────────────────────────────────
 
 pub const CH347_VID: u16 = 0x1a86;
 pub const CH347_PID: u16 = 0x55db;
+/// CH347F (the QFN/full-featured variant) enumerates as 0x55de with the same
+/// bulk SPI protocol and endpoint layout. 0x55dc is the HID-mode CH347 with a
+/// different endpoint layout and is deliberately NOT probed.
+pub const CH347F_PID: u16 = 0x55de;
 pub const CH347_SPI_INTERFACE: u8 = 2;
 pub const CH347_EP_OUT: u8 = 0x06;
 pub const CH347_EP_IN: u8 = 0x86;
@@ -57,6 +59,8 @@ pub const SPI_CMD_EWSR: u8 = 0x50;
 pub const SPI_CMD_SFDP: u8 = 0x5a;
 
 // 4-byte addressing
+pub const SPI_CMD_RESET_ENABLE: u8 = 0x66;
+pub const SPI_CMD_RESET: u8 = 0x99;
 pub const SPI_CMD_ENTER_4BYTE: u8 = 0xb7;
 pub const SPI_CMD_EXIT_4BYTE: u8 = 0xe9;
 pub const SPI_CMD_READ_4BYTE: u8 = 0x13;
@@ -82,6 +86,22 @@ pub const ADDR_4BYTE_THRESHOLD: u64 = 16 * 1024 * 1024;
 pub trait Transport {
     fn write(&mut self, data: &[u8]) -> Result<()>;
     fn read(&mut self, len: usize) -> Result<Vec<u8>>;
+
+    /// Read exactly `buf.len()` bytes into a caller-provided buffer. Streaming
+    /// reads call this once per 510-byte chunk; the live bus overrides it to
+    /// fill the slice directly — the default wraps `read` for mocks/tests.
+    /// Fails closed with `ShortTransfer` on a short read.
+    fn read_into(&mut self, buf: &mut [u8]) -> Result<()> {
+        let rx = self.read(buf.len())?;
+        if rx.len() < buf.len() {
+            return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
+                expected: buf.len(),
+                actual: rx.len(),
+            }));
+        }
+        buf.copy_from_slice(&rx[..buf.len()]);
+        Ok(())
+    }
 }
 
 pub struct CapturingTransport {
@@ -167,6 +187,7 @@ pub struct Ch347Protocol<T: Transport> {
     transport: T,
     use_4byte_addr: bool,
     clock_divisor: u8,
+    progress: Option<crate::backends::ProgressFn>,
 }
 
 impl<T: Transport> Ch347Protocol<T> {
@@ -175,6 +196,7 @@ impl<T: Transport> Ch347Protocol<T> {
             transport,
             use_4byte_addr: false,
             clock_divisor: 3, // default 7.5MHz (safe for most chips)
+            progress: None,
         }
     }
 
@@ -210,6 +232,19 @@ impl<T: Transport> Ch347Protocol<T> {
     }
 
     fn spi_transfer(&mut self, tx: &[u8]) -> Result<Vec<u8>> {
+        let res = self.spi_transfer_inner(tx);
+        if res.is_err() {
+            // CS must be released even when a chunk write/read fails mid-stream:
+            // a chip left selected treats the next command's clocks as
+            // continuation data. Best-effort — the original error is what the
+            // caller must see.
+            let _ = self.transport.write(&build_cs_xfer_packet(&[], false, 0));
+            let _ = self.transport.read(4);
+        }
+        res
+    }
+
+    fn spi_transfer_inner(&mut self, tx: &[u8]) -> Result<Vec<u8>> {
         let mut result = vec![0u8; tx.len()];
         // Reused CS-assert packet buffer: only the payload bytes change per chunk,
         // so we rewrite it in place instead of allocating a fresh Vec per 510-byte chunk.
@@ -230,6 +265,15 @@ impl<T: Transport> Ch347Protocol<T> {
             pkt.extend_from_slice(chunk);
             self.transport.write(&pkt)?;
             let rx = self.transport.read(4 + chunk_len)?;
+            if rx.len() < 4 + chunk_len {
+                // A short transport read must be a hard error, not a panic (the
+                // old slice indexing) and never silent padding. The wrapper
+                // releases CS.
+                return Err(BackendError::Usb(ratchet_usb::UsbError::ShortTransfer {
+                    expected: 4 + chunk_len,
+                    actual: rx.len(),
+                }));
+            }
             result[offset..offset + chunk_len].copy_from_slice(&rx[4..4 + chunk_len]);
 
             if is_last {
@@ -350,27 +394,71 @@ impl<T: Transport> Ch347Protocol<T> {
     }
 
     pub fn chip_erase(&mut self) -> Result<()> {
+        self.chip_erase_with_timeout(ERASE_TIMEOUT)
+    }
+
+    /// Chip-erase with a caller-sized WIP timeout: 16-32 MB parts take 200-400 s,
+    /// far past the fixed default. The backend sizes this from chip capacity.
+    pub fn chip_erase_with_timeout(&mut self, timeout: Duration) -> Result<()> {
         self.write_enable()?;
         self.spi_command(&[SPI_CMD_CHIP_ERASE])?;
-        self.wait_until_ready(ERASE_TIMEOUT)
+        self.wait_until_ready(timeout)
     }
 
     pub fn read_data(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
-        let mut tx: Vec<u8> = Vec::with_capacity(5 + length);
-        tx.push(if self.use_4byte_addr {
+        // Stream the read in 510-byte chunks instead of materializing a
+        // chip-size tx of zeros plus a chip-size echo (the old path held ~3x
+        // the chip size in transient memory for a full dump). CS stays
+        // asserted across chunks exactly as spi_transfer framed it; a failure
+        // mid-stream still releases CS.
+        let mut out = Vec::with_capacity(length);
+        let res = self.read_data_stream(address, length, &mut out);
+        if res.is_err() {
+            let _ = self.transport.write(&build_cs_xfer_packet(&[], false, 0));
+            let _ = self.transport.read(4);
+        }
+        res.map(|()| out)
+    }
+
+    fn read_data_stream(&mut self, address: u32, length: usize, out: &mut Vec<u8>) -> Result<()> {
+        // Opcode + address in the first CS-asserted packet; echo discarded.
+        let mut hdr: Vec<u8> = Vec::with_capacity(5);
+        hdr.push(if self.use_4byte_addr {
             SPI_CMD_READ_4BYTE
         } else {
             SPI_CMD_READ
         });
-        tx.extend(address_bytes(address, self.use_4byte_addr));
-        tx.extend(std::iter::repeat_n(0u8, length));
-        let mut rx = self.spi_command(&tx)?;
-        let addr_len = if self.use_4byte_addr { 4 } else { 3 };
-        // Reuse rx's allocation: drop the leading opcode+address echo and trailing
-        // bytes in place rather than copying the data slice into a fresh Vec.
-        rx.truncate(1 + addr_len + length);
-        rx.drain(..1 + addr_len);
-        Ok(rx)
+        hdr.extend(address_bytes(address, self.use_4byte_addr));
+        let mut rx = vec![0u8; 4 + CH347_MAX_SPI_PAYLOAD];
+        self.transport.write(&build_cs_xfer_packet(&hdr, true, 0))?;
+        self.transport.read_into(&mut rx[..4 + hdr.len()])?;
+
+        // Clock the data out: zeros shifted in clock bytes out, one reused
+        // packet + rx buffer per chunk.
+        let zeros = [0u8; CH347_MAX_SPI_PAYLOAD];
+        let mut pkt: Vec<u8> = Vec::with_capacity(4 + CH347_MAX_SPI_PAYLOAD);
+        let mut remaining = length;
+        while remaining > 0 {
+            let n = remaining.min(CH347_MAX_SPI_PAYLOAD);
+            pkt.clear();
+            pkt.push(CH347_CMD_SPI_CS_XFER);
+            pkt.push((n & 0xff) as u8);
+            pkt.push(((n >> 8) & 0xff) as u8);
+            pkt.push(0x00); // cs_assert=true, cs_index=0
+            pkt.extend_from_slice(&zeros[..n]);
+            self.transport.write(&pkt)?;
+            self.transport.read_into(&mut rx[..4 + n])?;
+            out.extend_from_slice(&rx[4..4 + n]);
+            remaining -= n;
+            if let Some(cb) = self.progress.as_mut() {
+                cb(out.len() as u64, length as u64);
+            }
+        }
+
+        // CS-deassert XFER (empty payload) terminates the transaction.
+        self.transport.write(&build_cs_xfer_packet(&[], false, 0))?;
+        let _drain = self.transport.read(4)?;
+        Ok(())
     }
 
     pub fn enter_4byte_mode(&mut self) -> Result<()> {
@@ -419,6 +507,22 @@ impl<T: Transport + Send> Ch347Backend<T> {
         if self.proto.use_4byte_addr() {
             let _ = self.proto.exit_4byte_mode();
         }
+    }
+
+    /// Standalone erase verbs arrive without a prior identify, so a >16 MB chip
+    /// would still be in power-on 3-byte mode and the erase address would silently
+    /// wrap at 16 MB — destroying the wrong sector. Identify first (which enters
+    /// 4-byte mode for big chips), then hard-refuse any range the active 3-byte
+    /// framing cannot express. `end` is exclusive.
+    fn prepare_erase_addressing(&mut self, end: u64) -> Result<()> {
+        self.identify_chip()?;
+        if !self.proto.use_4byte_addr() && end > ADDR_4BYTE_THRESHOLD {
+            return Err(BackendError::Other(format!(
+                "erase range ends at {end:#x} but the chip is in 3-byte address mode \
+                 (16 MB limit); a 3-byte frame would silently wrap and erase the wrong sector"
+            )));
+        }
+        Ok(())
     }
 
     /// Whole-chip read without the trailing EX4B: write_chip's backup step runs this
@@ -479,31 +583,31 @@ impl<T: Transport + Send> Ch347Backend<T> {
             )));
         }
         let page_size = chip.page_size.unwrap_or(256).max(1) as usize;
-        let sector_size = chip.sector_size.unwrap_or(4096).max(1);
 
         // Refuse protected silicon before the (possibly minutes-long) backup read:
         // a protected chip ignores erase/program and would fake-succeed.
         self.ensure_not_write_protected()?;
 
-        // 1. Back up current contents before overwriting (unless skipped).
+        // 1. Back up current contents before overwriting (unless skipped). The backup
+        //    goes to the persistent, owner-only per-user dir (temp_dir is wiped on
+        //    reboot and world-readable; dumps can carry NVRAM secrets).
         let backup_path = if opts.skip_backup {
             None
         } else {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("ratchet-backup-{}.bin", ts));
+            let path = super::backup::create_private_backup_path("ratchet-backup")?;
             self.read_chip_to_file(&path)?;
             Some(path.display().to_string())
         };
 
         // 2. Erase the sectors the image covers — program can only flip 1→0 (each sector_erase
-        //    now WREN + erase + WIP-wait). Previously write skipped erase entirely.
+        //    now WREN + erase + WIP-wait). The stride MUST match the issued opcode:
+        //    proto.sector_erase sends the 4 KB sector-erase (0x20/0x21), so stepping by the
+        //    DB's sectorSize (64 KB on 155 of 806 chips) would leave unerased gaps that AND
+        //    stale data into the image.
         let mut addr: u32 = 0;
         while (addr as usize) < firmware.len() {
             self.proto.sector_erase(addr)?;
-            addr = addr.saturating_add(sector_size);
+            addr = addr.saturating_add(4096);
         }
 
         // 3. Program page-by-page, never crossing a page boundary.
@@ -514,6 +618,9 @@ impl<T: Transport + Send> Ch347Backend<T> {
             self.proto
                 .page_program(offset as u32, &firmware[offset..chunk_end])?;
             offset = chunk_end;
+            if let Some(cb) = self.proto.progress.as_mut() {
+                cb(offset as u64, firmware.len() as u64);
+            }
         }
 
         // 4. Read back and compare unless skipped — no more hardcoded `verified: true`.
@@ -537,6 +644,17 @@ fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     hex_encode(&h.finalize())
+}
+
+/// The CH347 wire protocol carries 32-bit addresses; refuse anything wider
+/// instead of silently truncating with `as u32` (which would target the
+/// wrong sector on a hypothetical >4 GB part or a caller bug).
+fn checked_addr32(address: u64) -> Result<u32> {
+    u32::try_from(address).map_err(|_| {
+        BackendError::Other(format!(
+            "address {address:#x} exceeds the 32-bit range of the CH347 SPI framing"
+        ))
+    })
 }
 
 impl<T: Transport + Send> Backend for Ch347Backend<T> {
@@ -622,52 +740,85 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
 
     fn erase_chip(&mut self) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        self.proto.chip_erase()?;
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        // Identify to size the WIP timeout — chip-erase on 16-32 MB parts runs
+        // 200-400 s, far past the old fixed default. Unknown capacity gets the
+        // largest supported part's budget.
+        let res = self.identify_chip().and_then(|chip| {
+            let timeout = match chip {
+                Some(c) if c.size_bytes > 0 => {
+                    crate::backends::ch341a::erase_timeout_for(c.size_bytes)
+                }
+                _ => crate::backends::ch341a::erase_timeout_for(32 * 1024 * 1024),
+            };
+            let start = Instant::now();
+            self.proto.chip_erase_with_timeout(timeout)?;
+            Ok(EraseResult {
+                success: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+                error: None,
+            })
+        });
+        self.exit_4byte_if_entered();
+        res
     }
 
     fn sector_erase(&mut self, address: u64) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        self.proto.sector_erase(address as u32)?;
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        let res = self
+            .prepare_erase_addressing(address.saturating_add(1))
+            .and_then(|()| {
+                let start = Instant::now();
+                self.proto.sector_erase(checked_addr32(address)?)?;
+                Ok(EraseResult {
+                    success: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                })
+            });
+        self.exit_4byte_if_entered();
+        res
     }
 
     fn block_erase(&mut self, address: u64) -> Result<EraseResult> {
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        self.proto.block_erase_64k(address as u32)?;
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        let res = self
+            .prepare_erase_addressing(address.saturating_add(1))
+            .and_then(|()| {
+                let start = Instant::now();
+                self.proto.block_erase_64k(checked_addr32(address)?)?;
+                Ok(EraseResult {
+                    success: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                })
+            });
+        self.exit_4byte_if_entered();
+        res
     }
 
     fn region_erase(&mut self, start_addr: u64, length: u64) -> Result<EraseResult> {
         // Protection is checked once up front, not per sector.
         self.ensure_not_write_protected()?;
-        let start = Instant::now();
-        let mut addr = start_addr;
-        let end = start_addr + length;
-        while addr < end {
-            self.proto.sector_erase(addr as u32)?;
-            addr += 4096;
-        }
-        Ok(EraseResult {
-            success: true,
-            duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
-        })
+        let res = self
+            .prepare_erase_addressing(start_addr.saturating_add(length))
+            .and_then(|()| {
+                let start = Instant::now();
+                // Align down to the 4 KB sector grid like CH341A — the erase opcode
+                // wipes the whole containing sector regardless of the byte offset.
+                let mut addr = start_addr & !0xfff;
+                let end = start_addr + length;
+                while addr < end {
+                    self.proto.sector_erase(checked_addr32(addr)?)?;
+                    addr += 4096;
+                }
+                Ok(EraseResult {
+                    success: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                })
+            });
+        self.exit_4byte_if_entered();
+        res
     }
 
     fn is_write_protected(&mut self) -> Result<bool> {
@@ -681,6 +832,15 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
         // implementation) never cleared the BP bits at all.
         self.proto.spi_command(&[SPI_CMD_EWSR])?;
         self.proto.spi_command(&[SPI_CMD_WRSR, 0])?;
+        self.proto.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
+    }
+
+    fn restore_write_protection(&mut self, sr1: u8) -> Result<()> {
+        // Re-apply only the BP bits — writing the raw saved SR1 could set
+        // unrelated control bits (SRP, QE on some parts) by accident.
+        self.proto.spi_command(&[SPI_CMD_EWSR])?;
+        self.proto
+            .spi_command(&[SPI_CMD_WRSR, sr1 & SPI_SR_BP_MASK])?;
         self.proto.wait_until_ready(PAGE_PROGRAM_TIMEOUT)
     }
 
@@ -710,7 +870,20 @@ impl<T: Transport + Send> Backend for Ch347Backend<T> {
     }
 
     fn reset_chip(&mut self) -> Result<()> {
+        // JEDEC software reset: 0x66 (enable reset) then 0x99 (reset), each in
+        // its own CS frame, then a settle delay (tRST is ≤30 µs on common parts;
+        // 1 ms is comfortably safe). The previous implementation was a no-op
+        // that reported success.
+        self.proto.spi_command(&[SPI_CMD_RESET_ENABLE])?;
+        self.proto.spi_command(&[SPI_CMD_RESET])?;
+        std::thread::sleep(Duration::from_millis(1));
+        // Reset returns the chip to power-on state, including 3-byte addressing.
+        self.proto.set_4byte_addr(false);
         Ok(())
+    }
+
+    fn set_progress_callback(&mut self, cb: crate::backends::ProgressFn) {
+        self.proto.progress = Some(cb);
     }
 }
 
@@ -964,13 +1137,24 @@ mod tests {
 
     #[test]
     fn read_data_returns_payload_after_opcode_and_addr() {
-        // SPI echo: 4-byte CH347 header + 1 opcode + 3 addr + N data
-        let mut payload = vec![0u8; 4 + 1 + 3];
-        payload.extend(0..32u8);
-        let t = primed_transport(vec![payload, vec![0u8; 4]]);
+        // Streamed framing: read 1 echoes the opcode+address header (discarded),
+        // read 2 carries the data chunk behind the 4-byte CH347 header, read 3
+        // drains the CS-deassert.
+        let mut chunk = vec![0u8; 4];
+        chunk.extend(0..32u8);
+        let t = primed_transport(vec![
+            vec![0u8; 4 + 4], // header echo: CH347 hdr + opcode + 3 addr
+            chunk,
+            vec![0u8; 4], // deassert drain
+        ]);
         let mut p = Ch347Protocol::new(t);
         let out = p.read_data(0x10_0000, 32).unwrap();
         assert_eq!(out, (0..32u8).collect::<Vec<_>>());
+        // The header packet must carry READ (0x03) + the 3-byte address, and a
+        // trailing CS-deassert packet must terminate the stream.
+        let writes = &p.transport_mut().writes;
+        assert_eq!(&writes[0][4..8], &[SPI_CMD_READ, 0x10, 0x00, 0x00]);
+        assert_eq!(writes.last().unwrap(), &build_cs_xfer_packet(&[], false, 0));
     }
 
     #[test]
@@ -1036,11 +1220,133 @@ mod tests {
     }
 
     #[test]
+    fn cs_deasserted_after_midstream_error() {
+        // A transport whose reads fail mid-command (USB timeout). The CS-deassert
+        // framing (empty CS_XFER with the deassert bit) must still be written so
+        // the chip is not left selected for the next command.
+        struct FailReadTransport {
+            writes: Vec<Vec<u8>>,
+        }
+        impl Transport for FailReadTransport {
+            fn write(&mut self, d: &[u8]) -> Result<()> {
+                self.writes.push(d.to_vec());
+                Ok(())
+            }
+            fn read(&mut self, _len: usize) -> Result<Vec<u8>> {
+                Err(BackendError::Other("usb timeout".into()))
+            }
+        }
+        let mut p = Ch347Protocol::new(FailReadTransport { writes: Vec::new() });
+        p.spi_command(&[SPI_CMD_RDSR, 0]).unwrap_err();
+        let writes = &p.transport_mut().writes;
+        assert_eq!(
+            writes.last().unwrap(),
+            &build_cs_xfer_packet(&[], false, 0),
+            "CS must be deasserted after a mid-command transport error"
+        );
+    }
+
+    #[test]
+    fn short_transport_read_is_error_not_panic() {
+        // The old code sliced rx[4..4+chunk_len] straight out of the transport
+        // read — a short read panicked the process mid-operation. It must be a
+        // hard ShortTransfer error instead.
+        struct ShortTransport;
+        impl Transport for ShortTransport {
+            fn write(&mut self, _d: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn read(&mut self, len: usize) -> Result<Vec<u8>> {
+                Ok(vec![0u8; len.saturating_sub(1)])
+            }
+        }
+        let mut p = Ch347Protocol::new(ShortTransport);
+        let err = p.spi_command(&[SPI_CMD_RDSR, 0]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BackendError::Usb(ratchet_usb::UsbError::ShortTransfer { .. })
+            ),
+            "short transport read must be a hard error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn region_erase_uses_4byte_addressing_above_16mb() {
+        // W25Q256 (ef4019) = 32 MB. A standalone region-erase above 16 MB must
+        // identify first, enter 4-byte mode, issue the 4-byte sector-erase opcode
+        // (0x21) with all four address bytes, and exit 4-byte mode afterwards.
+        // The old path stayed in 3-byte mode and truncated the address (`as u32`),
+        // erasing the WRONG sector.
+        let t = primed_transport(vec![
+            vec![0u8; 4 + 2], // WP guard RDSR → unprotected
+            vec![0u8; 4],
+            vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x19], // RDID → W25Q256
+            vec![0u8; 4],
+        ]);
+        let mut b = Ch347Backend::new(t);
+        Backend::region_erase(&mut b, 0x0100_0000, 4096).unwrap();
+        assert!(
+            !b.protocol().use_4byte_addr(),
+            "must exit 4-byte mode afterwards"
+        );
+        let writes = &b.protocol().transport_mut().writes;
+        let sent = |op: u8| {
+            writes
+                .iter()
+                .any(|w| w.len() > 4 && w[0] == CH347_CMD_SPI_CS_XFER && w[4] == op)
+        };
+        assert!(
+            sent(SPI_CMD_ENTER_4BYTE),
+            "EN4B must be sent before erasing above 16 MB"
+        );
+        assert!(
+            writes.iter().any(|w| w.len() >= 9
+                && w[0] == CH347_CMD_SPI_CS_XFER
+                && w[4] == SPI_CMD_SECTOR_ERASE_4BYTE
+                && w[5..9] == [0x01, 0x00, 0x00, 0x00]),
+            "erase must use the 4-byte opcode (0x21) with the full 4-byte address"
+        );
+        assert!(
+            sent(SPI_CMD_EXIT_4BYTE),
+            "EX4B must restore 3-byte mode after the erase"
+        );
+    }
+
+    #[test]
+    fn region_erase_refuses_out_of_range_in_3byte_mode() {
+        // W25Q128 (ef4018) = 16 MB stays in 3-byte mode; a region beyond 16 MB
+        // cannot be expressed in a 3-byte frame and must be refused, not wrapped.
+        let t = primed_transport(vec![
+            vec![0u8; 4 + 2], // WP guard RDSR → unprotected
+            vec![0u8; 4],
+            vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x18], // RDID → W25Q128
+            vec![0u8; 4],
+        ]);
+        let mut b = Ch347Backend::new(t);
+        let err = Backend::region_erase(&mut b, 0x0100_0000, 4096).unwrap_err();
+        assert!(
+            format!("{err}").contains("3-byte"),
+            "refusal must explain the 3-byte addressing limit, got: {err}"
+        );
+        let writes = &b.protocol().transport_mut().writes;
+        assert!(
+            !writes.iter().any(|w| w.len() > 4
+                && w[0] == CH347_CMD_SPI_CS_XFER
+                && (w[4] == SPI_CMD_SECTOR_ERASE || w[4] == SPI_CMD_SECTOR_ERASE_4BYTE)),
+            "no erase opcode may reach the chip for an unaddressable range"
+        );
+    }
+
+    #[test]
     fn backend_verify_enters_and_exits_4byte_for_large_chip() {
         // A standalone verify of a >16 MB chip must identify first and enter 4-byte mode
         // (else it misaddresses the read-back), then EXIT 4-byte mode on completion so
         // the chip is not left misaddressing for the next tool.
-        let path = std::env::temp_dir().join("ratchet-ch347-verify-4b.bin");
+        let path = std::env::temp_dir().join(format!(
+            "ratchet-ch347-verify-4b-{}.bin",
+            std::process::id()
+        ));
         std::fs::write(&path, vec![0xa5u8; 32]).unwrap();
         let t = primed_transport(vec![vec![0u8, 0, 0, 0, 0xff, 0xef, 0x40, 0x19]]); // RDID → ef4019 (32 MB)
         let mut b = Ch347Backend::new(t);

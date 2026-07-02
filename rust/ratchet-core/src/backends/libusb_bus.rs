@@ -54,7 +54,13 @@ impl LibusbBus {
     }
 
     fn bulk_in_exact(&self, len: usize) -> Result<Vec<u8>> {
-        fill_exact(len, |chunk| {
+        let mut buf = vec![0u8; len];
+        self.bulk_in_exact_into(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn bulk_in_exact_into(&self, buf: &mut [u8]) -> Result<()> {
+        fill_exact_into(buf, |chunk| {
             self.handle
                 .bulk_in(self.ep_in, chunk, self.timeout_ms)
                 .map_err(BackendError::Usb)
@@ -62,15 +68,17 @@ impl LibusbBus {
     }
 }
 
-/// Read exactly `len` bytes by re-invoking `read` until the buffer is full.
+/// Fill `buf` exactly by re-invoking `read` until it is full. Borrowed-buffer
+/// form so hot paths (one call per 31-byte CH341A packet — ~270k per 8 MB read)
+/// reuse a single caller buffer instead of allocating a Vec per packet.
 /// A read that delivers 0 bytes means the device stopped responding mid-range;
 /// that is a hard `ShortTransfer` error, never zero-padding — padding would
 /// silently corrupt chip reads, verify passes, and pre-write backups.
-fn fill_exact<F>(len: usize, mut read: F) -> Result<Vec<u8>>
+fn fill_exact_into<F>(buf: &mut [u8], mut read: F) -> Result<()>
 where
     F: FnMut(&mut [u8]) -> Result<usize>,
 {
-    let mut buf = vec![0u8; len];
+    let len = buf.len();
     let mut filled = 0usize;
     while filled < len {
         let n = read(&mut buf[filled..])?;
@@ -82,7 +90,7 @@ where
         }
         filled += n;
     }
-    Ok(buf)
+    Ok(())
 }
 
 impl UsbBus for LibusbBus {
@@ -93,6 +101,10 @@ impl UsbBus for LibusbBus {
     fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
         self.bulk_in_exact(len)
     }
+
+    fn bulk_read_into(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.bulk_in_exact_into(buf)
+    }
 }
 
 impl Transport for LibusbBus {
@@ -102,6 +114,10 @@ impl Transport for LibusbBus {
 
     fn read(&mut self, len: usize) -> Result<Vec<u8>> {
         self.bulk_in_exact(len)
+    }
+
+    fn read_into(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.bulk_in_exact_into(buf)
     }
 }
 
@@ -121,17 +137,18 @@ mod tests {
 
     #[test]
     fn fill_exact_assembles_partial_reads() {
-        // Device delivers 3 bytes, then 2 — fill_exact must stitch them.
+        // Device delivers 3 bytes, then 2 — fill_exact_into must stitch them.
         let chunks: std::cell::RefCell<Vec<&[u8]>> =
             std::cell::RefCell::new(vec![&[1u8, 2, 3][..], &[4u8, 5][..]]);
-        let out = fill_exact(5, |dst| {
+        let mut out = [0u8; 5];
+        fill_exact_into(&mut out, |dst| {
             let mut c = chunks.borrow_mut();
             let chunk = c.remove(0);
             dst[..chunk.len()].copy_from_slice(chunk);
             Ok(chunk.len())
         })
         .expect("two partial reads fill the request");
-        assert_eq!(out, vec![1, 2, 3, 4, 5]);
+        assert_eq!(out, [1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -139,7 +156,8 @@ mod tests {
         // Device delivers 2 bytes then stops (0-byte read): must be an error
         // mentioning the short transfer, never a zero-padded success.
         let reads = std::cell::Cell::new(0u32);
-        let err = fill_exact(4, |dst| {
+        let mut out = [0u8; 4];
+        let err = fill_exact_into(&mut out, |dst| {
             if reads.get() == 0 {
                 reads.set(1);
                 dst[..2].copy_from_slice(&[0xAA, 0xBB]);
@@ -159,7 +177,8 @@ mod tests {
 
     #[test]
     fn fill_exact_propagates_read_errors() {
-        let err = fill_exact(8, |_| {
+        let mut out = [0u8; 8];
+        let err = fill_exact_into(&mut out, |_| {
             Err(BackendError::Usb(ratchet_usb::UsbError::Timeout))
         })
         .expect_err("underlying error propagates");
@@ -168,8 +187,7 @@ mod tests {
 
     #[test]
     fn fill_exact_zero_len_is_empty_ok() {
-        let out = fill_exact(0, |_| panic!("read must not be called for len 0")).unwrap();
-        assert!(out.is_empty());
+        fill_exact_into(&mut [], |_| panic!("read must not be called for len 0")).unwrap();
     }
 
     // Compile-time assertion: LibusbBus satisfies both trait bounds.

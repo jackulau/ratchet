@@ -1,96 +1,61 @@
-# biosMCP  -  Modern BIOS Chip Debugging & Programming MCP Server
+# ratchet  -  multi-protocol hardware debug + programming toolkit
 
-## Problem
-Existing BIOS programming tools (AsProgrammer, NeoProgrammer, SNANDer) are old, Windows-centric, GUI-only, and not agent-friendly. No modern tool lets AI agents autonomously detect, read, write, and debug BIOS chips via CH34x USB programmers.
+This file is the living task/architecture sketch for the workspace. The
+authoritative documentation is README.md; per-goal history lives in the goal
+logs. The original TypeScript-server-wrapping-external-tools plan documented
+here previously was fully replaced by the native Rust workspace in goal 004
+(`ts-final` git tag preserves that era).
 
-## Solution
-MCP server + CLI that wraps `flashrom` (battle-tested SPI backend) with agent-friendly tools for BIOS chip operations. Adds auto-detection, BIOS region analysis, safety checks, and modern DX.
+## Current Architecture
 
-## Architecture
 ```
 ┌─────────────────────────────────┐
-│  Claude / AI Agent              │
-│  (MCP client)                   │
+│  Human (CLI) / AI Agent (MCP)   │
 └──────────┬──────────────────────┘
-           │ MCP protocol (stdio)
+           │ clap CLI ─ or ─ JSON-RPC 2.0 over stdio (31 tools)
 ┌──────────▼──────────────────────┐
-│  biosMCP Server (TypeScript)    │
-│  ┌────────────┬────────────┐    │
-│  │ Tools      │ Analysis   │    │
-│  │ - detect   │ - regions  │    │
-│  │ - identify │ - headers  │    │
-│  │ - read     │ - checksum │    │
-│  │ - write    │ - diff     │    │
-│  │ - erase    │ - validate │    │
-│  │ - verify   │            │    │
-│  └─────┬──────┴────────────┘    │
-│        │                        │
-│  ┌─────▼──────────────────┐     │
-│  │ Backend Abstraction    │     │
-│  │ - flashrom (primary)   │     │
-│  │ - direct USB (future)  │     │
-│  └─────┬──────────────────┘     │
+│  Rust workspace (6 crates)      │
+│  ratchet-cli / ratchet-mcp      │
+│  ratchet-core                   │
+│   ├─ backends/ (ch341a, ch347,  │
+│   │   mock, factory, libusb_bus,│
+│   │   backup)                   │
+│   ├─ protocols/ programmers/    │
+│   ├─ workflows/ (repair pipeline)│
+│   ├─ analysis/ chips/ (806-chip │
+│   │   DB) debug/ instruments/   │
+│  ratchet-usb / ratchet-usb-sys  │
+│   (own libusb FFI - no rusb)    │
+│  ratchet-node (napi bridge)     │
 └────────┼────────────────────────┘
-         │ USB / libusb
+         │ libusb (custom bindgen bindings)
 ┌────────▼────────────────────────┐
-│  CH341A / CH347 Programmer      │
-│  → SPI Flash (BIOS chip)       │
+│  CH341A (1a86:5512)             │
+│  CH347  (1a86:55db / 55de)      │
+│  → SPI flash, I2C, JTAG IDCODE  │
 └─────────────────────────────────┘
 ```
 
-## Supported Hardware
-- **CH341A**  -  most common, SPI/I2C, 24MHz, primary target
-- **CH347**  -  newer, SPI/I2C/JTAG, faster, secondary target
-- **CH343**  -  UART-based, supported for serial debug console access
-- SPI flash chips: W25Qxx, MX25Lxx, SST25VFxx, EN25QHxx, GD25Qxx, etc.
-- I2C EEPROM: 24Cxx series
+No external programmer binaries: the SPI/I2C/JTAG paths speak the CH34x USB
+protocols directly. The mock backend (RATCHET_FORCE_MOCK=1) keeps every
+surface exercisable without hardware; destructive verbs refuse a silently
+selected mock.
 
-## MCP Tools
+## Status
 
-### Connection & Detection
-- `bios_detect_programmer`  -  detect connected CH34x programmer, return type/status
-- `bios_identify_chip`  -  read JEDEC ID, return chip model/size/capabilities
-- `bios_connection_status`  -  full status: programmer + chip + voltage
+Everything listed in README "What works today" is wired and smoke-tested
+(cli-smoke + mcp-smoke under forced mock, 470+ unit/integration tests).
+Honestly-unwired verb groups (UART open/sniff, 1-Wire, SWD, AVR-ISP,
+microwire, ESP, STM32, logic analyzer, Bus Pirate, CAN, monitor, serial
+connect) fail with explicit hw-unavailable errors - see README "Not wired
+yet".
 
-### Read Operations
-- `bios_read_chip`  -  read full chip contents to file, with progress
-- `bios_read_region`  -  read specific address range
-- `bios_read_id`  -  quick JEDEC ID read
+## Open follow-ups (candidate next goals)
 
-### Write Operations
-- `bios_write_chip`  -  write firmware file to chip (auto-backup first)
-- `bios_write_region`  -  write to specific address range
-- `bios_erase_chip`  -  full chip erase
-- `bios_verify`  -  verify chip contents match file
-
-### Analysis & Debug
-- `bios_analyze`  -  parse BIOS image: regions, headers, UEFI volumes
-- `bios_diff`  -  compare two BIOS images, show differences
-- `bios_checksum`  -  compute and verify checksums
-- `bios_dump_info`  -  human-readable BIOS image summary
-
-### Serial Debug (CH343)
-- `bios_serial_connect`  -  open serial debug console via CH343
-- `bios_serial_send`  -  send command over serial
-- `bios_serial_log`  -  capture serial output (POST codes, debug logs)
-
-## Safety
-- Auto-backup before any write operation
-- Verify-after-write by default
-- Chip write-protection check before write
-- Size mismatch detection (file vs chip)
-- Confirmation required for erase/write via agent
-
-## Tasks
-
-- [x] 1. Project scaffold (package.json, tsconfig, structure)
-- [x] 2. flashrom backend abstraction
-- [x] 3. Programmer detection tools
-- [x] 4. Chip identification tools
-- [x] 5. Read operations
-- [x] 6. Write operations (with safety)
-- [x] 7. BIOS image analysis
-- [x] 8. Serial debug tools (CH343)
-- [x] 9. CLI interface
-- [x] 10. MCP server wiring
-- [ ] 11. README and usage docs
+- [ ] Wire the remaining protocol verb groups to live transports (the big
+      one - each is its own epic; protocol logic is unit-tested already)
+- [ ] Distribution: GitHub Releases workflow, npm prebuilds for
+      ratchet-node, CHANGELOG, version bump past 2.0.0-alpha.1
+- [ ] Bundle a failure-pattern knowledge base for `failure-search`
+- [ ] Criterion benchmarks + real-hardware throughput numbers
+- [ ] macOS CI runner + MSRV check + cargo-audit

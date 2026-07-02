@@ -2,6 +2,7 @@
 // Keep surface minimal: anything specific to one programmer (e.g. CH341A SPI mode)
 // stays in that backend's module.
 
+pub mod backup;
 pub mod ch341a;
 pub mod ch347;
 pub mod errors;
@@ -33,7 +34,17 @@ pub enum BackendError {
 
 pub type Result<T> = std::result::Result<T, BackendError>;
 
+/// Progress observer for long hardware operations: called with
+/// `(bytes_done, bytes_total)` at chunk granularity. Installed via
+/// [`Backend::set_progress_callback`]; consumers (the CLI ticker) throttle
+/// their own output.
+pub type ProgressFn = Box<dyn FnMut(u64, u64) + Send>;
+
 pub trait Backend: Send {
+    /// Install a progress observer for long read/write/erase operations. The
+    /// default ignores it, so mocks and adapters are unaffected; the live
+    /// backends report per-chunk progress through it.
+    fn set_progress_callback(&mut self, _cb: ProgressFn) {}
     fn detect_programmer(&mut self) -> Result<ProgrammerInfo>;
     fn open(&mut self) -> Result<()>;
     fn close(&mut self) -> Result<()>;
@@ -50,6 +61,14 @@ pub trait Backend: Send {
     fn region_erase(&mut self, start_addr: u64, length: u64) -> Result<EraseResult>;
     fn is_write_protected(&mut self) -> Result<bool>;
     fn disable_write_protection(&mut self) -> Result<()>;
+    /// Re-apply previously saved SR1 block-protect bits (the counterpart of
+    /// `disable_write_protection`, used by full-repair to leave the chip as
+    /// protected as it found it). Default refuses rather than fake-succeeding.
+    fn restore_write_protection(&mut self, _sr1: u8) -> Result<()> {
+        Err(BackendError::Other(
+            "write-protection restore not supported by this backend".into(),
+        ))
+    }
     fn connection_test(&mut self) -> Result<ConnectionTestResult>;
     fn reset_chip(&mut self) -> Result<()>;
 }
@@ -82,4 +101,17 @@ pub fn reject_blank_image(firmware: &[u8]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Crate-wide lock for tests that mutate process environment variables.
+/// The libtest harness runs a crate's tests on parallel threads; two modules
+/// each holding their OWN env guard still race each other's set/remove/restore
+/// sequences (this bit backup.rs vs factory.rs under concurrent audit load).
+/// Every env-mutating test must hold THIS lock.
+#[cfg(test)]
+pub(crate) mod test_env {
+    pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }

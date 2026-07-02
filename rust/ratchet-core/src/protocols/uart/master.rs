@@ -25,7 +25,8 @@ pub enum Parity {
 }
 
 impl Parity {
-    fn to_ch347(self) -> Ch347Parity {
+    /// Map to the CH347 wire enum used by `hw::ch347_raw::build_uart_init`.
+    pub fn to_ch347(self) -> Ch347Parity {
         match self {
             Parity::None => Ch347Parity::None,
             Parity::Odd => Ch347Parity::Odd,
@@ -61,7 +62,8 @@ pub enum StopBits {
 }
 
 impl StopBits {
-    fn to_ch347(self) -> Ch347StopBits {
+    /// Map to the CH347 wire enum used by `hw::ch347_raw::build_uart_init`.
+    pub fn to_ch347(self) -> Ch347StopBits {
         match self {
             StopBits::One => Ch347StopBits::One,
             StopBits::OnePointFive => Ch347StopBits::OnePointFive,
@@ -163,34 +165,21 @@ impl<'b, B: UsbBus> Ch341aUart<'b, B> {
 // ─── CH347 native implementation ───────────────────────────────────────────
 
 pub struct Ch347Uart<'t, T: Ch347Transport> {
-    // Held to bind transport lifetime; real RX/TX path goes through `Ch347Raw` once hw lands.
-    #[allow(dead_code)]
-    raw: Ch347Raw<'t, T>,
+    // Held (never read) to keep the transport exclusively borrowed for the
+    // session; the real RX/TX path goes through `Ch347Raw` once hw lands.
+    // Underscore-named instead of allow(dead_code) so clippy stays honest.
+    _raw: Ch347Raw<'t, T>,
     pub cfg: UartConfig,
 }
 
 impl<'t, T: Ch347Transport> Ch347Uart<'t, T> {
     pub fn open(transport: &'t mut T, cfg: UartConfig) -> Result<Self> {
-        let mut raw = Ch347Raw::new(transport);
-        // Init packet uses the same `Parity`/`StopBits` we re-route to ch347_raw.
-        let pkt = crate::hw::ch347_raw::build_uart_init(
-            cfg.baud,
-            cfg.data_bits,
-            cfg.parity.to_ch347(),
-            cfg.stop_bits.to_ch347(),
-            cfg.flow_rts_cts,
-        );
-        // Use the underlying transport directly since Ch347Raw doesn't have a
-        // dedicated uart_init helper.
-        // Take a fresh reference via mem swap  -  pattern below uses raw transport.
-        // For simplicity we re-build via Ch347Raw and call its primitives instead.
-        // Actually `build_uart_init` is enough; just write it.
-        let _ = pkt;
-        let _ = &mut raw; // suppress unused
-                          // We need the transport directly here. Borrow through the raw layer:
-                          // Easier: drop raw, write the init via a fresh handle.
+        // The CH347 native UART engine is not wired to a live transport yet
+        // (the CLI `uart` verbs fail honestly, see README "Not wired yet").
+        // open() validates config plumbing and holds the transport exclusively;
+        // the `build_uart_init` packet goes out here once live RX/TX lands.
         Ok(Self {
-            raw: Ch347Raw::new(transport),
+            _raw: Ch347Raw::new(transport),
             cfg,
         })
     }
@@ -205,6 +194,28 @@ mod tests {
     use super::*;
     use crate::backends::ch341a::MockBus;
     use crate::backends::ch347::CapturingTransport;
+
+    #[test]
+    fn ch347_parity_and_stopbits_mapping() {
+        // Pin the CLI-enum → CH347-wire-enum mapping the UART init packet will
+        // use once the live RX/TX path lands.
+        for (p, want) in [
+            (Parity::None, Ch347Parity::None),
+            (Parity::Odd, Ch347Parity::Odd),
+            (Parity::Even, Ch347Parity::Even),
+            (Parity::Mark, Ch347Parity::Mark),
+            (Parity::Space, Ch347Parity::Space),
+        ] {
+            assert_eq!(p.to_ch347() as u8, want as u8);
+        }
+        for (s, want) in [
+            (StopBits::One, Ch347StopBits::One),
+            (StopBits::OnePointFive, Ch347StopBits::OnePointFive),
+            (StopBits::Two, Ch347StopBits::Two),
+        ] {
+            assert_eq!(s.to_ch347() as u8, want as u8);
+        }
+    }
 
     #[test]
     fn standard_8n1_config() {

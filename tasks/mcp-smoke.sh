@@ -3,7 +3,7 @@
 # stdio. Runs entirely against the mock backend (RATCHET_FORCE_MOCK=1) so no
 # hardware is required and no destructive op can ever touch real silicon.
 #
-# Asserts: initialize handshake, 30-tool surface, read-only calls succeed,
+# Asserts: initialize handshake, 31-tool surface, read-only calls succeed,
 # the confirm gate blocks destructive tools, a confirmed erase on the forced
 # mock succeeds (tagged backend:mock), failure_search errors honestly, and
 # transport-less hardware tools return JSON-RPC -32000.
@@ -64,12 +64,12 @@ check "initialize answers with protocolVersion + serverInfo" \
 
 # ── Tool surface ──
 TOOL_COUNT=$("$MCP" --list-tools | wc -l | tr -d ' ')
-if [ "$TOOL_COUNT" = "30" ]; then
+if [ "$TOOL_COUNT" = "31" ]; then
   PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))
-  FAILED_CHECKS+=("tool count $TOOL_COUNT != 30")
-  echo "  FAIL: tool count $TOOL_COUNT != 30" >&2
+  FAILED_CHECKS+=("tool count $TOOL_COUNT != 31")
+  echo "  FAIL: tool count $TOOL_COUNT != 31" >&2
 fi
 check "tools/list advertises the confirm-gated write_chip" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | tail -1)" \
@@ -82,6 +82,30 @@ check "identify succeeds" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"identify","arguments":{}}}' | tail -1)" '"result"'
 check "search_chips succeeds" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_chips","arguments":{"query":"W25Q64"}}}' | tail -1)" '"result"'
+check "sfdp succeeds" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sfdp","arguments":{}}}' | tail -1)" '"result"' 'density'
+check "wp_status reports protection fields" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wp_status","arguments":{}}}' | tail -1)" '"result"' 'write_protected'
+
+# read_chip → verify_chip → analyze_image against the same dump file.
+# NOTE: requests with an interpolated path are built in a variable FIRST —
+# macOS bash 3.2 mis-parses escaped quotes nested inside "$( ... )" and
+# brace-expands the request into fragments.
+SMOKE_TMP="$(mktemp -d)"
+trap 'rm -rf "$SMOKE_TMP"' EXIT
+DUMP="$SMOKE_TMP/mcp-dump.bin"
+REQ_READ='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_chip","arguments":{"output":"'$DUMP'"}}}'
+RESP_READ=$(rpc "$REQ_READ" | tail -1)
+check "read_chip dumps the mock chip" "$RESP_READ" '"result"' 'checksum'
+if [ -s "$DUMP" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILED_CHECKS+=("read_chip produced empty dump"); echo "  FAIL: read_chip produced empty dump" >&2
+fi
+REQ_VERIFY='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"verify_chip","arguments":{"file":"'$DUMP'"}}}'
+RESP_VERIFY=$(rpc "$REQ_VERIFY" | tail -1)
+check "verify_chip matches the fresh dump" "$RESP_VERIFY" '"result"' 'matches\\":true'
+REQ_ANALYZE='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analyze_image","arguments":{"file":"'$DUMP'"}}}'
+RESP_ANALYZE=$(rpc "$REQ_ANALYZE" | tail -1)
+check "analyze_image reports file size" "$RESP_ANALYZE" '"result"' 'fileSize'
 
 # ── Confirm gate: destructive tools refuse without confirm=true ──
 check "write_chip without confirm fails" \
@@ -90,6 +114,13 @@ check "erase_chip without confirm fails" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"erase_chip","arguments":{}}}' | tail -1)" '"error"' 'confirm'
 check "region_erase without confirm fails" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"region_erase","arguments":{"start":0,"length":4096}}}' | tail -1)" '"error"' 'confirm'
+check "i2c_write without confirm fails" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"i2c_write","arguments":{"addr":80,"data_hex":"00"}}}' | tail -1)" '"error"' 'confirm'
+check "wp_disable without confirm fails" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wp_disable","arguments":{}}}' | tail -1)" '"error"' 'confirm'
+check "wp_disable with confirm succeeds on forced mock" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wp_disable","arguments":{"confirm":true}}}' | tail -1)" \
+  '"result"' 'backend' 'mock'
 
 # ── Destructive op WITH confirm on the forced mock succeeds, tagged backend:mock ──
 check "erase_chip with confirm succeeds and reports mock backend" \

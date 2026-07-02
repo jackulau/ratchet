@@ -1,7 +1,7 @@
 // Mock backend  -  in-memory flash emulation. Used for tests and `RATCHET_FORCE_MOCK=1`.
 // Mirrors src/backends/mock.ts.
 
-use super::{Backend, BackendError, Result, WriteOpts};
+use super::{Backend, Result, WriteOpts};
 use crate::chips::{format_size, lookup_by_jedec_id};
 use crate::types::*;
 use sha2::{Digest, Sha256};
@@ -59,13 +59,17 @@ fn sha256_hex(data: &[u8]) -> String {
 
 impl Backend for MockBackend {
     fn detect_programmer(&mut self) -> Result<ProgrammerInfo> {
+        // The mock must never masquerade as real hardware in machine-readable
+        // output: it previously reported kind "ch341a" with the real VID/PID
+        // 1a86:5512, so an agent checking `detect` believed a programmer was
+        // attached. Every field now says mock.
         Ok(ProgrammerInfo {
-            kind: "ch341a".to_string(),
+            kind: "mock".to_string(),
             connected: true,
-            vendor_id: "1a86".to_string(),
-            product_id: "5512".to_string(),
-            description: "Mock CH341A (dry-run mode)".to_string(),
-            backend: "native".to_string(),
+            vendor_id: "0000".to_string(),
+            product_id: "0000".to_string(),
+            description: "Mock programmer (in-memory, no hardware)".to_string(),
+            backend: "mock".to_string(),
         })
     }
 
@@ -325,12 +329,11 @@ impl Backend for MockBackend {
     fn reset_chip(&mut self) -> Result<()> {
         Ok(())
     }
-}
 
-// Silence unused-import warnings if BackendError isn't referenced in this file directly.
-#[allow(dead_code)]
-fn _ensure_error_in_use() -> Option<BackendError> {
-    None
+    fn restore_write_protection(&mut self, sr1: u8) -> Result<()> {
+        self.write_protected = sr1 & 0x1c != 0;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +343,18 @@ mod tests {
 
     fn tmp_file(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ratchet-mock-test-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn detect_reports_mock_kind() {
+        // Machine-readable honesty: an agent inspecting detect output must be
+        // able to tell the mock from real silicon. No real kind, VID, or PID.
+        let mut m = MockBackend::default();
+        let info = m.detect_programmer().unwrap();
+        assert_eq!(info.kind, "mock");
+        assert_eq!(info.backend, "mock");
+        assert_ne!(info.vendor_id, "1a86", "mock must not claim the WCH VID");
+        assert_ne!(info.product_id, "5512", "mock must not claim a real PID");
     }
 
     #[test]

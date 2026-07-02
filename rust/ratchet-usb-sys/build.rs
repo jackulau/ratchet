@@ -19,7 +19,11 @@ fn main() {
         .prepend_enum_name(false)
         .derive_default(true)
         .derive_debug(true)
-        .layout_tests(false);
+        // Layout tests are the FFI boundary's only ground-truth verification:
+        // bindgen emits size/alignment assertions for every bound struct, so a
+        // header drift or ABI mismatch fails `cargo test -p ratchet-usb-sys`
+        // instead of corrupting memory at runtime.
+        .layout_tests(true);
 
     for path in &libusb.include_paths {
         builder = builder.clang_arg(format!("-I{}", path.display()));

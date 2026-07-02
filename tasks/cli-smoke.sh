@@ -82,8 +82,25 @@ head -c $((4 * 1024 * 1024)) "$RATCHET" > "$IMG"
 run "write (auto backup + verify)"      $RATCHET write "$IMG"
 run "write --skip-backup --skip-verify" $RATCHET write "$IMG" --skip-backup --skip-verify
 expect_fail "write refuses blank image" $RATCHET write "$DUMP"
-run "verify"             $RATCHET verify "$DUMP"
+# Exit-code contract (flashrom-style): verify exits 0 on a match, non-zero on a
+# mismatch — scripts gate on the exit code instead of parsing JSON. Mock state
+# is per-process, so the pristine dump matches and the derived image does not.
+run "verify matches"     $RATCHET verify "$DUMP"
+expect_fail "verify mismatch exits non-zero" $RATCHET verify "$IMG"
 run "erase"              $RATCHET erase
+run "region-erase"       $RATCHET region-erase 0 4096
+# Fresh mock is all-0xFF → blank; blank-check shares the verify exit contract.
+run "blank-check"        $RATCHET blank-check
+run "sfdp"               $RATCHET sfdp
+run "wp-disable (forced mock)" $RATCHET wp-disable
+
+# wp-status --json must carry the AgentEnvelope shape + the WP fields.
+WPS=$($RATCHET wp-status --json 2>/dev/null)
+if grep -q '"ok":true' <<<"$WPS" && grep -q '"command":"wp-status"' <<<"$WPS" && grep -q '"write_protected"' <<<"$WPS"; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1)); FAILED_CMDS+=("wp-status --json envelope shape"); echo "  FAIL: wp-status --json shape → $WPS" >&2
+fi
 
 # ── Whole-chip workflows (the pipelines a repair drives) ─────
 # full-backup writes ratchet-backup-<chip>.bin into CWD — run it inside the temp
@@ -97,6 +114,7 @@ run "full-repair"        $RATCHET full-repair
 # ── Pure analysis on the dump ────────────────────────────────
 run "analyze"            $RATCHET analyze "$DUMP"
 run "checksum"           $RATCHET checksum "$DUMP"
+run "diff"               $RATCHET diff "$DUMP" "$IMG"
 
 # ── Report ───────────────────────────────────────────────────
 echo ""

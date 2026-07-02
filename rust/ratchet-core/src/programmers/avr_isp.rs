@@ -276,8 +276,6 @@ pub struct AvrMockTransport {
     pub in_programming: bool,
     pub reset_high: bool,
     // Page-write scratch buffer (load-program-memory-page commands fill this before commit_page).
-    // Read by the page commit logic only  -  never observed externally, hence dead_code.
-    #[allow(dead_code)]
     page_buf: std::collections::HashMap<u16, u8>,
     pub xfers: Vec<[u8; 4]>,
 }
@@ -349,6 +347,22 @@ impl AvrIspTransport for AvrMockTransport {
                     self.eeprom[addr as usize] = cmd[3];
                 }
             }
+            (0x40 | 0x48, ah) => {
+                // Load program-memory page byte (0x40 low / 0x48 high) into the
+                // scratch buffer, keyed by BYTE address.
+                let word = ((ah as u16) << 8) | cmd[2] as u16;
+                let byte_addr = word * 2 + u16::from(cmd[0] == 0x48);
+                self.page_buf.insert(byte_addr, cmd[3]);
+            }
+            (0x4C, _) => {
+                // Write-program-memory-page: commit the scratch buffer to flash.
+                for (byte_addr, b) in self.page_buf.drain() {
+                    let a = byte_addr as usize;
+                    if a < self.flash.len() {
+                        self.flash[a] = b;
+                    }
+                }
+            }
             _ => {}
         }
         Ok(reply)
@@ -364,6 +378,21 @@ mod tests {
         let mut t = AvrMockTransport::new_atmega328p();
         let mut isp = AvrIsp::new(&mut t);
         isp.enter_programming().unwrap();
+    }
+
+    #[test]
+    fn flash_page_write_roundtrip() {
+        // load-program-memory-page (0x40/0x48) fills the scratch buffer; the
+        // write-page commit (0x4C) applies it to flash. Read back through the
+        // ISP read path to close the loop.
+        let mut t = AvrMockTransport::new_atmega328p();
+        let mut isp = AvrIsp::new(&mut t);
+        isp.enter_programming().unwrap();
+        isp.load_flash_page(0, 0xAB, false).unwrap(); // word 0, low byte
+        isp.load_flash_page(0, 0xCD, true).unwrap(); // word 0, high byte
+        isp.commit_flash_page(0).unwrap();
+        assert_eq!(isp.read_flash_byte(0, false).unwrap(), 0xAB);
+        assert_eq!(isp.read_flash_byte(0, true).unwrap(), 0xCD);
     }
 
     #[test]
