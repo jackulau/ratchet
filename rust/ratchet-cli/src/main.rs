@@ -1204,7 +1204,7 @@ fn progress_ticker(label: &'static str) -> ratchet_core::backends::ProgressFn {
             return;
         }
         last_tick = std::time::Instant::now();
-        let pct = if total > 0 { done * 100 / total } else { 0 };
+        let pct = (done * 100).checked_div(total).unwrap_or(0);
         let secs = start.elapsed().as_secs_f64();
         let rate_kib = if secs > 0.0 {
             done as f64 / secs / 1024.0
