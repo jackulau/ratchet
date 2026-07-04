@@ -518,12 +518,18 @@ fn open_dyn_with_kind() -> (Box<dyn Backend + Send>, BackendKind, Option<String>
     (r.backend, r.kind, r.warning, r.force_mock_env)
 }
 
-/// Open the backend for a DESTRUCTIVE verb (write / erase / region-erase /
-/// full-repair). Refuses to run when the factory silently fell back to mock:
-/// an agent that believes it flashed a BIOS while the bytes went to an
-/// in-memory fake is a bricked board waiting to happen. Explicitly setting
-/// RATCHET_FORCE_MOCK=1 remains allowed (test / smoke path).
-fn open_dyn_destructive(op: &str) -> anyhow::Result<(Box<dyn Backend + Send>, BackendKind)> {
+/// Open the backend for any verb that returns silicon data as authoritative —
+/// destructive writes (write / erase / region-erase / wp-disable) AND
+/// non-destructive chip reads (identify / read / verify / sfdp / wp-status /
+/// blank-check / full-backup). Refuses to run when the factory silently fell
+/// back to mock: an agent (or a `-v`-style script gating on exit code) that
+/// believes it flashed a BIOS — or read/verified/backed-up a real chip — while
+/// the bytes came from an in-memory fake is acting on a lie. The caller tags the
+/// result with `backend` via with_backend_field, so an explicit
+/// RATCHET_FORCE_MOCK=1 run (test / smoke path — still allowed) is always
+/// labelled `backend:"mock"`. `status` / `detect` keep the bare `open_dyn`:
+/// their whole job is to *report* the backend, mock included.
+fn open_dyn_checked(op: &str) -> anyhow::Result<(Box<dyn Backend + Send>, BackendKind)> {
     let r = open_default();
     if let Some(msg) = mock_fallback_error(op, r.kind, r.force_mock_env, r.warning.as_deref()) {
         anyhow::bail!(msg);
@@ -1137,9 +1143,9 @@ fn cmd_detect(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_identify(json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("identify")?;
     let info = m.identify_chip()?;
-    let env = AgentEnvelope::ok("identify", info.clone());
+    let env = AgentEnvelope::ok("identify", with_backend_field(&info, kind)?);
     emit_envelope(&env, json, || match &info {
         Some(c) => println!(
             "{} ({}) {} jedec={}",
@@ -1150,10 +1156,10 @@ fn cmd_identify(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("read")?;
     with_progress(&mut *m, "read", json);
     let r = m.read_chip(std::path::Path::new(output))?;
-    let env = AgentEnvelope::ok("read", r.clone());
+    let env = AgentEnvelope::ok("read", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || {
         println!(
             "read {} bytes → {} ({}ms)",
@@ -1164,7 +1170,7 @@ fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
 
 fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> anyhow::Result<()> {
     use ratchet_core::backends::WriteOpts;
-    let (mut m, kind) = open_dyn_destructive("write")?;
+    let (mut m, kind) = open_dyn_checked("write")?;
     with_progress(&mut *m, "write", json);
     let r = m.write_chip(
         std::path::Path::new(input),
@@ -1186,7 +1192,7 @@ fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> a
 }
 
 fn cmd_erase(json: bool) -> anyhow::Result<()> {
-    let (mut m, kind) = open_dyn_destructive("erase")?;
+    let (mut m, kind) = open_dyn_checked("erase")?;
     with_progress(&mut *m, "erase", json);
     let r = m.erase_chip()?;
     let env = AgentEnvelope::ok("erase", with_backend_field(&r, kind)?);
@@ -1238,10 +1244,10 @@ fn check_exit_code(ok: bool) -> i32 {
 }
 
 fn cmd_verify(file: &str, json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("verify")?;
     with_progress(&mut *m, "verify", json);
     let r = m.verify_chip(std::path::Path::new(file))?;
-    let env = AgentEnvelope::ok("verify", r.clone());
+    let env = AgentEnvelope::ok("verify", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || println!("matches={}", r.matches))?;
     let code = check_exit_code(r.matches);
     if code != 0 {
@@ -1432,9 +1438,9 @@ fn cmd_voltage_reference(jedec_id: &str, json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_sfdp(json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("sfdp")?;
     let s = m.read_sfdp()?;
-    let env = AgentEnvelope::ok("sfdp", s.clone());
+    let env = AgentEnvelope::ok("sfdp", with_backend_field(&s, kind)?);
     emit_envelope(&env, json, || {
         if let Some(s) = s {
             println!("density: {} bytes, page: {}", s.density_bytes, s.page_size);
@@ -1445,12 +1451,15 @@ fn cmd_sfdp(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_wp_status(json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("wp-status")?;
     let sr = m.read_status_registers()?;
     let wp = m.is_write_protected()?;
     let env = AgentEnvelope::ok(
         "wp-status",
-        json!({"write_protected": wp, "sr1": sr.sr1, "sr2": sr.sr2, "sr3": sr.sr3}),
+        with_backend_field(
+            &json!({"write_protected": wp, "sr1": sr.sr1, "sr2": sr.sr2, "sr3": sr.sr3}),
+            kind,
+        )?,
     );
     emit_envelope(&env, json, || println!("wp={wp} sr1=0x{:02x}", sr.sr1))
 }
@@ -1458,7 +1467,7 @@ fn cmd_wp_status(json: bool) -> anyhow::Result<()> {
 fn cmd_region_erase(start: &str, length: &str, json: bool) -> anyhow::Result<()> {
     let s = parse_addr(start)?;
     let l = parse_addr(length)?;
-    let (mut m, kind) = open_dyn_destructive("region-erase")?;
+    let (mut m, kind) = open_dyn_checked("region-erase")?;
     let r = m.region_erase(s, l)?;
     let env = AgentEnvelope::ok("region-erase", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || {
@@ -1467,7 +1476,7 @@ fn cmd_region_erase(start: &str, length: &str, json: bool) -> anyhow::Result<()>
 }
 
 fn cmd_blank_check(json: bool) -> anyhow::Result<()> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("blank-check")?;
     // Read the whole chip into a temp file and check every byte. Same path on
     // mock (instant) and real silicon (slow but accurate).
     let tmp = std::env::temp_dir().join(format!("ratchet-blank-check-{}.bin", std::process::id()));
@@ -1475,7 +1484,10 @@ fn cmd_blank_check(json: bool) -> anyhow::Result<()> {
     let data = std::fs::read(&tmp)?;
     let _ = std::fs::remove_file(&tmp);
     let blank = data.iter().all(|b| *b == 0xff);
-    let env = AgentEnvelope::ok("blank-check", json!({"blank": blank}));
+    let env = AgentEnvelope::ok(
+        "blank-check",
+        with_backend_field(&json!({"blank": blank}), kind)?,
+    );
     emit_envelope(&env, json, || println!("blank={blank}"))?;
     let code = check_exit_code(blank);
     if code != 0 {
@@ -1488,7 +1500,7 @@ fn cmd_wp_disable(json: bool) -> anyhow::Result<()> {
     // Mutates SR1 (clears the BP bits), so it runs behind the destructive gate:
     // a user hitting BackendError::WriteProtected needs an in-tool remedy, but
     // never against a silently-selected mock.
-    let (mut m, kind) = open_dyn_destructive("wp-disable")?;
+    let (mut m, kind) = open_dyn_checked("wp-disable")?;
     let before = m.is_write_protected()?;
     m.disable_write_protection()?;
     let after = m.is_write_protected()?;
@@ -1525,12 +1537,11 @@ fn cmd_repl() -> anyhow::Result<()> {
             break; // EOF (piped input or Ctrl-D)
         }
         let cmd = parse_line(&line);
-        // Destructive REPL commands share the CLI verbs' gate: refuse a
-        // silently-selected mock fallback (a "write success=true" against an
-        // in-memory fake is a bricked board waiting to happen). Explicit
-        // RATCHET_FORCE_MOCK=1 stays allowed.
-        if let Some(msg) = repl_destructive_refusal(&cmd, kind, force_mock_env, warning.as_deref())
-        {
+        // Hardware REPL commands share the CLI verbs' gate: refuse a
+        // silently-selected mock fallback (a "write success=true" — or an
+        // "identify: W25Q64" read — against an in-memory fake is a lie).
+        // Explicit RATCHET_FORCE_MOCK=1 stays allowed.
+        if let Some(msg) = repl_hw_refusal(&cmd, kind, force_mock_env, warning.as_deref()) {
             println!("error: {msg}");
             continue;
         }
@@ -1591,7 +1602,12 @@ fn cmd_repl() -> anyhow::Result<()> {
 /// The REPL's destructive-command gate: write / erase / sector-erase must refuse
 /// a silently-selected mock fallback exactly like the CLI verbs do. Returns the
 /// refusal message, or None when the command may run.
-fn repl_destructive_refusal(
+/// Refuse ANY hardware REPL command when the backend silently fell back to mock:
+/// the read commands (identify / jedec / status / read) misreport silicon just
+/// as much as the destructive ones (write / erase / sector-erase). Help / reset /
+/// macro / plugin / quit touch no chip data and stay allowed, as does an explicit
+/// RATCHET_FORCE_MOCK=1 run.
+fn repl_hw_refusal(
     cmd: &ratchet_core::repl::ReplCommand,
     kind: BackendKind,
     force_mock_env: bool,
@@ -1602,6 +1618,10 @@ fn repl_destructive_refusal(
         ReplCommand::Write { .. } => "write",
         ReplCommand::Erase => "erase",
         ReplCommand::SectorErase { .. } => "sector-erase",
+        ReplCommand::Identify => "identify",
+        ReplCommand::Jedec => "jedec",
+        ReplCommand::Status => "status",
+        ReplCommand::Read { .. } => "read",
         _ => return None,
     };
     mock_fallback_error(op, kind, force_mock_env, warning)
@@ -1658,7 +1678,7 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
     use ratchet_core::workflows::pipeline::{build_repair_pipeline, run_pipeline, PipelineContext};
     use ratchet_core::workflows::pipeline_adapter::BackendPipelineAdapter;
 
-    let (mut backend, kind) = open_dyn_destructive("full-repair")?;
+    let (mut backend, kind) = open_dyn_checked("full-repair")?;
     let mut adapter = BackendPipelineAdapter::new(&mut *backend);
     let mut ctx = PipelineContext::new(&mut adapter);
     if let Some(r) = reference {
@@ -1685,9 +1705,9 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
 
 fn cmd_full_backup(json: bool, force: bool) -> anyhow::Result<()> {
     // A full backup is a full-chip read to a descriptively named file, using
-    // the same wired SPI backend as `read`. (open_dyn warns on stderr when no
-    // device is present and it falls back to mock.)
-    let mut m = open_dyn();
+    // the same wired SPI backend as `read`. Guarded like `read`: refuses a
+    // silently-selected mock so a "backup" is never an in-memory fake dump.
+    let (mut m, kind) = open_dyn_checked("full-backup")?;
     let chip = m.identify_chip().ok().flatten();
     let label = chip
         .as_ref()
@@ -1705,7 +1725,10 @@ fn cmd_full_backup(json: bool, force: bool) -> anyhow::Result<()> {
     let r = m.read_chip(std::path::Path::new(&path))?;
     let env = AgentEnvelope::ok(
         "full-backup",
-        json!({ "output": r.file_path, "size_bytes": r.size_bytes, "duration_ms": r.duration_ms }),
+        with_backend_field(
+            &json!({ "output": r.file_path, "size_bytes": r.size_bytes, "duration_ms": r.duration_ms }),
+            kind,
+        )?,
     );
     emit_envelope(&env, json, || {
         println!("full-backup: {} bytes -> {}", r.size_bytes, r.file_path)
@@ -1818,36 +1841,50 @@ mod tests {
         assert!(mock_fallback_error("erase", BackendKind::Ch347, false, None).is_none());
     }
 
-    // REPL write/erase/sector-erase go through the same mock-fallback gate as
-    // the CLI verbs: silent mock → refused; explicit force-mock → allowed;
-    // real silicon and read-only commands → untouched.
+    // Every REPL hardware command goes through the same mock-fallback gate as
+    // the CLI verbs: silent mock → refused (destructive AND read — a mock
+    // "identify"/"read" lies about silicon just as much as a mock "write");
+    // explicit force-mock → allowed; real silicon and non-hardware commands
+    // (help/quit/macro) → untouched.
     #[test]
-    fn repl_refuses_destructive_on_silent_mock() {
+    fn repl_refuses_hw_ops_on_silent_mock() {
         use ratchet_core::repl::ReplCommand;
         let write = ReplCommand::Write {
             path: "x.bin".into(),
         };
-        let msg = repl_destructive_refusal(&write, BackendKind::Mock, false, Some("no device"))
+        let msg = repl_hw_refusal(&write, BackendKind::Mock, false, Some("no device"))
             .expect("silent-mock REPL write must be refused");
         assert!(msg.contains("mock fallback"));
-        assert!(
-            repl_destructive_refusal(&ReplCommand::Erase, BackendKind::Mock, false, None).is_some()
-        );
-        assert!(repl_destructive_refusal(
+        // Destructive commands refused on silent mock.
+        assert!(repl_hw_refusal(&ReplCommand::Erase, BackendKind::Mock, false, None).is_some());
+        assert!(repl_hw_refusal(
             &ReplCommand::SectorErase { address: 0 },
             BackendKind::Mock,
             false,
             None
         )
         .is_some());
+        // Read commands are ALSO refused on silent mock — mock chip data returned
+        // as a real read/identify is exactly the fake-success this gate closes.
+        assert!(repl_hw_refusal(&ReplCommand::Identify, BackendKind::Mock, false, None).is_some());
+        assert!(repl_hw_refusal(&ReplCommand::Jedec, BackendKind::Mock, false, None).is_some());
+        assert!(repl_hw_refusal(&ReplCommand::Status, BackendKind::Mock, false, None).is_some());
+        assert!(repl_hw_refusal(
+            &ReplCommand::Read {
+                path: "d.bin".into()
+            },
+            BackendKind::Mock,
+            false,
+            None
+        )
+        .is_some());
         // Explicit force-mock and real silicon stay allowed.
-        assert!(repl_destructive_refusal(&write, BackendKind::Mock, true, None).is_none());
-        assert!(repl_destructive_refusal(&write, BackendKind::Ch341a, false, None).is_none());
-        // Read-only commands never hit the gate, even on silent mock.
-        assert!(
-            repl_destructive_refusal(&ReplCommand::Identify, BackendKind::Mock, false, None)
-                .is_none()
-        );
+        assert!(repl_hw_refusal(&write, BackendKind::Mock, true, None).is_none());
+        assert!(repl_hw_refusal(&write, BackendKind::Ch341a, false, None).is_none());
+        assert!(repl_hw_refusal(&ReplCommand::Identify, BackendKind::Mock, true, None).is_none());
+        // Non-hardware commands never hit the gate, even on silent mock.
+        assert!(repl_hw_refusal(&ReplCommand::Help, BackendKind::Mock, false, None).is_none());
+        assert!(repl_hw_refusal(&ReplCommand::Quit, BackendKind::Mock, false, None).is_none());
     }
 
     // `ratchet verify` / `blank-check` are gateable like flashrom -v: a

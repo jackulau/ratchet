@@ -71,6 +71,14 @@ run "detect"             $RATCHET detect
 run "identify"           $RATCHET identify
 run "wp-status"          $RATCHET wp-status
 
+# Every read verb must carry backend:"mock" under forced mock, so a script (or
+# agent) can never mistake mock chip data for a real read. Silent-mock reads are
+# refused outright — same gate as the destructive verbs (unit-tested).
+IDJ=$($RATCHET identify --json 2>/dev/null)
+if grep -q '"backend":"mock"' <<<"$IDJ"; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILED_CMDS+=("identify --json backend:mock label"); echo "  FAIL: identify --json missing backend:mock → $IDJ" >&2
+fi
+
 # ── The motherboard-fix path: read → write → verify → erase ──
 DUMP="$TMP/dump.bin"
 run "read (backup)"      $RATCHET read "$DUMP"

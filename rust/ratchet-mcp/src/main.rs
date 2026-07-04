@@ -27,13 +27,18 @@ fn open_dyn() -> Box<dyn Backend + Send> {
     r.backend
 }
 
-/// Open the backend for a DESTRUCTIVE tool (write_chip / erase_chip /
-/// region_erase). Refuses to run when the factory silently fell back to mock:
-/// an agent that believes it flashed a BIOS while the bytes went to an
-/// in-memory fake is a bricked board waiting to happen. Explicitly setting
-/// RATCHET_FORCE_MOCK=1 remains allowed (test / smoke path).
+/// Open the backend for any tool that returns silicon data as authoritative —
+/// destructive writes (write_chip / erase_chip / region_erase / wp_disable) AND
+/// non-destructive chip reads (identify / sfdp / wp_status / read / verify /
+/// blank_check). Refuses to run when the factory silently fell back to mock: an
+/// agent that believes it flashed a BIOS — or read/verified/blank-checked a real
+/// chip — while the bytes came from an in-memory fake is acting on a lie, and the
+/// lone stderr warning never reaches the JSON-RPC result an agent consumes. The
+/// caller tags the result with `backend` via with_backend_field, so an explicit
+/// RATCHET_FORCE_MOCK=1 run (test / smoke path — still allowed) is always
+/// labelled `backend:"mock"`.
 #[allow(clippy::type_complexity)]
-fn open_dyn_destructive(op: &str) -> Result<(Box<dyn Backend + Send>, BackendKind), (i32, String)> {
+fn open_dyn_checked(op: &str) -> Result<(Box<dyn Backend + Send>, BackendKind), (i32, String)> {
     let r = open_default();
     if r.kind == BackendKind::Mock && !r.force_mock_env {
         return Err((
@@ -51,8 +56,8 @@ fn open_dyn_destructive(op: &str) -> Result<(Box<dyn Backend + Send>, BackendKin
     Ok((r.backend, r.kind))
 }
 
-/// Tag a destructive-op result with the backend kind so agents can tell real
-/// silicon results from explicitly-mocked ones.
+/// Tag a hardware result (destructive op OR chip read) with the backend kind so
+/// agents can tell real silicon results from explicitly-mocked ones.
 fn with_backend_field(v: Value, kind: BackendKind) -> Value {
     let mut v = v;
     if let Some(obj) = v.as_object_mut() {
@@ -687,27 +692,36 @@ fn call_detect() -> Result<Value, (i32, String)> {
 }
 
 fn call_identify() -> Result<Value, (i32, String)> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("identify")?;
     let info = m.identify_chip().map_err(map_err)?;
-    Ok(serde_json::to_value(&info).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&info).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_sfdp() -> Result<Value, (i32, String)> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("sfdp")?;
     let s = m.read_sfdp().map_err(map_err)?;
-    Ok(serde_json::to_value(&s).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&s).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_wp_status() -> Result<Value, (i32, String)> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("wp_status")?;
     let sr = m.read_status_registers().map_err(map_err)?;
     let wp = m.is_write_protected().map_err(map_err)?;
-    Ok(json!({"write_protected": wp, "sr1": sr.sr1, "sr2": sr.sr2, "sr3": sr.sr3}))
+    Ok(with_backend_field(
+        json!({"write_protected": wp, "sr1": sr.sr1, "sr2": sr.sr2, "sr3": sr.sr3}),
+        kind,
+    ))
 }
 
 fn call_wp_disable() -> Result<Value, (i32, String)> {
     // Mutates SR1 (clears the BP bits) — destructive gate + confirm required.
-    let (mut m, kind) = open_dyn_destructive("wp_disable")?;
+    let (mut m, kind) = open_dyn_checked("wp_disable")?;
     let before = m.is_write_protected().map_err(map_err)?;
     m.disable_write_protection().map_err(map_err)?;
     let after = m.is_write_protected().map_err(map_err)?;
@@ -725,11 +739,14 @@ fn call_wp_disable() -> Result<Value, (i32, String)> {
 
 fn call_read_chip(args: &Value) -> Result<Value, (i32, String)> {
     let output = arg_str(args, "output")?;
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("read_chip")?;
     let r = m
         .read_chip(std::path::Path::new(&output))
         .map_err(map_err)?;
-    Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&r).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_write_chip(args: &Value) -> Result<Value, (i32, String)> {
@@ -739,7 +756,7 @@ fn call_write_chip(args: &Value) -> Result<Value, (i32, String)> {
         skip_backup: arg_bool(args, "skip_backup"),
         skip_verify: arg_bool(args, "skip_verify"),
     };
-    let (mut m, kind) = open_dyn_destructive("write_chip")?;
+    let (mut m, kind) = open_dyn_checked("write_chip")?;
     let r = m
         .write_chip(std::path::Path::new(&input), opts)
         .map_err(map_err)?;
@@ -751,15 +768,18 @@ fn call_write_chip(args: &Value) -> Result<Value, (i32, String)> {
 
 fn call_verify_chip(args: &Value) -> Result<Value, (i32, String)> {
     let file = arg_str(args, "file")?;
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("verify_chip")?;
     let r = m
         .verify_chip(std::path::Path::new(&file))
         .map_err(map_err)?;
-    Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+    Ok(with_backend_field(
+        serde_json::to_value(&r).unwrap_or(Value::Null),
+        kind,
+    ))
 }
 
 fn call_erase_chip() -> Result<Value, (i32, String)> {
-    let (mut m, kind) = open_dyn_destructive("erase_chip")?;
+    let (mut m, kind) = open_dyn_checked("erase_chip")?;
     let r = m.erase_chip().map_err(map_err)?;
     Ok(with_backend_field(
         serde_json::to_value(&r).unwrap_or(Value::Null),
@@ -770,7 +790,7 @@ fn call_erase_chip() -> Result<Value, (i32, String)> {
 fn call_region_erase(args: &Value) -> Result<Value, (i32, String)> {
     let start = arg_u64(args, "start")?;
     let length = arg_u64(args, "length")?;
-    let (mut m, kind) = open_dyn_destructive("region_erase")?;
+    let (mut m, kind) = open_dyn_checked("region_erase")?;
     let r = m.region_erase(start, length).map_err(map_err)?;
     Ok(with_backend_field(
         serde_json::to_value(&r).unwrap_or(Value::Null),
@@ -779,7 +799,7 @@ fn call_region_erase(args: &Value) -> Result<Value, (i32, String)> {
 }
 
 fn call_blank_check() -> Result<Value, (i32, String)> {
-    let mut m = open_dyn();
+    let (mut m, kind) = open_dyn_checked("blank_check")?;
     let tmp = std::env::temp_dir().join(format!(
         "ratchet-mcp-blank-check-{}.bin",
         std::process::id()
@@ -788,7 +808,7 @@ fn call_blank_check() -> Result<Value, (i32, String)> {
     let data = std::fs::read(&tmp).map_err(|e| (-32000, e.to_string()))?;
     let _ = std::fs::remove_file(&tmp);
     let blank = data.iter().all(|b| *b == 0xff);
-    Ok(json!({"blank": blank}))
+    Ok(with_backend_field(json!({"blank": blank}), kind))
 }
 
 fn call_analyze_image(args: &Value) -> Result<Value, (i32, String)> {
