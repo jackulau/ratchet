@@ -124,8 +124,25 @@ pub fn address_bytes(addr: u64, use_4byte: bool) -> Vec<u8> {
     }
 }
 
+/// Reverse the bit order of every byte in place.
+///
+/// The CH341A's SPI stream engine (CMD_SPI_STREAM, 0xA8) shifts data **LSB
+/// first** — there is no hardware config to change it. SPI flash chips expect
+/// MSB first, so every payload byte must be bit-reversed on the way out AND
+/// every received byte bit-reversed on the way in (flashrom's ch341a_spi.c
+/// does exactly this). Without it the chip hears 0x9F as 0xF9, ignores the
+/// command, and every read comes back 0x00 — indistinguishable from a dead
+/// bus. UIO packets (CS control, mode setup) are NOT SPI data and must never
+/// be reversed.
+pub fn reverse_bits_in_place(buf: &mut [u8]) {
+    for b in buf {
+        *b = b.reverse_bits();
+    }
+}
+
 /// Chunk an SPI tx stream into CH341A USB packets.
-/// Each packet starts with CMD_SPI_STREAM and carries up to 31 SPI data bytes.
+/// Each packet starts with CMD_SPI_STREAM and carries up to 31 SPI data bytes,
+/// bit-reversed for the CH341A's LSB-first shifter (see reverse_bits_in_place).
 pub fn spi_stream_chunks(tx: &[u8]) -> Vec<Vec<u8>> {
     let max_payload = MAX_XFER - 1; // 31 SPI bytes per USB packet
     let mut out = Vec::new();
@@ -135,6 +152,7 @@ pub fn spi_stream_chunks(tx: &[u8]) -> Vec<Vec<u8>> {
         let mut packet = Vec::with_capacity(chunk_len + 1);
         packet.push(CMD_SPI_STREAM);
         packet.extend_from_slice(&tx[offset..offset + chunk_len]);
+        reverse_bits_in_place(&mut packet[1..]);
         out.push(packet);
         offset += chunk_len;
     }
@@ -270,8 +288,12 @@ impl<B: UsbBus> CH341ABackend<B> {
             packet.clear();
             packet.push(CMD_SPI_STREAM);
             packet.extend_from_slice(&cmd[offset..offset + chunk_len]);
+            // CH341A shifts LSB-first: payload out AND rx back must be
+            // bit-reversed (see reverse_bits_in_place).
+            reverse_bits_in_place(&mut packet[1..]);
             bus.bulk_write(&packet)?;
-            let r = bus.bulk_read(chunk_len)?;
+            let mut r = bus.bulk_read(chunk_len)?;
+            reverse_bits_in_place(&mut r);
             rx.extend_from_slice(&r);
             offset += chunk_len;
         }
@@ -365,6 +387,10 @@ impl<B: UsbBus> CH341ABackend<B> {
         packet.push(CMD_SPI_STREAM);
         packet.push(SPI_READ);
         packet.extend(address_bytes(start_addr, use_4byte));
+        // LSB-first shifter: reverse the opcode+address payload (the 0x00 dummy
+        // bytes in the data loop below are bit-order invariant, so only the rx
+        // side needs reversal there).
+        reverse_bits_in_place(&mut packet[1..]);
         let header_len = packet.len() - 1;
         bus.bulk_write(&packet)?;
         // One reused rx buffer for the echo and every data chunk: an 8 MB dump
@@ -384,6 +410,8 @@ impl<B: UsbBus> CH341ABackend<B> {
             packet.extend_from_slice(&zeros[..n]);
             bus.bulk_write(&packet)?;
             bus.bulk_read_into(&mut rx[..n])?;
+            // Chip data arrives LSB-first from the CH341A shifter.
+            reverse_bits_in_place(&mut rx[..n]);
             buf.extend_from_slice(&rx[..n]);
             if let Some(cb) = progress.as_deref_mut() {
                 cb(buf.len() as u64, len as u64);
@@ -877,6 +905,31 @@ mod tests {
         std::env::temp_dir().join(format!("ratchet-test-{}-{}", std::process::id(), name))
     }
 
+    /// Chip-semantic bytes → wire form. The CH341A shifter is LSB-first, so
+    /// this is what a MockBus must return for the driver's rx reversal to hand
+    /// back these bytes. Keeps test literals readable (0xef 0x40 0x17, not
+    /// their mirror images).
+    fn chip_rx(mut data: Vec<u8>) -> Vec<u8> {
+        reverse_bits_in_place(&mut data);
+        data
+    }
+
+    /// Recorded bus writes with every CMD_SPI_STREAM payload reversed back to
+    /// chip semantics, so asserts read as the CHIP sees them. UIO packets
+    /// (CS / mode setup) pass through untouched.
+    fn chip_writes(writes: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        writes
+            .iter()
+            .map(|w| {
+                let mut w = w.clone();
+                if w.first() == Some(&CMD_SPI_STREAM) {
+                    reverse_bits_in_place(&mut w[1..]);
+                }
+                w
+            })
+            .collect()
+    }
+
     #[test]
     fn enable_spi_mode_packet_layout() {
         let pkt = enable_spi_mode_packet();
@@ -922,7 +975,9 @@ mod tests {
         let chunks = spi_stream_chunks(&tx);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0][0], CMD_SPI_STREAM);
-        assert_eq!(&chunks[0][1..], &tx[..]);
+        // Payload goes out bit-reversed for the CH341A's LSB-first shifter.
+        let wire: Vec<u8> = tx.iter().map(|b| b.reverse_bits()).collect();
+        assert_eq!(&chunks[0][1..], &wire[..]);
     }
 
     #[test]
@@ -965,26 +1020,29 @@ mod tests {
         let mut backend = CH341ABackend::with_bus(MockBus::new());
         backend.open().unwrap();
         let bus = backend.bus.as_ref().unwrap();
-        assert_eq!(bus.writes.len(), 1);
-        assert_eq!(bus.writes[0], enable_spi_mode_packet().to_vec());
+        assert_eq!(chip_writes(&bus.writes).len(), 1);
+        assert_eq!(
+            chip_writes(&bus.writes)[0],
+            enable_spi_mode_packet().to_vec()
+        );
     }
 
     #[test]
     fn backend_rdid_wraps_in_cs_pulses_and_returns_decoded_id() {
         let mut bus = MockBus::new();
         // Response to bulk_read after the 4-byte SPI_RDID: cmd echo + 3 ID bytes.
-        bus.queue_read(vec![0x00, 0xef, 0x40, 0x17]);
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x17]));
         let mut backend = CH341ABackend::with_bus(bus);
         let id = backend.rdid().unwrap();
         assert_eq!(id.to_hex(), "ef4017");
 
         // Writes: cs_assert, spi_stream_packet(RDID+3x0), cs_deassert.
         let bus = backend.bus.as_ref().unwrap();
-        assert_eq!(bus.writes.len(), 3);
-        assert_eq!(bus.writes[0], cs_assert_packet().to_vec());
-        assert_eq!(bus.writes[1][0], CMD_SPI_STREAM);
-        assert_eq!(bus.writes[1][1], SPI_RDID);
-        assert_eq!(bus.writes[2], cs_deassert_packet().to_vec());
+        assert_eq!(chip_writes(&bus.writes).len(), 3);
+        assert_eq!(chip_writes(&bus.writes)[0], cs_assert_packet().to_vec());
+        assert_eq!(chip_writes(&bus.writes)[1][0], CMD_SPI_STREAM);
+        assert_eq!(chip_writes(&bus.writes)[1][1], SPI_RDID);
+        assert_eq!(chip_writes(&bus.writes)[2], cs_deassert_packet().to_vec());
     }
 
     #[test]
@@ -993,17 +1051,16 @@ mod tests {
         // Write-protect guard RDSR, identify RDID (zeros → unknown), WREN read,
         // CHIP_ERASE read, then one RDSR poll whose byte[1]=0 → WIP clear.
         for _ in 0..5 {
-            bus.queue_read(vec![0; 8]);
+            bus.queue_read(chip_rx(vec![0; 8]));
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.erase_chip().unwrap();
         let bus = backend.bus.as_ref().unwrap();
         // Frames: [guard RDSR][RDID][WREN][CHIP_ERASE][poll RDSR], 3 writes each (cs, pkt, cs).
-        assert_eq!(bus.writes[7][1], SPI_WREN);
-        assert_eq!(bus.writes[10][1], SPI_CHIP_ERASE);
+        assert_eq!(chip_writes(&bus.writes)[7][1], SPI_WREN);
+        assert_eq!(chip_writes(&bus.writes)[10][1], SPI_CHIP_ERASE);
         // A WIP poll (RDSR 0x05) must follow the erase — otherwise we'd race the busy chip.
-        assert!(bus
-            .writes
+        assert!(chip_writes(&bus.writes)
             .iter()
             .any(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_RDSR));
     }
@@ -1014,8 +1071,8 @@ mod tests {
         // implementation was a no-op Ok(()) — the REPL printed "reset ok" while
         // nothing reached the chip.
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0u8; 8]); // 0x66 echo
-        bus.queue_read(vec![0u8; 8]); // 0x99 echo
+        bus.queue_read(chip_rx(vec![0u8; 8])); // 0x66 echo
+        bus.queue_read(chip_rx(vec![0u8; 8])); // 0x99 echo
         let mut backend = CH341ABackend::with_bus(bus);
         backend.use_4byte_addr = true;
         backend.reset_chip().unwrap();
@@ -1023,7 +1080,7 @@ mod tests {
             !backend.use_4byte_addr,
             "reset returns the chip to power-on 3-byte addressing"
         );
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         let ops: Vec<u8> = writes
             .iter()
             .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM)
@@ -1055,11 +1112,11 @@ mod tests {
     fn erase_chip_refuses_when_write_protected() {
         let mut bus = MockBus::new();
         // Guard RDSR returns BP bits set → must refuse before any WREN/CHIP_ERASE.
-        bus.queue_read(vec![0x00, SR_BP_MASK]);
+        bus.queue_read(chip_rx(vec![0x00, SR_BP_MASK]));
         let mut backend = CH341ABackend::with_bus(bus);
         let err = backend.erase_chip().unwrap_err();
         assert!(matches!(err, BackendError::WriteProtected));
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         assert!(
             !writes.iter().any(|w| w.len() >= 2
                 && w[0] == CMD_SPI_STREAM
@@ -1071,7 +1128,7 @@ mod tests {
     #[test]
     fn sector_erase_refuses_when_write_protected() {
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0x00, SR_BP_MASK]);
+        bus.queue_read(chip_rx(vec![0x00, SR_BP_MASK]));
         let mut backend = CH341ABackend::with_bus(bus);
         let err = backend.sector_erase(0).unwrap_err();
         assert!(matches!(err, BackendError::WriteProtected));
@@ -1085,7 +1142,7 @@ mod tests {
         let path = test_tmp("unknown-capacity.bin");
         std::fs::write(&path, vec![0xa5u8; 64]).unwrap();
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0x00, 0xaa, 0xbb, 0x11]);
+        bus.queue_read(chip_rx(vec![0x00, 0xaa, 0xbb, 0x11]));
         let mut backend = CH341ABackend::with_bus(bus);
         let err = backend
             .write_chip(
@@ -1103,13 +1160,13 @@ mod tests {
     #[test]
     fn disable_write_protection_polls_wip_after_wrsr() {
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0u8; 8]); // EWSR
-        bus.queue_read(vec![0u8; 8]); // WRSR
-        bus.queue_read(vec![0x00, SR_WIP]); // status-register write still running
-        bus.queue_read(vec![0x00, 0x00]); // done
+        bus.queue_read(chip_rx(vec![0u8; 8])); // EWSR
+        bus.queue_read(chip_rx(vec![0u8; 8])); // WRSR
+        bus.queue_read(chip_rx(vec![0x00, SR_WIP])); // status-register write still running
+        bus.queue_read(chip_rx(vec![0x00, 0x00])); // done
         let mut backend = CH341ABackend::with_bus(bus);
         backend.disable_write_protection().unwrap();
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         let rdsr_polls = writes
             .iter()
             .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_RDSR)
@@ -1129,9 +1186,9 @@ mod tests {
         let path = test_tmp("erase-stride.bin");
         std::fs::write(&path, vec![0xa5u8; 8192]).unwrap();
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0x00, 0x1c, 0x20, 0x10]); // RDID → EN25P05 (64 KB, sectorSize 64 KB)
+        bus.queue_read(chip_rx(vec![0x00, 0x1c, 0x20, 0x10])); // RDID → EN25P05 (64 KB, sectorSize 64 KB)
         for _ in 0..600 {
-            bus.queue_read(vec![0u8; 40]); // WP guard, WREN/erase/poll, program chunks
+            bus.queue_read(chip_rx(vec![0u8; 40])); // WP guard, WREN/erase/poll, program chunks
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend
@@ -1143,7 +1200,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         let erase_addrs: Vec<u32> = writes
             .iter()
             .filter(|w| w.len() >= 5 && w[0] == CMD_SPI_STREAM && w[1] == SPI_SECTOR_ERASE)
@@ -1164,17 +1221,17 @@ mod tests {
         // (0x21) with all four address bytes, and exit 4-byte mode afterwards.
         // Without that, the 3-byte frame wraps and the WRONG sector is destroyed.
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0x00, 0x00]); // WP guard RDSR → unprotected
-        bus.queue_read(vec![0x00, 0xef, 0x40, 0x19]); // RDID → W25Q256
-        bus.queue_read(vec![0u8; 8]); // EN4B
-        bus.queue_read(vec![0u8; 8]); // WREN
-        bus.queue_read(vec![0u8; 8]); // sector erase cmd
-        bus.queue_read(vec![0x00, 0x00]); // WIP poll → ready
-        bus.queue_read(vec![0u8; 8]); // EX4B
+        bus.queue_read(chip_rx(vec![0x00, 0x00])); // WP guard RDSR → unprotected
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x19])); // RDID → W25Q256
+        bus.queue_read(chip_rx(vec![0u8; 8])); // EN4B
+        bus.queue_read(chip_rx(vec![0u8; 8])); // WREN
+        bus.queue_read(chip_rx(vec![0u8; 8])); // sector erase cmd
+        bus.queue_read(chip_rx(vec![0x00, 0x00])); // WIP poll → ready
+        bus.queue_read(chip_rx(vec![0u8; 8])); // EX4B
         let mut backend = CH341ABackend::with_bus(bus);
         backend.region_erase(0x0100_0000, 4096).unwrap();
         assert!(!backend.use_4byte_addr, "must exit 4-byte mode afterwards");
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         assert!(
             writes
                 .iter()
@@ -1201,15 +1258,15 @@ mod tests {
         // W25Q128 (ef4018) = 16 MB stays in 3-byte mode; a region beyond 16 MB
         // cannot be expressed in a 3-byte frame and must be refused, not wrapped.
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0x00, 0x00]); // WP guard RDSR → unprotected
-        bus.queue_read(vec![0x00, 0xef, 0x40, 0x18]); // RDID → W25Q128
+        bus.queue_read(chip_rx(vec![0x00, 0x00])); // WP guard RDSR → unprotected
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x18])); // RDID → W25Q128
         let mut backend = CH341ABackend::with_bus(bus);
         let err = backend.region_erase(0x0100_0000, 4096).unwrap_err();
         assert!(
             format!("{err}").contains("3-byte"),
             "refusal must explain the 3-byte addressing limit, got: {err}"
         );
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         assert!(
             !writes.iter().any(|w| w.len() >= 2
                 && w[0] == CMD_SPI_STREAM
@@ -1223,12 +1280,12 @@ mod tests {
         // Restore must re-apply the saved BP bits via EWSR+WRSR (masked to the
         // BP field so stray SRP/QE bits are never written) and poll WIP.
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0u8; 8]); // EWSR
-        bus.queue_read(vec![0u8; 8]); // WRSR
-        bus.queue_read(vec![0x00, 0x00]); // WIP poll → done
+        bus.queue_read(chip_rx(vec![0u8; 8])); // EWSR
+        bus.queue_read(chip_rx(vec![0u8; 8])); // WRSR
+        bus.queue_read(chip_rx(vec![0x00, 0x00])); // WIP poll → done
         let mut backend = CH341ABackend::with_bus(bus);
         backend.restore_write_protection(0xfc).unwrap();
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         let wrsr = writes
             .iter()
             .find(|w| w.len() >= 3 && w[0] == CMD_SPI_STREAM && w[1] == SPI_WRSR)
@@ -1253,9 +1310,9 @@ mod tests {
         let path = test_tmp("ex4b-verify.bin");
         std::fs::write(&path, vec![0xa5u8; 32]).unwrap();
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0x00, 0xef, 0x40, 0x19]); // RDID → W25Q256
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x19])); // RDID → W25Q256
         for _ in 0..8 {
-            bus.queue_read(vec![0u8; 40]); // EN4B + read chunks + EX4B (don't-care)
+            bus.queue_read(chip_rx(vec![0u8; 40])); // EN4B + read chunks + EX4B (don't-care)
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.verify_chip(&path).unwrap();
@@ -1263,7 +1320,7 @@ mod tests {
             !backend.use_4byte_addr,
             "4-byte flag must be cleared after the operation"
         );
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         assert!(
             writes
                 .iter()
@@ -1278,13 +1335,13 @@ mod tests {
         let mut bus = MockBus::new();
         // Guard RDSR, identify RDID (zeros → no chip), WREN, SECTOR_ERASE, RDSR poll.
         for _ in 0..5 {
-            bus.queue_read(vec![0; 8]);
+            bus.queue_read(chip_rx(vec![0; 8]));
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.sector_erase(0x123456).unwrap();
         let bus = backend.bus.as_ref().unwrap();
         // writes[10] = stream packet for SECTOR_ERASE (after guard + RDID + WREN frames)
-        let pkt = &bus.writes[10];
+        let pkt = &chip_writes(&bus.writes)[10];
         assert_eq!(pkt[0], CMD_SPI_STREAM);
         assert_eq!(pkt[1], SPI_SECTOR_ERASE);
         assert_eq!(&pkt[2..5], &[0x12, 0x34, 0x56]);
@@ -1295,13 +1352,13 @@ mod tests {
         let mut bus = MockBus::new();
         // Guard RDSR, identify RDID, WREN, SECTOR_ERASE, RDSR poll, trailing EX4B.
         for _ in 0..6 {
-            bus.queue_read(vec![0; 8]);
+            bus.queue_read(chip_rx(vec![0; 8]));
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.use_4byte_addr = true;
         backend.sector_erase(0x01020304).unwrap();
         let bus = backend.bus.as_ref().unwrap();
-        let pkt = &bus.writes[10];
+        let pkt = &chip_writes(&bus.writes)[10];
         assert_eq!(pkt[1], SPI_SECTOR_ERASE_4B);
         assert_eq!(&pkt[2..6], &[0x01, 0x02, 0x03, 0x04]);
     }
@@ -1395,9 +1452,9 @@ mod tests {
         // the final (total, total) call to print its 100% line.
         use std::sync::{Arc, Mutex};
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0u8; 8]); // header echo
+        bus.queue_read(chip_rx(vec![0u8; 8])); // header echo
         for _ in 0..3 {
-            bus.queue_read(vec![0u8; 40]); // data chunks (31+31+2)
+            bus.queue_read(chip_rx(vec![0u8; 40])); // data chunks (31+31+2)
         }
         let mut backend = CH341ABackend::with_bus(bus);
         let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1437,7 +1494,7 @@ mod tests {
         // spi_command path
         let mut backend = CH341ABackend::with_bus(FailReadBus { writes: Vec::new() });
         backend.spi_command(&[SPI_RDSR, 0]).unwrap_err();
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         assert_eq!(
             writes.last().unwrap(),
             &cs_deassert_packet().to_vec(),
@@ -1447,7 +1504,7 @@ mod tests {
         // read_range path (header echo read fails)
         let mut backend = CH341ABackend::with_bus(FailReadBus { writes: Vec::new() });
         backend.read_range(0, 64).unwrap_err();
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         assert_eq!(
             writes.last().unwrap(),
             &cs_deassert_packet().to_vec(),
@@ -1462,9 +1519,10 @@ mod tests {
             Ok(())
         }
         fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
-            // byte[1] carries the status; WIP bit set.
+            // byte[1] carries the status; WIP bit set — emitted in wire form
+            // (bit-reversed) like the real LSB-first shifter delivers it.
             let mut v = vec![0u8; len.max(2)];
-            v[1] = SR_WIP;
+            v[1] = SR_WIP.reverse_bits();
             Ok(v)
         }
     }
@@ -1473,15 +1531,14 @@ mod tests {
     fn wait_until_ready_polls_rdsr_until_wip_clears() {
         let mut bus = MockBus::new();
         // Two busy polls (WIP=1) then ready (WIP=0). byte[1] is the status register.
-        bus.queue_read(vec![0x00, SR_WIP]);
-        bus.queue_read(vec![0x00, SR_WIP]);
-        bus.queue_read(vec![0x00, 0x00]);
+        bus.queue_read(chip_rx(vec![0x00, SR_WIP]));
+        bus.queue_read(chip_rx(vec![0x00, SR_WIP]));
+        bus.queue_read(chip_rx(vec![0x00, 0x00]));
         let mut backend = CH341ABackend::with_bus(bus);
         backend.wait_until_ready(ERASE_TIMEOUT).unwrap();
         let bus = backend.bus.as_ref().unwrap();
         // Exactly three RDSR stream packets were issued (busy, busy, ready).
-        let rdsr_polls = bus
-            .writes
+        let rdsr_polls = chip_writes(&bus.writes)
             .iter()
             .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_RDSR)
             .count();
@@ -1515,10 +1572,10 @@ mod tests {
         let mut bus = MockBus::new();
         // RDID → Winbond W25Q128 (ef4018), the most common motherboard BIOS chip: 16 MB,
         // 256-byte pages, 4 KB sectors, 3-byte addressing.
-        bus.queue_read(vec![0x00, 0xef, 0x40, 0x18]);
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x18]));
         // Every subsequent read is don't-care except RDSR polls, whose byte[1]=0 ⇒ WIP clear.
         for _ in 0..80 {
-            bus.queue_read(vec![0u8; 8]);
+            bus.queue_read(chip_rx(vec![0u8; 8]));
         }
         let mut backend = CH341ABackend::with_bus(bus);
 
@@ -1535,7 +1592,7 @@ mod tests {
         assert_eq!(res.backup_path, None); // skip_backup honored
         assert!(!res.verified); // skip_verify honored
 
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         let erase_idx = find_cmd_at_addr(writes, SPI_SECTOR_ERASE, [0, 0, 0])
             .expect("sector-erase at addr 0 must be issued before programming");
         let pp0_idx =
@@ -1557,7 +1614,7 @@ mod tests {
         std::fs::write(&path, &big).unwrap();
 
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0x00, 0xef, 0x40, 0x17]); // RDID → W25Q64, 8 MB
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x17])); // RDID → W25Q64, 8 MB
         let mut backend = CH341ABackend::with_bus(bus);
         let err = backend
             .write_chip(
@@ -1664,16 +1721,25 @@ mod tests {
                         self.commit_frame();
                     }
                 }
-                Some(CMD_SPI_STREAM) => self.frame.extend_from_slice(&data[1..]),
+                Some(CMD_SPI_STREAM) => {
+                    // Wire bytes arrive LSB-first (driver pre-reversed them);
+                    // decode the frame in chip-semantic MSB order.
+                    let mut payload = data[1..].to_vec();
+                    reverse_bits_in_place(&mut payload);
+                    self.frame.extend_from_slice(&payload);
+                }
                 _ => {}
             }
             Ok(())
         }
         fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
-            let out: Vec<u8> = (0..len)
+            let mut out: Vec<u8> = (0..len)
                 .map(|j| self.response_byte(self.read_pos + j))
                 .collect();
             self.read_pos += len;
+            // Chip answers MSB-first; the CH341A shifter hands them to the host
+            // LSB-first — emit wire form, the driver reverses back.
+            reverse_bits_in_place(&mut out);
             Ok(out)
         }
     }
@@ -1746,15 +1812,15 @@ mod tests {
     fn identify_large_chip_sends_en4b_and_enables_4byte() {
         // W25Q256 (ef4019) = 32 MB → must enter 4-byte mode (EN4B 0xb7) so >16 MB is addressable.
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0x00, 0xef, 0x40, 0x19]);
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x19]));
         for _ in 0..4 {
-            bus.queue_read(vec![0u8; 8]); // EN4B command's reads (don't-care)
+            bus.queue_read(chip_rx(vec![0u8; 8])); // EN4B command's reads (don't-care)
         }
         let mut backend = CH341ABackend::with_bus(bus);
         let info = backend.identify_chip().unwrap().unwrap();
         assert!(info.size_bytes > SIZE_16MB);
         assert!(backend.use_4byte_addr, "4-byte addressing flag must be set");
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         assert!(
             writes
                 .iter()
@@ -1767,11 +1833,11 @@ mod tests {
     fn identify_small_chip_does_not_send_en4b() {
         // W25Q128 (ef4018) = 16 MB → stays in 3-byte mode, no EN4B.
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0x00, 0xef, 0x40, 0x18]);
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x18]));
         let mut backend = CH341ABackend::with_bus(bus);
         backend.identify_chip().unwrap();
         assert!(!backend.use_4byte_addr);
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         assert!(
             !writes
                 .iter()
@@ -1786,12 +1852,12 @@ mod tests {
         // inside exactly one CS assertion — never re-addressed per KiB.
         let mut bus = MockBus::new();
         for _ in 0..120 {
-            bus.queue_read(vec![0u8; 40]); // header echo + 31-byte data chunks
+            bus.queue_read(chip_rx(vec![0u8; 40])); // header echo + 31-byte data chunks
         }
         let mut backend = CH341ABackend::with_bus(bus);
         let data = backend.read_range(0, 3 * 1024).unwrap();
         assert_eq!(data.len(), 3 * 1024);
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         let read_opcodes = writes
             .iter()
             .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_READ)
@@ -1817,14 +1883,14 @@ mod tests {
         // one bulk_read(21) whose data sits at [5..21].
         let mut rx1 = vec![0u8; 5];
         rx1.extend_from_slice(&sfdp_space[..16]);
-        bus.queue_read(rx1);
+        bus.queue_read(chip_rx(rx1));
         // BFPT read at 0x80 (20 dwords = 80 bytes): tx = 85 bytes → CH341A chunks
         // of 31 + 31 + 23, each answered by one queued bulk_read.
         let mut rx2 = vec![0u8; 5];
         rx2.extend_from_slice(&sfdp_space[0x80..0x80 + 80]);
-        bus.queue_read(rx2[..31].to_vec());
-        bus.queue_read(rx2[31..62].to_vec());
-        bus.queue_read(rx2[62..85].to_vec());
+        bus.queue_read(chip_rx(rx2[..31].to_vec()));
+        bus.queue_read(chip_rx(rx2[31..62].to_vec()));
+        bus.queue_read(chip_rx(rx2[62..85].to_vec()));
         let mut backend = CH341ABackend::with_bus(bus);
         let info = backend.read_sfdp().unwrap().expect("SFDP present");
         // Real density parsed from the BFPT — never the fabricated zeros.
@@ -1834,7 +1900,7 @@ mod tests {
         assert!(info.sector_size_4kb);
         assert!(!info.supports_4byte_addr);
         // Wire bytes: 0x5a + 3-byte address 0 + dummy.
-        let writes = &backend.bus.as_ref().unwrap().writes;
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
         let first_sfdp = writes
             .iter()
             .find(|w| w.len() >= 6 && w[0] == CMD_SPI_STREAM && w[1] == SPI_SFDP)
@@ -1845,7 +1911,7 @@ mod tests {
     #[test]
     fn read_sfdp_returns_none_without_valid_signature() {
         let mut bus = MockBus::new();
-        bus.queue_read(vec![0u8; 21]); // zeros — no "SFDP" signature
+        bus.queue_read(chip_rx(vec![0u8; 21])); // zeros — no "SFDP" signature
         let mut backend = CH341ABackend::with_bus(bus);
         assert!(backend.read_sfdp().unwrap().is_none());
     }
