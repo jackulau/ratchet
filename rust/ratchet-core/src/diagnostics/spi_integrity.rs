@@ -38,6 +38,48 @@ pub struct SpiIntegrityReport {
     pub status_register_consistent: bool,
 }
 
+/// How a dead SPI bus is failing — distinguished by what MISO returns when the
+/// JEDEC ID (0x9F) command gets no real answer from a chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeadBusKind {
+    /// Every byte reads 0x00 — MISO stuck low.
+    StuckLow,
+    /// Every byte reads 0xFF — MISO floating / pulled high.
+    FloatingHigh,
+}
+
+/// Classify a single JEDEC read: `Some(kind)` when the bus is electrically dead
+/// (no chip answered), `None` when the ID looks like a live response.
+pub fn classify_dead_bus(jedec_hex: &str) -> Option<DeadBusKind> {
+    match jedec_hex {
+        "000000" => Some(DeadBusKind::StuckLow),
+        "ffffff" | "FFFFFF" => Some(DeadBusKind::FloatingHigh),
+        _ => None,
+    }
+}
+
+/// Physical-layer guidance for a dead bus — what to check, in likelihood order.
+/// Written for the SOIC-clip / in-circuit case, the way this failure is
+/// actually hit in the field.
+pub fn dead_bus_hint(kind: DeadBusKind) -> &'static str {
+    match kind {
+        DeadBusKind::StuckLow => {
+            "SPI bus reads all-zero (MISO stuck low). Check, in order: (1) chip has no power — \
+             board must be fully unplugged (PSU off + CMOS battery out) so the programmer's \
+             3.3V isn't drained by the rest of the board; (2) SOIC clip misaligned or loose — \
+             reseat square, verify pin-1 (red wire) on the chip's dot; (3) 1.8V-family chip on \
+             a 3.3V programmer — needs a 1.8V adapter; (4) another device holding the bus — \
+             try 'ratchet monitor' to watch stability while adjusting the clip"
+        }
+        DeadBusKind::FloatingHigh => {
+            "SPI bus reads all-ones (MISO floating high). Check: (1) clip not making contact — \
+             reseat it; (2) clip rotated 180° — pin-1 (red wire) must sit on the chip's dot; \
+             (3) chip unpowered; run 'ratchet monitor' to watch stability while adjusting"
+        }
+    }
+}
+
 pub fn analyze_spi_readings(readings: Vec<SpiReading>) -> SpiIntegrityReport {
     if readings.is_empty() {
         return SpiIntegrityReport {
@@ -76,13 +118,20 @@ pub fn analyze_spi_readings(readings: Vec<SpiReading>) -> SpiIntegrityReport {
     } else {
         SpiPattern::Noisy
     };
+    // Score means connection QUALITY, not read consistency: a dead bus reads
+    // 0x000000 with perfect consistency, but 100% next to "Dead" is a lie.
+    let score = if pattern == SpiPattern::Dead {
+        0
+    } else {
+        score
+    };
 
     let recommendation: String = match pattern {
         SpiPattern::Dead => "All reads return 0x000000 or 0xFFFFFF  -  no chip detected. Check: (1) SOIC clip seating on chip, (2) pin 1 alignment, (3) programmer is powered, (4) chip is a valid SPI flash.".to_string(),
         _ if score >= 95 => "Connection is solid. Safe to proceed with read/write operations.".to_string(),
         _ if score >= 80 => "Connection is marginal  -  some reads are inconsistent. Reseat the SOIC clip and ensure firm pressure on all 8 pins. Avoid touching the clip during operations.".to_string(),
         _ if score >= 50 => "Connection is unreliable  -  too many inconsistent reads. Do NOT attempt write operations. Fix the physical connection first: clean chip pads, check clip spring tension, try a different clip or use a ZIF socket.".to_string(),
-        _ => "Connection is very poor or no chip present. Check all physical connections, verify chip is correct type, and ensure programmer is working (try 'ratchet test-connection').".to_string(),
+        _ => "Connection is very poor or no chip present. Check all physical connections, verify chip is correct type, and ensure programmer is working (try 'ratchet monitor').".to_string(),
     };
 
     SpiIntegrityReport {
@@ -113,6 +162,27 @@ mod tests {
             jedec_id: id.to_string(),
             timestamp: 0,
         }
+    }
+
+    #[test]
+    fn classify_dead_bus_distinguishes_stuck_low_and_floating_high() {
+        assert_eq!(classify_dead_bus("000000"), Some(DeadBusKind::StuckLow));
+        assert_eq!(classify_dead_bus("ffffff"), Some(DeadBusKind::FloatingHigh));
+        assert_eq!(classify_dead_bus("FFFFFF"), Some(DeadBusKind::FloatingHigh));
+        assert_eq!(classify_dead_bus("ef4017"), None);
+        assert_eq!(classify_dead_bus("c22016"), None);
+    }
+
+    #[test]
+    fn dead_bus_hints_are_actionable_and_distinct() {
+        let low = dead_bus_hint(DeadBusKind::StuckLow);
+        let high = dead_bus_hint(DeadBusKind::FloatingHigh);
+        assert!(low.contains("all-zero"));
+        assert!(low.contains("CMOS battery"));
+        assert!(low.contains("1.8V"));
+        assert!(high.contains("all-ones"));
+        assert!(high.contains("pin-1"));
+        assert_ne!(low, high);
     }
 
     #[test]
@@ -153,12 +223,15 @@ mod tests {
         let r = analyze_spi_readings(vec![reading("000000"); 10]);
         assert_eq!(r.pattern, SpiPattern::Dead);
         assert!(r.recommendation.contains("no chip detected"));
+        // Dead bus = zero connection quality, even though reads are consistent.
+        assert_eq!(r.score, 0);
     }
 
     #[test]
     fn all_ff_yields_dead() {
         let r = analyze_spi_readings(vec![reading("ffffff"); 10]);
         assert_eq!(r.pattern, SpiPattern::Dead);
+        assert_eq!(r.score, 0);
     }
 
     #[test]

@@ -100,6 +100,15 @@ run "region-erase"       $RATCHET region-erase 0 4096
 # Fresh mock is all-0xFF → blank; blank-check shares the verify exit contract.
 run "blank-check"        $RATCHET blank-check
 run "sfdp"               $RATCHET sfdp
+# Monitor: mock returns a stable JEDEC ID → pattern Stable, exit 0 (flashrom-style
+# exit contract: non-Stable exits non-zero so scripts can gate on clip quality).
+run "monitor"            $RATCHET monitor --samples 3 --interval-ms 10
+MONJ=$($RATCHET monitor --samples 3 --interval-ms 10 --json 2>/dev/null)
+if grep -q '"pattern":"stable"' <<<"$MONJ" && grep -q '"backend":"mock"' <<<"$MONJ"; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1)); FAILED_CMDS+=("monitor --json stable+backend"); echo "  FAIL: monitor --json shape → $MONJ" >&2
+fi
 run "wp-disable (forced mock)" $RATCHET wp-disable
 
 # wp-status --json must carry the AgentEnvelope shape + the WP fields.

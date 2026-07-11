@@ -7,6 +7,7 @@
 // transport returns an honest JSON-RPC error, never placeholder data.
 
 use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind};
+use ratchet_core::diagnostics::spi_integrity::{classify_dead_bus, dead_bus_hint};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::OnceLock;
@@ -691,9 +692,41 @@ fn call_detect() -> Result<Value, (i32, String)> {
     Ok(serde_json::to_value(&info).unwrap_or(Value::Null))
 }
 
+/// Diagnose a no-chip result: re-read the raw JEDEC bytes and build the
+/// physical-layer hint. Mirrors the CLI's probe — an agent must see WHY the bus
+/// is dead (stuck-low vs floating-high need different fixes), never a bare null.
+fn probe_no_chip(m: &mut (dyn Backend + Send)) -> (String, String) {
+    let raw = m
+        .read_jedec_id()
+        .map(|id| id.to_hex())
+        .unwrap_or_else(|e| format!("read failed: {e}"));
+    let hint = match classify_dead_bus(&raw) {
+        Some(kind) => dead_bus_hint(kind).to_string(),
+        None => format!(
+            "JEDEC read returned '{raw}' but no chip was matched — flaky contact or an \
+             unsupported device; check read stability with repeated identify calls"
+        ),
+    };
+    (raw, hint)
+}
+
+fn no_chip_err(tool: &str, kind: BackendKind, raw: &str, hint: &str) -> (i32, String) {
+    (
+        -32000,
+        format!(
+            "{tool}: no chip detected (jedec={raw}, backend={}). {hint}",
+            kind.as_str()
+        ),
+    )
+}
+
 fn call_identify() -> Result<Value, (i32, String)> {
     let (mut m, kind) = open_dyn_checked("identify")?;
     let info = m.identify_chip().map_err(map_err)?;
+    let Some(info) = info else {
+        let (raw, hint) = probe_no_chip(&mut *m);
+        return Err(no_chip_err("identify", kind, &raw, &hint));
+    };
     Ok(with_backend_field(
         serde_json::to_value(&info).unwrap_or(Value::Null),
         kind,
@@ -703,6 +736,18 @@ fn call_identify() -> Result<Value, (i32, String)> {
 fn call_sfdp() -> Result<Value, (i32, String)> {
     let (mut m, kind) = open_dyn_checked("sfdp")?;
     let s = m.read_sfdp().map_err(map_err)?;
+    let Some(s) = s else {
+        // Dead bus (no chip answered) is an error; a live pre-JESD216 chip
+        // without an SFDP table is a valid structured answer.
+        let (raw, hint) = probe_no_chip(&mut *m);
+        if classify_dead_bus(&raw).is_some() {
+            return Err(no_chip_err("sfdp", kind, &raw, &hint));
+        }
+        return Ok(with_backend_field(
+            json!({"supported": false, "raw_jedec": raw}),
+            kind,
+        ));
+    };
     Ok(with_backend_field(
         serde_json::to_value(&s).unwrap_or(Value::Null),
         kind,
@@ -711,6 +756,16 @@ fn call_sfdp() -> Result<Value, (i32, String)> {
 
 fn call_wp_status() -> Result<Value, (i32, String)> {
     let (mut m, kind) = open_dyn_checked("wp_status")?;
+    // A dead bus reads status registers as 0x00 — "write_protected: false"
+    // from a bus with no chip answering is a lie an agent would act on.
+    let raw = m.read_jedec_id().map_err(map_err)?.to_hex();
+    if let Some(dead) = classify_dead_bus(&raw) {
+        let hint = format!(
+            "status registers unreliable — no chip is answering. {}",
+            dead_bus_hint(dead)
+        );
+        return Err(no_chip_err("wp_status", kind, &raw, &hint));
+    }
     let sr = m.read_status_registers().map_err(map_err)?;
     let wp = m.is_write_protected().map_err(map_err)?;
     Ok(with_backend_field(
