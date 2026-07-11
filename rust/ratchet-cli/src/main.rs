@@ -3,8 +3,12 @@
 // and CH347 based on `RATCHET_FORCE_MOCK` and USB device presence.
 
 use clap::{Parser, Subcommand};
-use ratchet_core::agent::envelope::AgentEnvelope;
+use ratchet_core::agent::envelope::{AgentEnvelope, AgentError};
 use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind, RawBus};
+use ratchet_core::diagnostics::spi_integrity::{
+    analyze_spi_readings, classify_dead_bus, dead_bus_hint, format_score_bar, SpiPattern,
+    SpiReading,
+};
 use serde_json::json;
 use std::sync::OnceLock;
 
@@ -184,10 +188,13 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Monitor connection quality continuously.
+    /// Monitor connection quality: repeated JEDEC reads scored for stability.
     Monitor {
         #[arg(long, default_value = "1000")]
         interval_ms: u32,
+        /// Number of JEDEC reads to sample before scoring.
+        #[arg(long, default_value = "10")]
+        samples: u32,
         #[arg(long)]
         json: bool,
     },
@@ -642,7 +649,11 @@ fn main() -> anyhow::Result<()> {
             json,
         }) => cmd_full_repair(reference.as_deref(), skip_write, json)?,
         Some(Command::FullBackup { json, force }) => cmd_full_backup(json, force)?,
-        Some(Command::Monitor { interval_ms, json }) => cmd_monitor(interval_ms, json)?,
+        Some(Command::Monitor {
+            interval_ms,
+            samples,
+            json,
+        }) => cmd_monitor(interval_ms, samples, json)?,
         Some(Command::I2c(c)) => cmd_i2c(c)?,
         Some(Command::Uart(c)) => cmd_uart(c)?,
         Some(Command::Onewire(c)) => cmd_onewire(c)?,
@@ -1142,16 +1153,65 @@ fn cmd_detect(json: bool) -> anyhow::Result<()> {
     })
 }
 
+/// Diagnose a no-chip result: re-read the raw JEDEC bytes the identify path
+/// discarded, classify the electrical failure, and return (raw_hex, hint).
+/// The raw bytes are the whole diagnosis — "no chip detected" alone tells the
+/// user nothing about WHY (dead-low ≠ floating-high ≠ unknown ID).
+fn probe_no_chip(m: &mut (dyn Backend + Send)) -> (String, String) {
+    let raw = m
+        .read_jedec_id()
+        .map(|id| id.to_hex())
+        .unwrap_or_else(|e| format!("read failed: {e}"));
+    let hint = match classify_dead_bus(&raw) {
+        Some(kind) => dead_bus_hint(kind).to_string(),
+        None => format!(
+            "JEDEC read returned '{raw}' but no chip was matched — flaky contact or an \
+             unsupported device; run 'ratchet monitor' to check read stability"
+        ),
+    };
+    (raw, hint)
+}
+
+/// Emit the fail envelope for a verb that found a dead/empty SPI bus, then exit
+/// non-zero (flashrom-style: scripts and agents gate on the exit code — a
+/// missing chip must never look like success).
+fn fail_no_chip(command: &str, kind: BackendKind, raw: String, hint: String, json: bool) -> ! {
+    let env = AgentEnvelope::<serde_json::Value> {
+        ok: false,
+        command: command.into(),
+        data: Some(json!({"raw_jedec": raw, "backend": kind.as_str()})),
+        error: Some(AgentError {
+            code: "no_chip".into(),
+            message: format!("no chip detected (jedec={raw})"),
+            hint: Some(hint.clone()),
+        }),
+        next_action: None,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&env).unwrap_or_else(|_| "{\"ok\":false}".into())
+        );
+    } else {
+        println!("no chip detected (jedec={raw})");
+        println!("  {hint}");
+    }
+    std::process::exit(1);
+}
+
 fn cmd_identify(json: bool) -> anyhow::Result<()> {
     let (mut m, kind) = open_dyn_checked("identify")?;
     let info = m.identify_chip()?;
-    let env = AgentEnvelope::ok("identify", with_backend_field(&info, kind)?);
-    emit_envelope(&env, json, || match &info {
-        Some(c) => println!(
+    let Some(c) = info else {
+        let (raw, hint) = probe_no_chip(&mut *m);
+        fail_no_chip("identify", kind, raw, hint, json);
+    };
+    let env = AgentEnvelope::ok("identify", with_backend_field(&c, kind)?);
+    emit_envelope(&env, json, || {
+        println!(
             "{} ({}) {} jedec={}",
             c.name, c.vendor_name, c.size_human, c.jedec_id
-        ),
-        None => println!("no chip detected"),
+        )
     })
 }
 
@@ -1440,18 +1500,44 @@ fn cmd_voltage_reference(jedec_id: &str, json: bool) -> anyhow::Result<()> {
 fn cmd_sfdp(json: bool) -> anyhow::Result<()> {
     let (mut m, kind) = open_dyn_checked("sfdp")?;
     let s = m.read_sfdp()?;
+    let Some(s) = s else {
+        // No SFDP table. Two very different causes: a dead bus (no chip answered
+        // at all — an error), or a live chip that predates JESD216 (fine).
+        let (raw, hint) = probe_no_chip(&mut *m);
+        if classify_dead_bus(&raw).is_some() {
+            fail_no_chip("sfdp", kind, raw, hint, json);
+        }
+        let env = AgentEnvelope::ok(
+            "sfdp",
+            with_backend_field(&json!({"supported": false, "raw_jedec": raw}), kind)?,
+        );
+        return emit_envelope(&env, json, || {
+            println!("chip present (jedec={raw}) but no SFDP table (pre-JESD216 part)")
+        });
+    };
     let env = AgentEnvelope::ok("sfdp", with_backend_field(&s, kind)?);
     emit_envelope(&env, json, || {
-        if let Some(s) = s {
-            println!("density: {} bytes, page: {}", s.density_bytes, s.page_size);
-        } else {
-            println!("no SFDP");
-        }
+        println!("density: {} bytes, page: {}", s.density_bytes, s.page_size)
     })
 }
 
 fn cmd_wp_status(json: bool) -> anyhow::Result<()> {
     let (mut m, kind) = open_dyn_checked("wp-status")?;
+    // A dead bus reads status registers as 0x00 — which would render as
+    // "write_protected: false" and invite a doomed write. Refuse instead.
+    let raw = m.read_jedec_id()?.to_hex();
+    if let Some(dead) = classify_dead_bus(&raw) {
+        fail_no_chip(
+            "wp-status",
+            kind,
+            raw,
+            format!(
+                "status registers unreliable — no chip is answering. {}",
+                dead_bus_hint(dead)
+            ),
+            json,
+        );
+    }
     let sr = m.read_status_registers()?;
     let wp = m.is_write_protected()?;
     let env = AgentEnvelope::ok(
@@ -1553,7 +1639,11 @@ fn cmd_repl() -> anyhow::Result<()> {
             ),
             ReplCommand::Identify => match backend.identify_chip() {
                 Ok(Some(c)) => println!("{} ({}) {}", c.name, c.vendor_name, c.size_human),
-                Ok(None) => println!("no chip detected"),
+                Ok(None) => {
+                    let (raw, hint) = probe_no_chip(&mut *backend);
+                    println!("no chip detected (jedec={raw})");
+                    println!("  {hint}");
+                }
                 Err(e) => println!("error: {e}"),
             },
             ReplCommand::Jedec => match backend.read_jedec_id() {
@@ -1735,11 +1825,45 @@ fn cmd_full_backup(json: bool, force: bool) -> anyhow::Result<()> {
     })
 }
 
-fn cmd_monitor(_interval_ms: u32, _json: bool) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "monitor: continuous live monitor not implemented; use 'status' or 'identify' for a \
-         one-shot read"
-    )
+/// Connection-quality monitor: sample the JEDEC ID `samples` times at
+/// `interval_ms`, then score stability via the SPI-integrity classifier.
+/// This is the SOIC-clip debugging tool — run it while adjusting the clip and
+/// watch the reads settle. Exits non-zero unless the connection is Stable
+/// (same contract as verify/blank-check: scripts gate on the exit code).
+fn cmd_monitor(interval_ms: u32, samples: u32, json: bool) -> anyhow::Result<()> {
+    let (mut m, kind) = open_dyn_checked("monitor")?;
+    let samples = samples.max(1);
+    let start = std::time::Instant::now();
+    let mut readings = Vec::with_capacity(samples as usize);
+    for i in 0..samples {
+        let id = m.read_jedec_id()?.to_hex();
+        if !json {
+            eprintln!("read {}/{samples}: jedec={id}", i + 1);
+        }
+        readings.push(SpiReading {
+            jedec_id: id,
+            timestamp: start.elapsed().as_millis() as u64,
+        });
+        if i + 1 < samples {
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms as u64));
+        }
+    }
+    let report = analyze_spi_readings(readings);
+    let stable = report.pattern == SpiPattern::Stable;
+    let env = AgentEnvelope::ok("monitor", with_backend_field(&report, kind)?);
+    emit_envelope(&env, json, || {
+        println!("{}", format_score_bar(report.score));
+        println!(
+            "pattern: {:?}, dominant id: {} ({}/{} reads)",
+            report.pattern, report.dominant_id, report.dominant_count, report.total_reads
+        );
+        println!("{}", report.recommendation);
+    })?;
+    let code = check_exit_code(stable);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 fn parse_addr(s: &str) -> anyhow::Result<u64> {
@@ -1798,13 +1922,15 @@ mod tests {
 
     // Transport-less verbs must fail honestly (Err / non-zero exit), never a
     // fake success. These call hw_unavailable directly (no bus open needed).
+    // (monitor is no longer here: it is implemented — its exit contract is
+    // covered by cli-smoke and the spi_integrity unit tests; calling it here
+    // would touch a real programmer when one is plugged in.)
     #[test]
     fn hw_verbs_fail_honestly() {
         assert!(cmd_swd(SwdCmd::Connect { json: true }).is_err());
         assert!(cmd_avr(AvrCmd::Signature { json: true }).is_err());
         assert!(cmd_onewire(OnewireCmd::Scan { json: true }).is_err());
         assert!(cmd_esp(EspCmd::Detect { json: true }).is_err());
-        assert!(cmd_monitor(1000, true).is_err());
         assert!(cmd_failure_search("x", true).is_err());
     }
 
