@@ -1653,6 +1653,9 @@ mod tests {
         jedec: [u8; 3],
         frame: Vec<u8>,
         read_pos: usize,
+        /// EN4B (0xB7) state, like real silicon: while set, mode-dependent
+        /// opcodes (0x03/0x02/0x20) carry 4 address bytes.
+        four_byte: bool,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -1661,10 +1664,21 @@ mod tests {
                 jedec,
                 frame: Vec::new(),
                 read_pos: 0,
+                four_byte: false,
             }
         }
         fn decode_addr(bytes: &[u8]) -> usize {
             bytes.iter().fold(0usize, |acc, &b| (acc << 8) | b as usize)
+        }
+        /// Address length for an opcode given the current EN4B state — mirrors
+        /// datasheet behavior: dedicated 4B opcodes always take 4 bytes,
+        /// classic opcodes take 4 only while EN4B is active.
+        fn addr_len(&self, op: u8) -> usize {
+            match op {
+                SPI_READ_4B | SPI_PAGE_PROGRAM_4B | SPI_SECTOR_ERASE_4B | SPI_BLOCK_ERASE_4B => 4,
+                _ if self.four_byte => 4,
+                _ => 3,
+            }
         }
         /// Full-duplex response for absolute frame position `pos`, given `self.frame` so far.
         fn response_byte(&self, pos: usize) -> u8 {
@@ -1681,7 +1695,7 @@ mod tests {
                 }
                 SPI_RDSR | SPI_RDSR2 | SPI_RDSR3 => 0, // WIP clear
                 op @ (SPI_READ | SPI_READ_4B) => {
-                    let addr_len = if op == SPI_READ_4B { 4 } else { 3 };
+                    let addr_len = self.addr_len(op);
                     let data_start = 1 + addr_len;
                     if pos >= data_start && self.frame.len() >= data_start {
                         let base = Self::decode_addr(&self.frame[1..data_start]);
@@ -1700,15 +1714,17 @@ mod tests {
             }
             match self.frame[0] {
                 SPI_CHIP_ERASE => self.flash.iter_mut().for_each(|b| *b = 0xff),
+                SPI_EN4B => self.four_byte = true,
+                SPI_EX4B => self.four_byte = false,
                 op @ (SPI_SECTOR_ERASE | SPI_SECTOR_ERASE_4B) => {
-                    let al = if op == SPI_SECTOR_ERASE_4B { 4 } else { 3 };
+                    let al = self.addr_len(op);
                     let a = Self::decode_addr(&self.frame[1..1 + al]);
                     for b in self.flash.iter_mut().skip(a).take(4096) {
                         *b = 0xff;
                     }
                 }
                 op @ (SPI_PAGE_PROGRAM | SPI_PAGE_PROGRAM_4B) => {
-                    let al = if op == SPI_PAGE_PROGRAM_4B { 4 } else { 3 };
+                    let al = self.addr_len(op);
                     let a = Self::decode_addr(&self.frame[1..1 + al]);
                     for (i, &d) in self.frame[1 + al..].iter().enumerate() {
                         if let Some(cell) = self.flash.get_mut(a + i) {
@@ -1755,6 +1771,40 @@ mod tests {
             reverse_bits_in_place(&mut out);
             Ok(out)
         }
+    }
+
+    // W25Q256JW-class part (ef6019, 32 MB): identify auto-sends EN4B, then the
+    // classic 0x03 read must carry FOUR address bytes. LoopbackFlash tracks
+    // EN4B like silicon, so if the driver ever frames 3-byte addresses on a
+    // >16 MB chip (or never enters 4-byte mode), every marker below lands at
+    // the wrong offset and this test fails — this is the regression net for
+    // the exact read path a 32 MB BIOS dump takes.
+    #[test]
+    fn read_32mb_chip_crosses_16mb_boundary_correctly() {
+        const SIZE_32MB: usize = 32 * 1024 * 1024;
+        let mut bus = LoopbackFlash::new(SIZE_32MB, [0xef, 0x60, 0x19]);
+        bus.flash[0] = 0xa5;
+        // Distinct bytes straddling the 16 MB line: 3-byte addressing cannot
+        // even express offsets past 0x00FF_FFFF.
+        let boundary = 16 * 1024 * 1024;
+        let markers: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        for (i, m) in markers.iter().enumerate() {
+            bus.flash[boundary - 3 + i] = *m;
+        }
+        bus.flash[SIZE_32MB - 1] = 0x5a;
+
+        let mut backend = CH341ABackend::with_bus(bus);
+        let path = test_tmp("d4-32mb-read.bin");
+        let r = backend.read_chip(&path).unwrap();
+        assert!(r.success);
+        assert_eq!(r.size_bytes as usize, SIZE_32MB);
+
+        let dump = std::fs::read(&path).unwrap();
+        assert_eq!(dump.len(), SIZE_32MB);
+        assert_eq!(dump[0], 0xa5);
+        assert_eq!(&dump[boundary - 3..boundary + 3], &markers);
+        assert_eq!(dump[SIZE_32MB - 1], 0x5a, "top byte of the 32 MB range");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
