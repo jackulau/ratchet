@@ -34,7 +34,12 @@ pub const UIO_STM_OUT: u8 = 0x80;
 pub const UIO_STM_END: u8 = 0x20;
 
 pub const STM_SPI_CS: u8 = 0x01;
-pub const STM_SPI_DBG: u8 = 0x04;
+/// Direction mask making D0-D5 outputs: CS0/CS1/CS2, SCK (D3), DOUT2 (D4),
+/// MOSI (D5). D6/D7 stay inputs (D7 is MISO). This is the mask every working
+/// reference implementation programs (flashrom ch341a_spi.c and ch341prog use
+/// 0x3F); anything narrower leaves SCK/MOSI hi-Z and the chip never hears a
+/// command — the bus then reads all-zero with perfect physical contact.
+pub const STM_SPI_DIR_OUTPUTS: u8 = 0x3f;
 
 // SPI flash command bytes ────────────────────────────────────────────────────
 pub const SPI_RDID: u8 = 0x9f;
@@ -87,11 +92,13 @@ pub const SIZE_16MB: u64 = 16 * 1024 * 1024;
 // ─── Pure protocol functions (no I/O) ───────────────────────────────────────
 
 /// Build the SPI-mode-enable UIO packet sent right after claiming the interface.
+/// OUT first (CS0 high = deasserted, SCK/MOSI low = mode-0 idle), then DIR
+/// 0x3F so CS, SCK and MOSI are actually driven — see STM_SPI_DIR_OUTPUTS.
 pub fn enable_spi_mode_packet() -> [u8; 4] {
     [
         CMD_UIO_STREAM,
         UIO_STM_OUT | STM_SPI_CS,
-        UIO_STM_DIR | (STM_SPI_CS | STM_SPI_DBG),
+        UIO_STM_DIR | STM_SPI_DIR_OUTPUTS,
         UIO_STM_END,
     ]
 }
@@ -935,7 +942,13 @@ mod tests {
         let pkt = enable_spi_mode_packet();
         assert_eq!(pkt[0], CMD_UIO_STREAM);
         assert_eq!(pkt[1], UIO_STM_OUT | STM_SPI_CS);
-        assert_eq!(pkt[2], UIO_STM_DIR | (STM_SPI_CS | STM_SPI_DBG));
+        // DIR must drive D0-D5 (0x3F, the flashrom/ch341prog mask). A narrower
+        // mask leaves SCK/MOSI hi-Z: the chip never receives a command and the
+        // bus reads all-zero even with perfect contact.
+        assert_eq!(pkt[2], UIO_STM_DIR | STM_SPI_DIR_OUTPUTS);
+        assert_eq!(pkt[2] & 0x08, 0x08, "SCK (D3) must be an output");
+        assert_eq!(pkt[2] & 0x20, 0x20, "MOSI (D5) must be an output");
+        assert_eq!(pkt[2] & 0x80, 0, "MISO (D7) must stay an input");
         assert_eq!(pkt[3], UIO_STM_END);
     }
 

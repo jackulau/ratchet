@@ -70,7 +70,11 @@ pub fn dead_bus_hint(kind: DeadBusKind) -> &'static str {
              3.3V isn't drained by the rest of the board; (2) SOIC clip misaligned or loose — \
              reseat square, verify pin-1 (red wire) on the chip's dot; (3) 1.8V-family chip on \
              a 3.3V programmer — needs a 1.8V adapter; (4) another device holding the bus — \
-             try 'ratchet monitor' to watch stability while adjusting the clip"
+             try 'ratchet monitor' to watch stability while adjusting the clip. \
+             Discriminator: if the read is all-zero even with NO chip attached, the MISO path \
+             itself is broken somewhere in the adapter/clip/ZIF stack — test each junction \
+             (adapter seated at the ZIF pin-1 end, clamp prongs actually gripping, socket-to- \
+             adapter solder joints) before blaming the chip"
         }
         DeadBusKind::FloatingHigh => {
             "SPI bus reads all-ones (MISO floating high). Check: (1) clip not making contact — \
