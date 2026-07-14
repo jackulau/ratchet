@@ -447,7 +447,14 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// larger than 16 MB: without it a 4-byte address sent after a plain READ (0x03) is
     /// misinterpreted, so reads/writes land at the wrong offset. Sending EN4B is the most
     /// compatible activation — it works even on parts that lack the dedicated 4-byte opcodes.
+    ///
+    /// WREN precedes EN4B: Micron N25Q/MT25Q parts latch the address-mode change only when
+    /// the write-enable latch is set and otherwise silently ignore B7h (then every 4-byte
+    /// address reads one byte short — a wrong-offset dump). Winbond/Macronix accept B7h with
+    /// or without WREN and ignore the dangling WEL (a subsequent READ does not consume it),
+    /// so the extra command is safe across vendors.
     pub fn enter_4byte_mode(&mut self) -> Result<()> {
+        self.spi_command(&[SPI_WREN])?;
         self.spi_command(&[SPI_EN4B])?;
         self.use_4byte_addr = true;
         Ok(())
@@ -456,7 +463,9 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// Leave 4-byte address mode (EX4B, 0xe9) and clear the flag. Always paired with
     /// enter_4byte_mode at operation end: a chip left in 4-byte mode misaddresses for
     /// the next tool (or the motherboard itself) that assumes power-on 3-byte mode.
+    /// WREN precedes EX4B for the same cross-vendor reason as enter_4byte_mode.
     pub fn exit_4byte_mode(&mut self) -> Result<()> {
+        self.spi_command(&[SPI_WREN])?;
         self.spi_command(&[SPI_EX4B])?;
         self.use_4byte_addr = false;
         Ok(())
@@ -1236,10 +1245,12 @@ mod tests {
         let mut bus = MockBus::new();
         bus.queue_read(chip_rx(vec![0x00, 0x00])); // WP guard RDSR → unprotected
         bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x19])); // RDID → W25Q256
+        bus.queue_read(chip_rx(vec![0u8; 8])); // WREN (enter 4-byte, Micron gate)
         bus.queue_read(chip_rx(vec![0u8; 8])); // EN4B
-        bus.queue_read(chip_rx(vec![0u8; 8])); // WREN
+        bus.queue_read(chip_rx(vec![0u8; 8])); // WREN (erase)
         bus.queue_read(chip_rx(vec![0u8; 8])); // sector erase cmd
         bus.queue_read(chip_rx(vec![0x00, 0x00])); // WIP poll → ready
+        bus.queue_read(chip_rx(vec![0u8; 8])); // WREN (exit 4-byte, Micron gate)
         bus.queue_read(chip_rx(vec![0u8; 8])); // EX4B
         let mut backend = CH341ABackend::with_bus(bus);
         backend.region_erase(0x0100_0000, 4096).unwrap();
@@ -1656,6 +1667,12 @@ mod tests {
         /// EN4B (0xB7) state, like real silicon: while set, mode-dependent
         /// opcodes (0x03/0x02/0x20) carry 4 address bytes.
         four_byte: bool,
+        /// Write-enable latch (set by WREN 0x06).
+        wel: bool,
+        /// Micron-like gating: when true, EN4B/EX4B are honored only if WEL is
+        /// set, exactly as Micron N25Q/MT25Q behave. A driver that omits the
+        /// WREN before B7h then never enters 4-byte mode and misframes reads.
+        strict_en4b: bool,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -1665,7 +1682,14 @@ mod tests {
                 frame: Vec::new(),
                 read_pos: 0,
                 four_byte: false,
+                wel: false,
+                strict_en4b: false,
             }
+        }
+        /// Model a Micron-family part that ignores EN4B/EX4B unless WREN preceded it.
+        fn micron_like(mut self) -> Self {
+            self.strict_en4b = true;
+            self
         }
         fn decode_addr(bytes: &[u8]) -> usize {
             bytes.iter().fold(0usize, |acc, &b| (acc << 8) | b as usize)
@@ -1714,8 +1738,19 @@ mod tests {
             }
             match self.frame[0] {
                 SPI_CHIP_ERASE => self.flash.iter_mut().for_each(|b| *b = 0xff),
-                SPI_EN4B => self.four_byte = true,
-                SPI_EX4B => self.four_byte = false,
+                SPI_WREN => self.wel = true,
+                SPI_EN4B => {
+                    if !self.strict_en4b || self.wel {
+                        self.four_byte = true;
+                    }
+                    self.wel = false;
+                }
+                SPI_EX4B => {
+                    if !self.strict_en4b || self.wel {
+                        self.four_byte = false;
+                    }
+                    self.wel = false;
+                }
                 op @ (SPI_SECTOR_ERASE | SPI_SECTOR_ERASE_4B) => {
                     let al = self.addr_len(op);
                     let a = Self::decode_addr(&self.frame[1..1 + al]);
@@ -1804,6 +1839,36 @@ mod tests {
         assert_eq!(dump[0], 0xa5);
         assert_eq!(&dump[boundary - 3..boundary + 3], &markers);
         assert_eq!(dump[SIZE_32MB - 1], 0x5a, "top byte of the 32 MB range");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Same 32 MB read, but the emulated part gates EN4B on WREN like a Micron
+    // N25Q/MT25Q. If enter_4byte_mode omits the WREN before B7h, the strict
+    // part stays in 3-byte mode, the 0x03 read frames a 3-byte address, and the
+    // >16 MB markers land at the wrong offset — so this test fails closed on a
+    // regression of the WREN-before-EN4B fix.
+    #[test]
+    fn read_32mb_micron_gated_en4b_needs_wren() {
+        const SIZE_32MB: usize = 32 * 1024 * 1024;
+        let mut bus = LoopbackFlash::new(SIZE_32MB, [0xef, 0x60, 0x19]).micron_like();
+        let boundary = 16 * 1024 * 1024;
+        let markers: [u8; 6] = [0x9a, 0x8b, 0x7c, 0x6d, 0x5e, 0x4f];
+        for (i, m) in markers.iter().enumerate() {
+            bus.flash[boundary - 3 + i] = *m;
+        }
+        bus.flash[SIZE_32MB - 1] = 0xc3;
+
+        let mut backend = CH341ABackend::with_bus(bus);
+        let path = test_tmp("d5-32mb-micron.bin");
+        let r = backend.read_chip(&path).unwrap();
+        assert!(r.success);
+        let dump = std::fs::read(&path).unwrap();
+        assert_eq!(
+            &dump[boundary - 3..boundary + 3],
+            &markers,
+            "WREN-gated part only enters 4-byte mode if WREN preceded EN4B"
+        );
+        assert_eq!(dump[SIZE_32MB - 1], 0xc3, "top byte of the 32 MB range");
         let _ = std::fs::remove_file(&path);
     }
 
