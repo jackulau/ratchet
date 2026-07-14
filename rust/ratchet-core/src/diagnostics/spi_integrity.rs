@@ -65,16 +65,21 @@ pub fn classify_dead_bus(jedec_hex: &str) -> Option<DeadBusKind> {
 pub fn dead_bus_hint(kind: DeadBusKind) -> &'static str {
     match kind {
         DeadBusKind::StuckLow => {
-            "SPI bus reads all-zero (MISO stuck low). Check, in order: (1) chip has no power — \
-             board must be fully unplugged (PSU off + CMOS battery out) so the programmer's \
-             3.3V isn't drained by the rest of the board; (2) SOIC clip misaligned or loose — \
-             reseat square, verify pin-1 (red wire) on the chip's dot; (3) 1.8V-family chip on \
-             a 3.3V programmer — needs a 1.8V adapter; (4) another device holding the bus — \
-             try 'ratchet monitor' to watch stability while adjusting the clip. \
-             Discriminator: if the read is all-zero even with NO chip attached, the MISO path \
-             itself is broken somewhere in the adapter/clip/ZIF stack — test each junction \
-             (adapter seated at the ZIF pin-1 end, clamp prongs actually gripping, socket-to- \
-             adapter solder joints) before blaming the chip"
+            "SPI bus reads all-zero (MISO stuck low). Check, in order: (1) PACKAGE vs TOOL — a \
+             leadless chip (WSON / QFN / USON / DFN: flat pads on the underside, no gull-wing \
+             legs) CANNOT be contacted by a SOIC spring clip; it needs a WSON/QFN socket or a \
+             soldered breakout board. A SOIC clip only grips the legs of an SOP/SOIC package; \
+             (2) chip has no power — if reading in-circuit, the board must be fully unplugged \
+             (PSU off + CMOS battery out) so the programmer's supply isn't drained by the rest \
+             of the board; measure VCC at the chip (0V = adapter not powering it); (3) SOIC clip \
+             misaligned or loose — reseat square, verify pin-1 (red wire) on the chip's dot; \
+             (4) 1.8V-family chip on a 3.3V programmer — needs a 1.8V adapter (and ~3.3V measured \
+             on a 1.8V part is over-voltage, unplug now); (5) another device holding the bus — \
+             try 'ratchet monitor' to watch stability while adjusting. \
+             Discriminator: a PERFECTLY STABLE all-zero (same value every read) is no contact / \
+             no power / wrong package, NOT a loose clip — a loose clip gives VARYING reads. If \
+             it stays all-zero even with NO chip attached, the MISO path itself is broken in the \
+             adapter/clip/ZIF stack — test each junction before blaming the chip"
         }
         DeadBusKind::FloatingHigh => {
             "SPI bus reads all-ones (MISO floating high). Check: (1) clip not making contact — \
@@ -131,7 +136,16 @@ pub fn analyze_spi_readings(readings: Vec<SpiReading>) -> SpiIntegrityReport {
     };
 
     let recommendation: String = match pattern {
-        SpiPattern::Dead => "All reads return 0x000000 or 0xFFFFFF  -  no chip detected. Check: (1) SOIC clip seating on chip, (2) pin 1 alignment, (3) programmer is powered, (4) chip is a valid SPI flash.".to_string(),
+        SpiPattern::Dead => "All reads identical (0x000000 or 0xFFFFFF)  -  no chip responding. \
+             A PERFECTLY STABLE dead value is not a loose clip (that gives varying reads): it means \
+             no contact at all, no power, or a package/tool mismatch. Check: \
+             (1) PACKAGE vs TOOL  -  a leadless chip (WSON/QFN/USON/DFN: flat pads underneath, no legs) \
+             CANNOT be read with a SOIC spring clip; it needs a WSON/QFN socket or a soldered breakout board; \
+             (2) chip power  -  measure VCC at the chip (want the chip's rated voltage, e.g. 1.8V for a JW/JV-W part); \
+             0V means the adapter isn't delivering power, ~3.3V on a 1.8V part is over-voltage, unplug now; \
+             (3) SOIC clip seating and pin-1 (red wire) alignment through EVERY layer of the stack; \
+             (4) programmer is powered and the right voltage adapter is fitted."
+            .to_string(),
         _ if score >= 95 => "Connection is solid. Safe to proceed with read/write operations.".to_string(),
         _ if score >= 80 => "Connection is marginal  -  some reads are inconsistent. Reseat the SOIC clip and ensure firm pressure on all 8 pins. Avoid touching the clip during operations.".to_string(),
         _ if score >= 50 => "Connection is unreliable  -  too many inconsistent reads. Do NOT attempt write operations. Fix the physical connection first: clean chip pads, check clip spring tension, try a different clip or use a ZIF socket.".to_string(),
@@ -184,6 +198,13 @@ mod tests {
         assert!(low.contains("all-zero"));
         assert!(low.contains("CMOS battery"));
         assert!(low.contains("1.8V"));
+        // Leadless-package mismatch is the class of failure the hint silently
+        // omitted; a SOIC clip cannot read a WSON/QFN part. Keep it named.
+        assert!(low.contains("WSON"));
+        assert!(low.contains("leadless"));
+        // Stable-vs-varying is the discriminator that actually separates
+        // no-contact from a loose clip.
+        assert!(low.contains("VARYING"));
         assert!(high.contains("all-ones"));
         assert!(high.contains("pin-1"));
         assert_ne!(low, high);
@@ -226,7 +247,11 @@ mod tests {
     fn all_zero_yields_dead() {
         let r = analyze_spi_readings(vec![reading("000000"); 10]);
         assert_eq!(r.pattern, SpiPattern::Dead);
-        assert!(r.recommendation.contains("no chip detected"));
+        assert!(r.recommendation.contains("no chip responding"));
+        // The dead-bus advice must name the leadless-package trap and the
+        // stable-vs-varying discriminator, not just say "reseat the clip".
+        assert!(r.recommendation.contains("WSON"));
+        assert!(r.recommendation.contains("STABLE"));
         // Dead bus = zero connection quality, even though reads are consistent.
         assert_eq!(r.score, 0);
     }
