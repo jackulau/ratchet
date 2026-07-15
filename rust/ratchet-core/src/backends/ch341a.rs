@@ -499,6 +499,43 @@ impl<B: UsbBus> CH341ABackend<B> {
         Ok(rx[data_start..data_start + len].to_vec())
     }
 
+    /// SFDP fallback for a valid JEDEC id that is absent from the chip DB. The
+    /// Basic Flash Parameter Table carries the chip's real density and erase
+    /// geometry, so an unlisted-but-SFDP-compliant part becomes fully readable
+    /// instead of failing later with size 0 (`read_chip_to_file` rejects a
+    /// zero-size identity). Mirrors AsProgrammer/flashrom, which size an unknown
+    /// chip from SFDP and read it anyway. Returns `None` when the chip exposes no
+    /// usable SFDP table, leaving the honest size-0 "Unknown" identity in place
+    /// rather than fabricating geometry.
+    fn identify_via_sfdp(&mut self, hex: &str) -> Result<Option<ChipInfo>> {
+        let Some(sfdp) = crate::sfdp::discover_sfdp(|addr, len| self.sfdp_read_at(addr, len))?
+        else {
+            return Ok(None);
+        };
+        if sfdp.density_bytes == 0 {
+            return Ok(None);
+        }
+        Ok(Some(ChipInfo {
+            name: format!("Unknown {} (via SFDP)", hex.to_ascii_uppercase()),
+            vendor_name: "Unknown".into(),
+            jedec_id: hex.to_string(),
+            size_bytes: sfdp.density_bytes,
+            size_human: format_size(sfdp.density_bytes),
+            chip_type: "spi".into(),
+            page_size: Some(sfdp.page_size),
+            sector_size: Some(if sfdp.sector_size_4kb { 4096 } else { 65536 }),
+            block_size: Some(if sfdp.block_size_64kb {
+                65536
+            } else if sfdp.block_size_32kb {
+                32768
+            } else {
+                65536
+            }),
+            write_protected: None,
+            voltage: None,
+        }))
+    }
+
     /// Refuse destructive ops on write-protected silicon: protected chips silently
     /// ignore erase/program commands, which would otherwise read as fake success.
     /// Reads SR1 strictly — a short response must not read as "unprotected".
@@ -716,6 +753,8 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
                 write_protected: None,
                 voltage: Some(db.voltage),
             }
+        } else if let Some(info) = self.identify_via_sfdp(&hex)? {
+            info
         } else {
             ChipInfo {
                 name: format!("Unknown {}", hex.to_ascii_uppercase()),
@@ -1158,13 +1197,14 @@ mod tests {
 
     #[test]
     fn write_chip_refuses_unknown_capacity_chip() {
-        // JEDEC id aabb11 is not in the chip DB → size_bytes 0 → must refuse, not
-        // skip the oversize guard and write blind. (Capacity byte 0x11 < 0x19 keeps
-        // the 4-byte-addressing heuristic quiet.)
+        // JEDEC id aabb11 is not in the chip DB and exposes no SFDP table → size_bytes
+        // 0 → must refuse, not skip the oversize guard and write blind. (Capacity byte
+        // 0x11 < 0x19 keeps the 4-byte-addressing heuristic quiet.)
         let path = test_tmp("unknown-capacity.bin");
         std::fs::write(&path, vec![0xa5u8; 64]).unwrap();
         let mut bus = MockBus::new();
-        bus.queue_read(chip_rx(vec![0x00, 0xaa, 0xbb, 0x11]));
+        bus.queue_read(chip_rx(vec![0x00, 0xaa, 0xbb, 0x11])); // RDID → unlisted id
+        bus.queue_read(chip_rx(vec![0u8; 21])); // SFDP probe → no signature → size stays 0
         let mut backend = CH341ABackend::with_bus(bus);
         let err = backend
             .write_chip(
@@ -1673,6 +1713,9 @@ mod tests {
         /// set, exactly as Micron N25Q/MT25Q behave. A driver that omits the
         /// WREN before B7h then never enters 4-byte mode and misframes reads.
         strict_en4b: bool,
+        /// SFDP image returned for 0x5A reads. Empty ⇒ the part exposes no SFDP
+        /// table (reads answer 0xff, so discovery finds no valid signature).
+        sfdp: Vec<u8>,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -1684,11 +1727,19 @@ mod tests {
                 four_byte: false,
                 wel: false,
                 strict_en4b: false,
+                sfdp: Vec::new(),
             }
         }
         /// Model a Micron-family part that ignores EN4B/EX4B unless WREN preceded it.
         fn micron_like(mut self) -> Self {
             self.strict_en4b = true;
+            self
+        }
+        /// Attach an SFDP image so 0x5A reads return its bytes — models a chip
+        /// whose geometry is discoverable via SFDP even when its JEDEC id is
+        /// absent from the chip DB.
+        fn with_sfdp(mut self, sfdp: Vec<u8>) -> Self {
+            self.sfdp = sfdp;
             self
         }
         fn decode_addr(bytes: &[u8]) -> usize {
@@ -1724,6 +1775,16 @@ mod tests {
                     if pos >= data_start && self.frame.len() >= data_start {
                         let base = Self::decode_addr(&self.frame[1..data_start]);
                         *self.flash.get(base + (pos - data_start)).unwrap_or(&0xff)
+                    } else {
+                        0
+                    }
+                }
+                SPI_SFDP => {
+                    // 0x5A + 3 SFDP-space address bytes + 1 dummy, then data.
+                    let data_start = 5;
+                    if pos >= data_start && self.frame.len() >= 4 {
+                        let base = Self::decode_addr(&self.frame[1..4]);
+                        *self.sfdp.get(base + (pos - data_start)).unwrap_or(&0xff)
                     } else {
                         0
                     }
@@ -2042,6 +2103,86 @@ mod tests {
         bus.queue_read(chip_rx(vec![0u8; 21])); // zeros — no "SFDP" signature
         let mut backend = CH341ABackend::with_bus(bus);
         assert!(backend.read_sfdp().unwrap().is_none());
+    }
+
+    // A chip whose JEDEC id is valid but not in the 806-entry DB must still be
+    // identified and sized from its SFDP table — the exact case where a bare
+    // JEDEC lookup would give up but AsProgrammer/flashrom read the part anyway.
+    #[test]
+    fn identify_unlisted_jedec_reads_geometry_from_sfdp() {
+        use crate::sfdp::{build_synthetic_sfdp, BuildSfdpOptions};
+        let jedec = [0xab, 0xcd, 0x18];
+        assert!(
+            lookup_by_jedec_id("abcd18").is_none(),
+            "test precondition: abcd18 must be absent from the chip DB"
+        );
+        let sfdp_space = build_synthetic_sfdp(&BuildSfdpOptions::default()); // 8 MB, 4KB sectors
+        let bus = LoopbackFlash::new(1024, jedec).with_sfdp(sfdp_space);
+        let mut backend = CH341ABackend::with_bus(bus);
+
+        let info = backend
+            .identify_chip()
+            .unwrap()
+            .expect("an unlisted-but-SFDP-compliant chip must still identify");
+        assert_eq!(info.jedec_id, "abcd18");
+        assert_eq!(
+            info.size_bytes,
+            8 * 1024 * 1024,
+            "size must come from the SFDP density, not a fabricated default"
+        );
+        assert!(
+            info.name.contains("via SFDP"),
+            "identity must be marked SFDP-sourced: {}",
+            info.name
+        );
+        assert_eq!(info.page_size, Some(256));
+        assert_eq!(info.sector_size, Some(4096));
+    }
+
+    // The capability that actually matters: a full read of an unlisted chip now
+    // succeeds end-to-end because identify sizes it from SFDP instead of failing
+    // with size 0 (which read_chip_to_file rejects as ChipNotDetected).
+    #[test]
+    fn read_unlisted_sfdp_chip_succeeds_end_to_end() {
+        use crate::sfdp::{build_synthetic_sfdp, BuildSfdpOptions};
+        const SIZE_8MB: usize = 8 * 1024 * 1024;
+        let jedec = [0xab, 0xcd, 0x18];
+        assert!(lookup_by_jedec_id("abcd18").is_none());
+        let sfdp_space = build_synthetic_sfdp(&BuildSfdpOptions::default()); // 8 MB
+        let mut bus = LoopbackFlash::new(SIZE_8MB, jedec).with_sfdp(sfdp_space);
+        bus.flash[0] = 0xa5;
+        bus.flash[SIZE_8MB - 1] = 0x5a;
+        let mut backend = CH341ABackend::with_bus(bus);
+        let path = test_tmp("sfdp-unlisted-read.bin");
+        let r = backend.read_chip(&path).unwrap();
+        assert!(r.success);
+        assert_eq!(r.size_bytes as usize, SIZE_8MB);
+        let dump = std::fs::read(&path).unwrap();
+        assert_eq!(dump[0], 0xa5);
+        assert_eq!(dump[SIZE_8MB - 1], 0x5a, "top byte of the SFDP-sized range");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // No SFDP table ⇒ identify stays honest: a valid id still identifies, but
+    // size remains 0 (Unknown) rather than inventing geometry. A later read then
+    // fails closed instead of dumping a wrongly-sized image.
+    #[test]
+    fn identify_unlisted_jedec_without_sfdp_stays_unknown_size_zero() {
+        let jedec = [0xab, 0xcd, 0x18];
+        assert!(lookup_by_jedec_id("abcd18").is_none());
+        let bus = LoopbackFlash::new(1024, jedec); // no .with_sfdp → 0xff on 0x5A
+        let mut backend = CH341ABackend::with_bus(bus);
+        let info = backend
+            .identify_chip()
+            .unwrap()
+            .expect("a valid id still identifies even without SFDP");
+        assert_eq!(info.jedec_id, "abcd18");
+        assert_eq!(
+            info.size_bytes, 0,
+            "no SFDP ⇒ honest unknown size, never a fabricated one"
+        );
+        assert!(info.name.starts_with("Unknown"));
+        assert!(!info.name.contains("via SFDP"));
     }
 
     #[test]
