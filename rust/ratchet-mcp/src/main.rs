@@ -10,23 +10,8 @@ use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind};
 use ratchet_core::diagnostics::spi_integrity::{classify_dead_bus, dead_bus_hint};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::sync::OnceLock;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
-
-/// Open the live-or-mock backend. Warning (no-device, libusb-init failure,
-/// etc.) is logged once to stderr so MCP clients see the note in their server
-/// log without polluting every JSON-RPC response.
-fn open_dyn() -> Box<dyn Backend + Send> {
-    static WARNED: OnceLock<()> = OnceLock::new();
-    let r = open_default();
-    if let Some(ref msg) = r.warning {
-        if WARNED.set(()).is_ok() {
-            eprintln!("ratchet-mcp: {msg}");
-        }
-    }
-    r.backend
-}
 
 /// Open the backend for any tool that returns silicon data as authoritative —
 /// destructive writes (write_chip / erase_chip / region_erase / wp_disable) AND
@@ -686,8 +671,29 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, (i32, String)> {
 
 // ─── Mock-backed tool impls ──────────────────────────────────────────────────
 
+/// ProgrammerInfo-shaped answer for "nothing claimable is attached". The mock
+/// would answer `connected:true`, which is a lie for the one tool whose whole
+/// job is "what is attached?" — report not-connected plus the factory's reason
+/// (absent vs interface-busy need different fixes).
+fn no_programmer_info(reason: String) -> Value {
+    json!({
+        "type": "none",
+        "connected": false,
+        "vendorId": "",
+        "productId": "",
+        "description": reason,
+        "backend": "none",
+    })
+}
+
 fn call_detect() -> Result<Value, (i32, String)> {
-    let mut m = open_dyn();
+    let r = open_default();
+    if r.kind == BackendKind::Mock && !r.force_mock_env {
+        return Ok(no_programmer_info(r.warning.unwrap_or_else(|| {
+            "no CH341A or CH347 USB device detected".into()
+        })));
+    }
+    let mut m = r.backend;
     let info = m.detect_programmer().map_err(map_err)?;
     Ok(serde_json::to_value(&info).unwrap_or(Value::Null))
 }
@@ -897,7 +903,20 @@ fn call_chip_info(args: &Value) -> Result<Value, (i32, String)> {
     let key = arg_str(args, "key")?;
     let chip = ratchet_core::chips::lookup_by_jedec_id(&key)
         .or_else(|| ratchet_core::chips::lookup_by_name(&key));
-    Ok(serde_json::to_value(chip).unwrap_or(Value::Null))
+    if chip.is_some() {
+        return Ok(serde_json::to_value(chip).unwrap_or(Value::Null));
+    }
+    // No exact hit. Never a bare null: surface near-matches so the caller can
+    // re-query with a real key. Deliberately no fuzzy auto-pick — suffix
+    // variants of one part number can carry different JEDEC IDs (W25Q256JW-IM
+    // is ef8019, plain -JW reads ef6019), and guessing silicon identity is how
+    // wrong-voltage mistakes happen.
+    let suggestions: Vec<&str> = ratchet_core::chips::search(&key)
+        .into_iter()
+        .map(|c| c.name.as_str())
+        .take(8)
+        .collect();
+    Ok(json!({"found": false, "key": key, "suggestions": suggestions}))
 }
 
 fn call_post_decode(args: &Value) -> Result<Value, (i32, String)> {
@@ -1078,5 +1097,46 @@ mod tests {
         let v = with_backend_field(json!({"success": true}), BackendKind::Mock);
         assert_eq!(v["backend"], "mock");
         assert_eq!(v["success"], true);
+    }
+
+    // detect must never present the mock's `connected:true` as a hardware
+    // answer: the no-programmer shape says not-connected and carries the WHY.
+    #[test]
+    fn detect_no_hardware_shape_is_honest() {
+        let v = no_programmer_info("interface busy: claimed by another process".into());
+        assert_eq!(v["connected"], false);
+        assert_eq!(v["backend"], "none");
+        assert_eq!(v["type"], "none");
+        assert!(v["description"]
+            .as_str()
+            .unwrap()
+            .contains("interface busy"));
+    }
+
+    #[test]
+    fn chip_info_exact_name_hit_returns_chip() {
+        let v = call_chip_info(&json!({"key": "W25Q256FW"})).unwrap();
+        assert_eq!(v["jedecId"], "ef6019");
+        // voltage is f32 in the DB; JSON round-trips it as an f64 approximation
+        assert!((v["voltage"].as_f64().unwrap() - 1.8).abs() < 1e-3);
+    }
+
+    #[test]
+    fn chip_info_miss_returns_suggestions_not_null() {
+        // "W25Q256JW" is not a DB name (the ef6019 part is filed as W25Q256FW;
+        // only the ef8019 variant carries JW in its name). Must not be a bare
+        // null, and must not silently auto-pick a different JEDEC ID.
+        let v = call_chip_info(&json!({"key": "W25Q256JW"})).unwrap();
+        assert!(!v.is_null());
+        assert_eq!(v["found"], false);
+        let s = v["suggestions"].as_array().unwrap();
+        assert!(s.iter().any(|n| n == "W25Q256JW-IM"));
+    }
+
+    #[test]
+    fn chip_info_garbage_key_gives_empty_suggestions() {
+        let v = call_chip_info(&json!({"key": "ZZZ999NOPE"})).unwrap();
+        assert_eq!(v["found"], false);
+        assert_eq!(v["suggestions"].as_array().unwrap().len(), 0);
     }
 }

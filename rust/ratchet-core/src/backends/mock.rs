@@ -8,15 +8,11 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const MOCK_JEDEC: JedecId = JedecId {
-    manufacturer: 0xef,
-    memory_type: 0x40,
-    capacity: 0x17,
-};
 const MOCK_SIZE: usize = 8 * 1024 * 1024; // 8MB  -  W25Q64
 
 pub struct MockBackend {
     flash: Vec<u8>,
+    jedec: JedecId,
     opened: bool,
     write_protected: bool,
     quality_mode: QualityMode,
@@ -29,9 +25,19 @@ impl Default for MockBackend {
 }
 
 impl MockBackend {
+    /// Identity is derived from the requested size so it can never disagree
+    /// with the emulated array: the JEDEC capacity byte is log2(size) per the
+    /// standard convention (8MB -> 0x17 = W25Q64JV, 32MB -> 0x19 = W25Q256JV,
+    /// which exercises the 4-byte-address pipeline in forced-mock runs).
     pub fn new(size_bytes: usize) -> Self {
+        let capacity = size_bytes.next_power_of_two().trailing_zeros() as u8;
         Self {
             flash: vec![0xff; size_bytes],
+            jedec: JedecId {
+                manufacturer: 0xef,
+                memory_type: 0x40,
+                capacity,
+            },
             opened: false,
             write_protected: false,
             quality_mode: QualityMode::Stable,
@@ -84,11 +90,11 @@ impl Backend for MockBackend {
     }
 
     fn read_jedec_id(&mut self) -> Result<JedecId> {
-        Ok(MOCK_JEDEC)
+        Ok(self.jedec)
     }
 
     fn identify_chip(&mut self) -> Result<Option<ChipInfo>> {
-        let jedec_hex = MOCK_JEDEC.to_hex();
+        let jedec_hex = self.jedec.to_hex();
         let info = if let Some(db) = lookup_by_jedec_id(&jedec_hex) {
             ChipInfo {
                 name: db.name.clone(),
@@ -104,12 +110,14 @@ impl Backend for MockBackend {
                 voltage: Some(db.voltage),
             }
         } else {
+            // Derived ID missing from the DB (odd emulated size): stay honest
+            // about what this is and keep size coherent with the array.
             ChipInfo {
-                name: "W25Q64".to_string(),
-                vendor_name: "Winbond".to_string(),
+                name: "MockFlash".to_string(),
+                vendor_name: "Mock".to_string(),
                 jedec_id: jedec_hex,
-                size_bytes: MOCK_SIZE as u64,
-                size_human: "8 MB".to_string(),
+                size_bytes: self.flash.len() as u64,
+                size_human: format_size(self.flash.len() as u64),
                 chip_type: "spi".to_string(),
                 page_size: Some(256),
                 sector_size: Some(4096),
@@ -295,7 +303,7 @@ impl Backend for MockBackend {
                         ids.push(noisy_ids[(i as usize) % noisy_ids.len()].to_string());
                         timings.push(5 + i * 25);
                     } else {
-                        ids.push("ef4017".to_string());
+                        ids.push(self.jedec.to_hex());
                         timings.push(5);
                     }
                 }
@@ -318,7 +326,7 @@ impl Backend for MockBackend {
                 stable: true,
                 reads: read_count,
                 matches: read_count,
-                jedec_id: "ef4017".to_string(),
+                jedec_id: self.jedec.to_hex(),
                 timings: vec![5; read_count as usize],
                 status_register: Some(0x00),
                 error: None,
@@ -369,6 +377,18 @@ mod tests {
         let mut m = MockBackend::default();
         let id = m.read_jedec_id().unwrap();
         assert_eq!(id.to_hex(), "ef4017");
+    }
+
+    // Identity must track the emulated size: a 32MB mock that still claims to
+    // be an 8MB W25Q64 makes every size-dependent path (4-byte addressing,
+    // oversize-image checks) untestable in forced-mock runs.
+    #[test]
+    fn identity_is_coherent_with_emulated_size() {
+        let mut m = MockBackend::new(32 * 1024 * 1024);
+        assert_eq!(m.read_jedec_id().unwrap().to_hex(), "ef4019");
+        let info = m.identify_chip().unwrap().unwrap();
+        assert_eq!(info.size_bytes, 32 * 1024 * 1024);
+        assert!(info.name.starts_with("W25Q256"));
     }
 
     #[test]

@@ -34,7 +34,12 @@ pub const UIO_STM_OUT: u8 = 0x80;
 pub const UIO_STM_END: u8 = 0x20;
 
 pub const STM_SPI_CS: u8 = 0x01;
-pub const STM_SPI_DBG: u8 = 0x04;
+/// Direction mask making D0-D5 outputs: CS0/CS1/CS2, SCK (D3), DOUT2 (D4),
+/// MOSI (D5). D6/D7 stay inputs (D7 is MISO). This is the mask every working
+/// reference implementation programs (flashrom ch341a_spi.c and ch341prog use
+/// 0x3F); anything narrower leaves SCK/MOSI hi-Z and the chip never hears a
+/// command — the bus then reads all-zero with perfect physical contact.
+pub const STM_SPI_DIR_OUTPUTS: u8 = 0x3f;
 
 // SPI flash command bytes ────────────────────────────────────────────────────
 pub const SPI_RDID: u8 = 0x9f;
@@ -87,11 +92,13 @@ pub const SIZE_16MB: u64 = 16 * 1024 * 1024;
 // ─── Pure protocol functions (no I/O) ───────────────────────────────────────
 
 /// Build the SPI-mode-enable UIO packet sent right after claiming the interface.
+/// OUT first (CS0 high = deasserted, SCK/MOSI low = mode-0 idle), then DIR
+/// 0x3F so CS, SCK and MOSI are actually driven — see STM_SPI_DIR_OUTPUTS.
 pub fn enable_spi_mode_packet() -> [u8; 4] {
     [
         CMD_UIO_STREAM,
         UIO_STM_OUT | STM_SPI_CS,
-        UIO_STM_DIR | (STM_SPI_CS | STM_SPI_DBG),
+        UIO_STM_DIR | STM_SPI_DIR_OUTPUTS,
         UIO_STM_END,
     ]
 }
@@ -440,7 +447,14 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// larger than 16 MB: without it a 4-byte address sent after a plain READ (0x03) is
     /// misinterpreted, so reads/writes land at the wrong offset. Sending EN4B is the most
     /// compatible activation — it works even on parts that lack the dedicated 4-byte opcodes.
+    ///
+    /// WREN precedes EN4B: Micron N25Q/MT25Q parts latch the address-mode change only when
+    /// the write-enable latch is set and otherwise silently ignore B7h (then every 4-byte
+    /// address reads one byte short — a wrong-offset dump). Winbond/Macronix accept B7h with
+    /// or without WREN and ignore the dangling WEL (a subsequent READ does not consume it),
+    /// so the extra command is safe across vendors.
     pub fn enter_4byte_mode(&mut self) -> Result<()> {
+        self.spi_command(&[SPI_WREN])?;
         self.spi_command(&[SPI_EN4B])?;
         self.use_4byte_addr = true;
         Ok(())
@@ -449,7 +463,9 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// Leave 4-byte address mode (EX4B, 0xe9) and clear the flag. Always paired with
     /// enter_4byte_mode at operation end: a chip left in 4-byte mode misaddresses for
     /// the next tool (or the motherboard itself) that assumes power-on 3-byte mode.
+    /// WREN precedes EX4B for the same cross-vendor reason as enter_4byte_mode.
     pub fn exit_4byte_mode(&mut self) -> Result<()> {
+        self.spi_command(&[SPI_WREN])?;
         self.spi_command(&[SPI_EX4B])?;
         self.use_4byte_addr = false;
         Ok(())
@@ -935,7 +951,13 @@ mod tests {
         let pkt = enable_spi_mode_packet();
         assert_eq!(pkt[0], CMD_UIO_STREAM);
         assert_eq!(pkt[1], UIO_STM_OUT | STM_SPI_CS);
-        assert_eq!(pkt[2], UIO_STM_DIR | (STM_SPI_CS | STM_SPI_DBG));
+        // DIR must drive D0-D5 (0x3F, the flashrom/ch341prog mask). A narrower
+        // mask leaves SCK/MOSI hi-Z: the chip never receives a command and the
+        // bus reads all-zero even with perfect contact.
+        assert_eq!(pkt[2], UIO_STM_DIR | STM_SPI_DIR_OUTPUTS);
+        assert_eq!(pkt[2] & 0x08, 0x08, "SCK (D3) must be an output");
+        assert_eq!(pkt[2] & 0x20, 0x20, "MOSI (D5) must be an output");
+        assert_eq!(pkt[2] & 0x80, 0, "MISO (D7) must stay an input");
         assert_eq!(pkt[3], UIO_STM_END);
     }
 
@@ -1223,10 +1245,12 @@ mod tests {
         let mut bus = MockBus::new();
         bus.queue_read(chip_rx(vec![0x00, 0x00])); // WP guard RDSR → unprotected
         bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x19])); // RDID → W25Q256
+        bus.queue_read(chip_rx(vec![0u8; 8])); // WREN (enter 4-byte, Micron gate)
         bus.queue_read(chip_rx(vec![0u8; 8])); // EN4B
-        bus.queue_read(chip_rx(vec![0u8; 8])); // WREN
+        bus.queue_read(chip_rx(vec![0u8; 8])); // WREN (erase)
         bus.queue_read(chip_rx(vec![0u8; 8])); // sector erase cmd
         bus.queue_read(chip_rx(vec![0x00, 0x00])); // WIP poll → ready
+        bus.queue_read(chip_rx(vec![0u8; 8])); // WREN (exit 4-byte, Micron gate)
         bus.queue_read(chip_rx(vec![0u8; 8])); // EX4B
         let mut backend = CH341ABackend::with_bus(bus);
         backend.region_erase(0x0100_0000, 4096).unwrap();
@@ -1640,6 +1664,15 @@ mod tests {
         jedec: [u8; 3],
         frame: Vec<u8>,
         read_pos: usize,
+        /// EN4B (0xB7) state, like real silicon: while set, mode-dependent
+        /// opcodes (0x03/0x02/0x20) carry 4 address bytes.
+        four_byte: bool,
+        /// Write-enable latch (set by WREN 0x06).
+        wel: bool,
+        /// Micron-like gating: when true, EN4B/EX4B are honored only if WEL is
+        /// set, exactly as Micron N25Q/MT25Q behave. A driver that omits the
+        /// WREN before B7h then never enters 4-byte mode and misframes reads.
+        strict_en4b: bool,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -1648,10 +1681,28 @@ mod tests {
                 jedec,
                 frame: Vec::new(),
                 read_pos: 0,
+                four_byte: false,
+                wel: false,
+                strict_en4b: false,
             }
+        }
+        /// Model a Micron-family part that ignores EN4B/EX4B unless WREN preceded it.
+        fn micron_like(mut self) -> Self {
+            self.strict_en4b = true;
+            self
         }
         fn decode_addr(bytes: &[u8]) -> usize {
             bytes.iter().fold(0usize, |acc, &b| (acc << 8) | b as usize)
+        }
+        /// Address length for an opcode given the current EN4B state — mirrors
+        /// datasheet behavior: dedicated 4B opcodes always take 4 bytes,
+        /// classic opcodes take 4 only while EN4B is active.
+        fn addr_len(&self, op: u8) -> usize {
+            match op {
+                SPI_READ_4B | SPI_PAGE_PROGRAM_4B | SPI_SECTOR_ERASE_4B | SPI_BLOCK_ERASE_4B => 4,
+                _ if self.four_byte => 4,
+                _ => 3,
+            }
         }
         /// Full-duplex response for absolute frame position `pos`, given `self.frame` so far.
         fn response_byte(&self, pos: usize) -> u8 {
@@ -1668,7 +1719,7 @@ mod tests {
                 }
                 SPI_RDSR | SPI_RDSR2 | SPI_RDSR3 => 0, // WIP clear
                 op @ (SPI_READ | SPI_READ_4B) => {
-                    let addr_len = if op == SPI_READ_4B { 4 } else { 3 };
+                    let addr_len = self.addr_len(op);
                     let data_start = 1 + addr_len;
                     if pos >= data_start && self.frame.len() >= data_start {
                         let base = Self::decode_addr(&self.frame[1..data_start]);
@@ -1687,15 +1738,28 @@ mod tests {
             }
             match self.frame[0] {
                 SPI_CHIP_ERASE => self.flash.iter_mut().for_each(|b| *b = 0xff),
+                SPI_WREN => self.wel = true,
+                SPI_EN4B => {
+                    if !self.strict_en4b || self.wel {
+                        self.four_byte = true;
+                    }
+                    self.wel = false;
+                }
+                SPI_EX4B => {
+                    if !self.strict_en4b || self.wel {
+                        self.four_byte = false;
+                    }
+                    self.wel = false;
+                }
                 op @ (SPI_SECTOR_ERASE | SPI_SECTOR_ERASE_4B) => {
-                    let al = if op == SPI_SECTOR_ERASE_4B { 4 } else { 3 };
+                    let al = self.addr_len(op);
                     let a = Self::decode_addr(&self.frame[1..1 + al]);
                     for b in self.flash.iter_mut().skip(a).take(4096) {
                         *b = 0xff;
                     }
                 }
                 op @ (SPI_PAGE_PROGRAM | SPI_PAGE_PROGRAM_4B) => {
-                    let al = if op == SPI_PAGE_PROGRAM_4B { 4 } else { 3 };
+                    let al = self.addr_len(op);
                     let a = Self::decode_addr(&self.frame[1..1 + al]);
                     for (i, &d) in self.frame[1 + al..].iter().enumerate() {
                         if let Some(cell) = self.flash.get_mut(a + i) {
@@ -1742,6 +1806,70 @@ mod tests {
             reverse_bits_in_place(&mut out);
             Ok(out)
         }
+    }
+
+    // W25Q256JW-class part (ef6019, 32 MB): identify auto-sends EN4B, then the
+    // classic 0x03 read must carry FOUR address bytes. LoopbackFlash tracks
+    // EN4B like silicon, so if the driver ever frames 3-byte addresses on a
+    // >16 MB chip (or never enters 4-byte mode), every marker below lands at
+    // the wrong offset and this test fails — this is the regression net for
+    // the exact read path a 32 MB BIOS dump takes.
+    #[test]
+    fn read_32mb_chip_crosses_16mb_boundary_correctly() {
+        const SIZE_32MB: usize = 32 * 1024 * 1024;
+        let mut bus = LoopbackFlash::new(SIZE_32MB, [0xef, 0x60, 0x19]);
+        bus.flash[0] = 0xa5;
+        // Distinct bytes straddling the 16 MB line: 3-byte addressing cannot
+        // even express offsets past 0x00FF_FFFF.
+        let boundary = 16 * 1024 * 1024;
+        let markers: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        for (i, m) in markers.iter().enumerate() {
+            bus.flash[boundary - 3 + i] = *m;
+        }
+        bus.flash[SIZE_32MB - 1] = 0x5a;
+
+        let mut backend = CH341ABackend::with_bus(bus);
+        let path = test_tmp("d4-32mb-read.bin");
+        let r = backend.read_chip(&path).unwrap();
+        assert!(r.success);
+        assert_eq!(r.size_bytes as usize, SIZE_32MB);
+
+        let dump = std::fs::read(&path).unwrap();
+        assert_eq!(dump.len(), SIZE_32MB);
+        assert_eq!(dump[0], 0xa5);
+        assert_eq!(&dump[boundary - 3..boundary + 3], &markers);
+        assert_eq!(dump[SIZE_32MB - 1], 0x5a, "top byte of the 32 MB range");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Same 32 MB read, but the emulated part gates EN4B on WREN like a Micron
+    // N25Q/MT25Q. If enter_4byte_mode omits the WREN before B7h, the strict
+    // part stays in 3-byte mode, the 0x03 read frames a 3-byte address, and the
+    // >16 MB markers land at the wrong offset — so this test fails closed on a
+    // regression of the WREN-before-EN4B fix.
+    #[test]
+    fn read_32mb_micron_gated_en4b_needs_wren() {
+        const SIZE_32MB: usize = 32 * 1024 * 1024;
+        let mut bus = LoopbackFlash::new(SIZE_32MB, [0xef, 0x60, 0x19]).micron_like();
+        let boundary = 16 * 1024 * 1024;
+        let markers: [u8; 6] = [0x9a, 0x8b, 0x7c, 0x6d, 0x5e, 0x4f];
+        for (i, m) in markers.iter().enumerate() {
+            bus.flash[boundary - 3 + i] = *m;
+        }
+        bus.flash[SIZE_32MB - 1] = 0xc3;
+
+        let mut backend = CH341ABackend::with_bus(bus);
+        let path = test_tmp("d5-32mb-micron.bin");
+        let r = backend.read_chip(&path).unwrap();
+        assert!(r.success);
+        let dump = std::fs::read(&path).unwrap();
+        assert_eq!(
+            &dump[boundary - 3..boundary + 3],
+            &markers,
+            "WREN-gated part only enters 4-byte mode if WREN preceded EN4B"
+        );
+        assert_eq!(dump[SIZE_32MB - 1], 0xc3, "top byte of the 32 MB range");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
