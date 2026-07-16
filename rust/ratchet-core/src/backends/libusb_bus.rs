@@ -17,6 +17,12 @@ use ratchet_usb::DeviceHandle;
 
 pub const DEFAULT_TIMEOUT_MS: u32 = 5_000;
 
+/// Parallel IN transfers kept in flight by `bulk_stream`. flashrom uses 32
+/// (USB_IN_TRANSFERS) and reports it as the most stable value; the ring must be
+/// deep enough that the host controller always has an IN queued when the device
+/// answers, or throughput collapses back to one round-trip per packet.
+pub const IN_RING: usize = 32;
+
 pub struct LibusbBus {
     handle: DeviceHandle,
     ep_in: u8,
@@ -104,6 +110,23 @@ impl UsbBus for LibusbBus {
 
     fn bulk_read_into(&mut self, buf: &mut [u8]) -> Result<()> {
         self.bulk_in_exact_into(buf)
+    }
+
+    fn bulk_stream(&mut self, out: &[u8], in_buf: &mut [u8], in_chunk: usize) -> Result<()> {
+        // Overlap OUT with a ring of INs. The trait default alternates one packet
+        // at a time (~350 us per 31 bytes); on real silicon that is the whole
+        // reason a 32 MB dump takes six minutes.
+        self.handle
+            .bulk_out_in_parallel(
+                self.ep_out,
+                out,
+                self.ep_in,
+                in_buf,
+                in_chunk,
+                IN_RING,
+                self.timeout_ms,
+            )
+            .map_err(BackendError::Usb)
     }
 }
 

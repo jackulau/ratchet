@@ -89,6 +89,18 @@ pub fn erase_timeout_for(size_bytes: u64) -> Duration {
 
 pub const SIZE_16MB: u64 = 16 * 1024 * 1024;
 
+/// Bytes per SPI read transaction. Each chunk is independently addressed and
+/// retryable, so this is the blast radius of one contact dropout. Big enough to
+/// amortise USB latency across the IN ring (a 64 KB chunk is ~2100 packets),
+/// small enough that a retry is cheap and progress stays responsive.
+pub const READ_CHUNK: usize = 64 * 1024;
+
+/// Attempts per chunk before a read gives up and fails closed.
+pub const READ_CHUNK_ATTEMPTS: u32 = 3;
+
+/// Erase granularity used by write_chip (matches SPI_BLOCK_ERASE / _4B).
+pub const BLOCK_64K: u64 = 64 * 1024;
+
 // ─── Pure protocol functions (no I/O) ───────────────────────────────────────
 
 /// Build the SPI-mode-enable UIO packet sent right after claiming the interface.
@@ -166,6 +178,26 @@ pub fn spi_stream_chunks(tx: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Pack an SPI tx stream into one contiguous run of CH341A USB packets: each is
+/// CMD_SPI_STREAM followed by up to 31 bit-reversed data bytes (LSB-first
+/// shifter, see reverse_bits_in_place).
+///
+/// Only the final packet may be short. That matters: the device replies with one
+/// 31-byte packet per full command packet, and a short USB packet terminates a
+/// bulk transfer, so uniform framing is what lets an IN ring size its transfers
+/// without knowing the payload. Same layout as flashrom's ch341a_spi.c.
+pub fn pack_spi_stream(tx: &[u8]) -> Vec<u8> {
+    let max_payload = MAX_XFER - 1; // 31 SPI bytes per USB packet
+    let mut out = Vec::with_capacity(tx.len() + tx.len().div_ceil(max_payload));
+    for chunk in tx.chunks(max_payload) {
+        out.push(CMD_SPI_STREAM);
+        let start = out.len();
+        out.extend_from_slice(chunk);
+        reverse_bits_in_place(&mut out[start..]);
+    }
+    out
+}
+
 /// Decode a 4-byte RDID response (cmd echo + 3 ID bytes).
 pub fn decode_jedec_response(rx: &[u8]) -> Option<JedecId> {
     if rx.len() < 4 {
@@ -199,6 +231,32 @@ pub trait UsbBus: Send {
             }));
         }
         buf.copy_from_slice(&rx[..buf.len()]);
+        Ok(())
+    }
+
+    /// Stream a run of pre-packed CH341A packets, draining the device's replies
+    /// concurrently. `out` is contiguous packets of CMD_SPI_STREAM + up to
+    /// `in_chunk` data bytes each (only the last may be short); the device
+    /// answers one byte per data byte, so `in_buf.len()` is the total data count.
+    ///
+    /// The default alternates one packet at a time — identical to what a caller
+    /// would have issued by hand, which is what mocks and unit tests observe.
+    /// `LibusbBus` overrides it with an overlapped async ring: measured on real
+    /// silicon, the CH341A accepts a batched OUT only up to ~4 packets and then
+    /// NAKs, and a caller blocked inside that OUT can never drain IN to unblock
+    /// it. Overlapping the directions is the only way to beat one round-trip per
+    /// 31 bytes (~350 us, i.e. 84 KiB/s).
+    fn bulk_stream(&mut self, out: &[u8], in_buf: &mut [u8], in_chunk: usize) -> Result<()> {
+        let mut done = 0usize;
+        for pkt in out.chunks(in_chunk + 1) {
+            self.bulk_write(pkt)?;
+            let n = (pkt.len() - 1).min(in_buf.len().saturating_sub(done));
+            if n == 0 {
+                break;
+            }
+            self.bulk_read_into(&mut in_buf[done..done + n])?;
+            done += n;
+        }
         Ok(())
     }
 }
@@ -253,6 +311,9 @@ pub struct CH341ABackend<B: UsbBus> {
     bus: Option<B>,
     use_4byte_addr: bool,
     progress: Option<super::ProgressFn>,
+    /// JEDEC id observed at identify time. Long operations re-check against it to
+    /// tell a dead bus apart from legitimately zero-filled flash.
+    jedec_expect: Option<[u8; 3]>,
 }
 
 impl<B: UsbBus> CH341ABackend<B> {
@@ -261,6 +322,7 @@ impl<B: UsbBus> CH341ABackend<B> {
             bus: Some(bus),
             use_4byte_addr: false,
             progress: None,
+            jedec_expect: None,
         }
     }
 
@@ -360,71 +422,106 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// Shared by `read_chip` (whole chip) and `verify_chip` (file-length read-back) so the two
     /// always use identical addressing.
     ///
-    /// The whole range streams inside ONE CS assertion: the opcode + address go out
-    /// once and the chip auto-increments while data is clocked out in 31-byte USB
-    /// packets. The old scheme re-issued READ + address + CS toggle per KiB — a
-    /// 5-byte header and two extra USB frames every 1024 bytes of an 8-16 MB dump.
+    /// The range is split into `READ_CHUNK`-sized SPI transactions, each a
+    /// self-contained CS↓ / READ+address / data / CS↑. Per-chunk framing is what
+    /// makes a dropout survivable: a wobbling probe costs one chunk retry instead
+    /// of corrupting the whole dump, and each chunk's bytes are streamed through
+    /// an overlapped IN ring rather than one round-trip per 31 bytes.
     pub fn read_range(&mut self, start_addr: u64, len: usize) -> Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let use_4byte = self.use_4byte_addr;
-        let progress = self.progress.as_mut();
-        let bus = self.bus.as_mut().ok_or(BackendError::NotConnected)?;
-        bus.bulk_write(&cs_assert_packet())?;
-        let res = Self::read_range_chunks(bus, start_addr, len, use_4byte, progress);
-        // CS must be released on success AND failure (see spi_command); the
-        // original error takes precedence over a deassert failure.
-        let deassert = bus.bulk_write(&cs_deassert_packet());
-        let buf = res?;
-        deassert?;
-        Ok(buf)
-    }
-
-    fn read_range_chunks(
-        bus: &mut B,
-        start_addr: u64,
-        len: usize,
-        use_4byte: bool,
-        mut progress: Option<&mut super::ProgressFn>,
-    ) -> Result<Vec<u8>> {
-        let max_payload = MAX_XFER - 1; // 31 SPI bytes per USB packet
-        let mut packet: Vec<u8> = Vec::with_capacity(max_payload + 1);
-        // Opcode + address, echoed back full-duplex and discarded.
-        packet.push(CMD_SPI_STREAM);
-        packet.push(SPI_READ);
-        packet.extend(address_bytes(start_addr, use_4byte));
-        // LSB-first shifter: reverse the opcode+address payload (the 0x00 dummy
-        // bytes in the data loop below are bit-order invariant, so only the rx
-        // side needs reversal there).
-        reverse_bits_in_place(&mut packet[1..]);
-        let header_len = packet.len() - 1;
-        bus.bulk_write(&packet)?;
-        // One reused rx buffer for the echo and every data chunk: an 8 MB dump
-        // is ~270k packets, and a fresh Vec per packet was pure allocator churn.
-        // bulk_read_into fails closed (ShortTransfer) on a short chunk — a short
-        // read would shift every subsequent byte left, an offset-misaligned dump
-        // that verify/backup would trust. Caller releases CS on error.
-        let mut rx = [0u8; MAX_XFER - 1];
-        bus.bulk_read_into(&mut rx[..header_len])?;
-        // Clock out the data: every dummy byte shifted in clocks one byte out.
-        let zeros = [0u8; MAX_XFER - 1];
         let mut buf = Vec::with_capacity(len);
         while buf.len() < len {
-            let n = (len - buf.len()).min(max_payload);
-            packet.clear();
-            packet.push(CMD_SPI_STREAM);
-            packet.extend_from_slice(&zeros[..n]);
-            bus.bulk_write(&packet)?;
-            bus.bulk_read_into(&mut rx[..n])?;
-            // Chip data arrives LSB-first from the CH341A shifter.
-            reverse_bits_in_place(&mut rx[..n]);
-            buf.extend_from_slice(&rx[..n]);
-            if let Some(cb) = progress.as_deref_mut() {
+            let n = (len - buf.len()).min(READ_CHUNK);
+            let addr = start_addr + buf.len() as u64;
+            let chunk = self.read_chunk_checked(addr, n)?;
+            buf.extend_from_slice(&chunk);
+            if let Some(cb) = self.progress.as_mut() {
                 cb(buf.len() as u64, len as u64);
             }
         }
         Ok(buf)
+    }
+
+    /// Read one chunk, retrying on transport errors and on a dead-bus result.
+    ///
+    /// A run of solid 0x00 is the dead-bus signature (see the Dead diagnosis in
+    /// connection_test), but it is also legal firmware content, so it cannot be
+    /// failed on alone. The discriminator is the chip itself: re-read the JEDEC
+    /// id, and if the chip no longer answers, contact dropped and the zeros are
+    /// garbage. Without this a wobbling probe yields a dump that is two-thirds
+    /// zeros and a "successful" backup that would have been worthless in a
+    /// restore.
+    fn read_chunk_checked(&mut self, addr: u64, n: usize) -> Result<Vec<u8>> {
+        let expect = self.jedec_expect;
+        let mut last: Option<String> = None;
+        for attempt in 1..=READ_CHUNK_ATTEMPTS {
+            let use_4byte = self.use_4byte_addr;
+            let bus = self.bus.as_mut().ok_or(BackendError::NotConnected)?;
+            match Self::read_one_chunk(bus, addr, n, use_4byte) {
+                Ok(data) => {
+                    if !data.iter().all(|&b| b == 0x00) {
+                        return Ok(data);
+                    }
+                    // All-zero: ask the chip whether it is still there.
+                    match self.rdid() {
+                        Ok(id) => {
+                            let live = [id.manufacturer, id.memory_type, id.capacity];
+                            if expect.is_none_or(|e| e == live) && live != [0, 0, 0] {
+                                return Ok(data); // chip answers: the zeros are real data
+                            }
+                            last = Some(format!(
+                                "chip id went {:02x}{:02x}{:02x} mid-read (expected {})",
+                                live[0],
+                                live[1],
+                                live[2],
+                                expect
+                                    .map(|e| format!("{:02x}{:02x}{:02x}", e[0], e[1], e[2]))
+                                    .unwrap_or_else(|| "a stable id".into())
+                            ));
+                        }
+                        Err(e) => last = Some(format!("chip stopped answering ({e})")),
+                    }
+                }
+                Err(e) => last = Some(e.to_string()),
+            }
+            if attempt < READ_CHUNK_ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        Err(BackendError::Other(format!(
+            "lost contact with the chip at offset {addr:#x} and could not recover in \
+             {READ_CHUNK_ATTEMPTS} attempts: {}. The probe is not holding — reseat it and \
+             re-run. (Refusing to write a dead-bus read to disk: a dump padded with zeros \
+             looks like a valid backup and is not.)",
+            last.unwrap_or_else(|| "unknown".into())
+        )))
+    }
+
+    /// One self-contained SPI read transaction, streamed as a single packed run.
+    fn read_one_chunk(bus: &mut B, addr: u64, n: usize, use_4byte: bool) -> Result<Vec<u8>> {
+        // Opcode + address are echoed back full-duplex and discarded. Packing them
+        // into the same stream as the dummy bytes keeps every USB packet full, so
+        // the device's replies stay a uniform 31 bytes for the IN ring to frame.
+        let mut tx = Vec::with_capacity(5 + n);
+        tx.push(SPI_READ);
+        tx.extend(address_bytes(addr, use_4byte));
+        let header_len = tx.len();
+        tx.resize(header_len + n, 0);
+        let stream = pack_spi_stream(&tx);
+        let mut rx = vec![0u8; tx.len()];
+        bus.bulk_write(&cs_assert_packet())?;
+        let res = bus.bulk_stream(&stream, &mut rx, MAX_XFER - 1);
+        // CS must be released on success AND failure (see spi_command); the
+        // original error takes precedence over a deassert failure.
+        let deassert = bus.bulk_write(&cs_deassert_packet());
+        res?;
+        deassert?;
+        // Chip data arrives LSB-first from the CH341A shifter.
+        reverse_bits_in_place(&mut rx);
+        rx.drain(..header_len);
+        Ok(rx)
     }
 
     /// Program a single page (≤ page_size bytes, never crossing a page boundary): WREN, then
@@ -562,6 +659,26 @@ impl<B: UsbBus> CH341ABackend<B> {
         Ok(())
     }
 
+    /// Erase one 64 KB block without the write-protect pre-check. Same contract as
+    /// sector_erase_inner: callers looping over a whole chip check protection once.
+    fn block_erase_inner(&mut self, address: u64) -> Result<EraseResult> {
+        let start = Instant::now();
+        self.spi_command(&[SPI_WREN])?;
+        let mut cmd = vec![if self.use_4byte_addr {
+            SPI_BLOCK_ERASE_4B
+        } else {
+            SPI_BLOCK_ERASE
+        }];
+        cmd.extend(address_bytes(address, self.use_4byte_addr));
+        self.spi_command(&cmd)?;
+        self.wait_until_ready(ERASE_TIMEOUT)?;
+        Ok(EraseResult {
+            success: true,
+            duration_ms: start.elapsed().as_millis() as u64,
+            error: None,
+        })
+    }
+
     /// Erase one sector without the write-protect pre-check. Callers that loop over
     /// many sectors (write_chip, region_erase) check protection once up front.
     fn sector_erase_inner(&mut self, address: u64) -> Result<EraseResult> {
@@ -672,24 +789,43 @@ impl<B: UsbBus> CH341ABackend<B> {
             Some(path.display().to_string())
         };
 
-        // 2. Erase every sector the image touches — SPI program can only flip 1→0, so the
-        //    target must be 0xFF first. (Each sector_erase issues WREN + erase + WIP-wait.)
-        //    The stride MUST match the issued opcode: sector_erase_inner sends the 4 KB
-        //    sector-erase (0x20/0x21), so stepping by the DB's sectorSize (64 KB on 155
-        //    of 806 chips) would leave unerased gaps that AND stale data into the image.
+        // 2. Erase every block the image touches — SPI program can only flip 1→0, so the
+        //    target must be 0xFF first.
+        //    Erase in 64 KB blocks (0xD8/0xDC), not 4 KB sectors (0x20/0x21). Both leave
+        //    the same 0xFF, but a 256 Mb part erases a block in ~150 ms typical and a
+        //    sector in ~45 ms: 512 blocks beats 8192 sectors by roughly five minutes of
+        //    hand-on-probe time. The stride MUST match the issued opcode, or the gaps
+        //    stay unerased and AND stale data into the image.
+        //    Only the tail falls back to 4 KB, when an image ends mid-block.
         let mut addr: u64 = 0;
-        while (addr as usize) < firmware.len() {
-            self.sector_erase_inner(addr)?;
-            addr += 4096;
+        let end = firmware.len() as u64;
+        while addr < end {
+            if end - addr >= BLOCK_64K {
+                self.block_erase_inner(addr)?;
+                addr += BLOCK_64K;
+            } else {
+                self.sector_erase_inner(addr)?;
+                addr += 4096;
+            }
+            if let Some(cb) = self.progress.as_mut() {
+                cb(addr.min(end), end);
+            }
         }
 
         // 3. Program page-by-page, never letting a PAGE_PROGRAM cross a page boundary (the chip
         //    wraps the address within the page if you do, silently corrupting the write).
+        //    Pages that are entirely 0xFF are skipped: step 2 just erased that range to
+        //    0xFF, so programming all-ones is a no-op that still costs a WREN, a page
+        //    program and a WIP poll. Vendor BIOS images are typically ~45% blank, so this
+        //    is minutes off the write with no change to the resulting bytes.
         let mut offset = 0usize;
         while offset < firmware.len() {
             let page_end = (offset / page_size + 1) * page_size;
             let chunk_end = page_end.min(firmware.len());
-            self.page_program(offset as u64, &firmware[offset..chunk_end])?;
+            let page = &firmware[offset..chunk_end];
+            if !page.iter().all(|&b| b == 0xFF) {
+                self.page_program(offset as u64, page)?;
+            }
             offset = chunk_end;
             if let Some(cb) = self.progress.as_mut() {
                 cb(offset as u64, firmware.len() as u64);
@@ -737,8 +873,12 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         let id = self.rdid()?;
         let hex = id.to_hex();
         if hex == "000000" || hex == "ffffff" {
+            self.jedec_expect = None;
             return Ok(None);
         }
+        // Anchor for mid-operation contact checks: a long read that comes back
+        // all-zero is only trustworthy if the chip still answers with this id.
+        self.jedec_expect = Some([id.manufacturer, id.memory_type, id.capacity]);
         let info = if let Some(db) = lookup_by_jedec_id(&hex) {
             ChipInfo {
                 name: db.name.clone(),
@@ -847,23 +987,7 @@ impl<B: UsbBus> Backend for CH341ABackend<B> {
         self.ensure_not_write_protected()?;
         let res = self
             .prepare_erase_addressing(address.saturating_add(1))
-            .and_then(|()| {
-                let start = Instant::now();
-                self.spi_command(&[SPI_WREN])?;
-                let mut cmd = vec![if self.use_4byte_addr {
-                    SPI_BLOCK_ERASE_4B
-                } else {
-                    SPI_BLOCK_ERASE
-                }];
-                cmd.extend(address_bytes(address, self.use_4byte_addr));
-                self.spi_command(&cmd)?;
-                self.wait_until_ready(ERASE_TIMEOUT)?;
-                Ok(EraseResult {
-                    success: true,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    error: None,
-                })
-            });
+            .and_then(|()| self.block_erase_inner(address));
         self.exit_4byte_if_entered();
         res
     }
@@ -1277,6 +1401,99 @@ mod tests {
     }
 
     #[test]
+    fn write_chip_erases_whole_blocks_with_the_block_opcode_and_covers_the_tail() {
+        // Erasing a 32 MB image 4 KB at a time is 8192 erases at ~45 ms typical:
+        // ~6 minutes of hand-on-probe time. 64 KB blocks do it in 512 at ~150 ms.
+        // Both leave 0xFF, so the only property that matters is that the union of
+        // erased ranges still covers every byte the program step will touch --
+        // any gap ANDs stale data into the image.
+        let path = test_tmp("erase-block-stride.bin");
+        let len = 128 * 1024 + 4096; // two whole blocks plus a short tail
+        std::fs::write(&path, vec![0xa5u8; len]).unwrap();
+        let mut bus = MockBus::new();
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x18])); // RDID → W25Q128, 16 MB, 3-byte addr
+        for _ in 0..6000 {
+            bus.queue_read(chip_rx(vec![0u8; 40]));
+        }
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap();
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
+        let mut covered = vec![false; len];
+        for w in writes {
+            if w.len() < 5 || w[0] != CMD_SPI_STREAM {
+                continue;
+            }
+            let size = match w[1] {
+                SPI_BLOCK_ERASE => 64 * 1024usize,
+                SPI_SECTOR_ERASE => 4096,
+                _ => continue,
+            };
+            let a = u32::from_be_bytes([0, w[2], w[3], w[4]]) as usize;
+            for byte in covered.iter_mut().skip(a).take(size) {
+                *byte = true;
+            }
+        }
+        assert!(
+            covered.iter().all(|&c| c),
+            "every byte of the image range must be erased -- an unerased gap corrupts the write"
+        );
+        let blocks = writes
+            .iter()
+            .filter(|w| w.len() >= 5 && w[0] == CMD_SPI_STREAM && w[1] == SPI_BLOCK_ERASE)
+            .count();
+        assert_eq!(blocks, 2, "the two whole 64 KB blocks use the block opcode");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_chip_skips_pages_that_are_already_blank() {
+        // The erase step just left this range at 0xFF, so programming an all-0xFF
+        // page writes nothing while still costing a WREN, a page program and a WIP
+        // poll. Vendor BIOS images run ~45% blank (the ASUS 5044 image is 45.6%),
+        // so skipping them is minutes off the write for identical resulting bytes.
+        let path = test_tmp("skip-blank-pages.bin");
+        let mut img = vec![0xffu8; 1024];
+        img[0..256].fill(0xa5); // page 0 has data
+        img[512..768].fill(0x5a); // page 2 has data; pages 1 and 3 stay blank
+        std::fs::write(&path, &img).unwrap();
+        let mut bus = MockBus::new();
+        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x18])); // RDID → W25Q128
+        for _ in 0..600 {
+            bus.queue_read(chip_rx(vec![0u8; 40]));
+        }
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap();
+        let writes = &chip_writes(&backend.bus.as_ref().unwrap().writes);
+        let programmed: Vec<u32> = writes
+            .iter()
+            .filter(|w| w.len() >= 5 && w[0] == CMD_SPI_STREAM && w[1] == SPI_PAGE_PROGRAM)
+            .map(|w| u32::from_be_bytes([0, w[2], w[3], w[4]]))
+            .collect();
+        assert_eq!(
+            programmed,
+            vec![0x000, 0x200],
+            "only the two non-blank pages get programmed (got {programmed:x?})"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn region_erase_uses_4byte_addressing_above_16mb() {
         // W25Q256 (ef4019) = 32 MB. A standalone region-erase above 16 MB must
         // identify first, enter 4-byte mode, issue the 4-byte sector-erase opcode
@@ -1376,7 +1593,7 @@ mod tests {
         let mut bus = MockBus::new();
         bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x19])); // RDID → W25Q256
         for _ in 0..8 {
-            bus.queue_read(chip_rx(vec![0u8; 40])); // EN4B + read chunks + EX4B (don't-care)
+            bus.queue_read(chip_rx(vec![0xa5u8; 40])); // EN4B + read chunks + EX4B (don't-care)
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.verify_chip(&path).unwrap();
@@ -1500,13 +1717,164 @@ mod tests {
         }
         let mut backend = CH341ABackend::with_bus(HeaderThenShortBus { reads: 0 });
         let err = backend.read_range(0, 64).unwrap_err();
+        // Retried first (a short chunk is what a wobbling probe produces), then
+        // failed closed. What matters is that it aborts and says why, never that it
+        // pads the range out to length.
+        let msg = err.to_string();
         assert!(
-            matches!(
-                err,
-                BackendError::Usb(ratchet_usb::UsbError::ShortTransfer { .. })
-            ),
-            "short data chunk must abort the read, got: {err}"
+            msg.contains("short transfer"),
+            "short data chunk must abort the read and name the cause, got: {msg}"
         );
+    }
+
+    /// Bus that clocks out solid 0x00 for data reads (the dead-bus signature) while
+    /// answering RDID with a configurable id. Lets a test drive the exact ambiguity
+    /// the contact check exists to resolve: are these zeros real flash content, or
+    /// is the probe simply not touching the chip?
+    struct ZeroDataBus {
+        id: [u8; 3],
+        rdid_next: bool,
+    }
+    impl UsbBus for ZeroDataBus {
+        fn bulk_write(&mut self, d: &[u8]) -> Result<()> {
+            // Payload is bit-reversed on the wire; un-reverse to spot an RDID frame.
+            self.rdid_next =
+                d.len() >= 2 && d[0] == CMD_SPI_STREAM && d[1].reverse_bits() == SPI_RDID;
+            Ok(())
+        }
+        fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
+            if self.rdid_next {
+                let mut v = vec![0u8, self.id[0], self.id[1], self.id[2]];
+                v.resize(len, 0);
+                Ok(chip_rx(v))
+            } else {
+                Ok(vec![0u8; len]) // 0x00 is bit-order invariant
+            }
+        }
+    }
+
+    #[test]
+    fn pack_spi_stream_keeps_every_packet_full_except_the_last() {
+        // The IN ring sizes its transfers assuming the device answers exactly 31
+        // bytes per full command packet. If pack_spi_stream ever emitted a short
+        // packet in the middle, that reply would be short too, the ring would
+        // mis-frame from that point on, and the dump would be silently misaligned.
+        for len in [1usize, 30, 31, 32, 61, 62, 63, 4096, 65541] {
+            let tx: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let packed = pack_spi_stream(&tx);
+            let mut sizes = Vec::new();
+            let mut i = 0;
+            let mut recovered = Vec::new();
+            while i < packed.len() {
+                assert_eq!(packed[i], CMD_SPI_STREAM, "each packet starts with 0xA8");
+                let payload = (packed.len() - i - 1).min(MAX_XFER - 1);
+                sizes.push(payload);
+                let mut chunk = packed[i + 1..i + 1 + payload].to_vec();
+                reverse_bits_in_place(&mut chunk); // undo the LSB-first shifter
+                recovered.extend_from_slice(&chunk);
+                i += 1 + payload;
+            }
+            assert_eq!(recovered, tx, "payload must round-trip for len {len}");
+            assert_eq!(
+                sizes.len(),
+                len.div_ceil(MAX_XFER - 1),
+                "packet count for len {len}"
+            );
+            if let Some((last, rest)) = sizes.split_last() {
+                assert!(
+                    rest.iter().all(|&s| s == MAX_XFER - 1),
+                    "only the final packet may be short (len {len}, sizes {sizes:?})"
+                );
+                assert!(*last > 0 && *last < MAX_XFER);
+            }
+            // Total wire bytes = payload + one command byte per packet, matching the
+            // length flashrom passes to its usb_transfer().
+            assert_eq!(packed.len(), len + len.div_ceil(MAX_XFER - 1));
+        }
+    }
+
+    #[test]
+    fn pack_spi_stream_empty_is_empty() {
+        assert!(pack_spi_stream(&[]).is_empty());
+    }
+
+    #[test]
+    fn read_refuses_all_zero_range_when_chip_stops_answering() {
+        // This is the failure that produced a 33 MB "backup" that was 67% zeros and
+        // reported success. A range of solid 0x00 plus a chip that no longer answers
+        // RDID means the probe lost contact; the bytes are garbage and must never
+        // reach disk looking like a valid dump.
+        let mut backend = CH341ABackend::with_bus(ZeroDataBus {
+            id: [0x00, 0x00, 0x00],
+            rdid_next: false,
+        });
+        let err = backend.read_range(0, 128).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lost contact"),
+            "dead bus must fail closed, got: {msg}"
+        );
+        assert!(
+            msg.contains("0x0"),
+            "error must name the offset so the user knows where it died: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_accepts_all_zero_range_when_chip_still_answers() {
+        // The other half of the discriminator: an all-0x00 range is legal firmware
+        // content. If the chip still answers RDID, the zeros are real data and the
+        // read must succeed - otherwise the check is just a false-positive machine.
+        let mut backend = CH341ABackend::with_bus(ZeroDataBus {
+            id: [0xef, 0x60, 0x19],
+            rdid_next: false,
+        });
+        let data = backend
+            .read_range(0, 128)
+            .expect("zeros with a live chip are real data");
+        assert_eq!(data, vec![0u8; 128]);
+    }
+
+    #[test]
+    fn read_refuses_when_chip_id_changes_mid_read() {
+        // Contact can degrade into a wrong-but-nonzero id rather than silence.
+        // Anything that is not the id identify() anchored on means the bus is no
+        // longer trustworthy.
+        let mut backend = CH341ABackend::with_bus(ZeroDataBus {
+            id: [0xef, 0x60, 0x19],
+            rdid_next: false,
+        });
+        backend.jedec_expect = Some([0xc2, 0x25, 0x39]); // identify saw a Macronix part
+        let err = backend.read_range(0, 128).unwrap_err();
+        assert!(
+            err.to_string().contains("ef6019"),
+            "error must report the id actually seen: {err}"
+        );
+    }
+
+    #[test]
+    fn read_retries_a_failed_chunk_before_giving_up() {
+        // A wobble should cost one retry, not the whole dump.
+        struct FlakyBus {
+            fails_left: u32,
+        }
+        impl UsbBus for FlakyBus {
+            fn bulk_write(&mut self, _d: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
+                if self.fails_left > 0 {
+                    self.fails_left -= 1;
+                    return Err(BackendError::Usb(ratchet_usb::UsbError::Timeout));
+                }
+                Ok(chip_rx(vec![0xa5u8; len]))
+            }
+        }
+        let mut backend = CH341ABackend::with_bus(FlakyBus { fails_left: 1 });
+        let data = backend
+            .read_range(0, 64)
+            .expect("one transient failure must be retried, not fatal");
+        assert_eq!(data, vec![0xa5u8; 64]);
     }
 
     #[test]
@@ -1516,9 +1884,9 @@ mod tests {
         // the final (total, total) call to print its 100% line.
         use std::sync::{Arc, Mutex};
         let mut bus = MockBus::new();
-        bus.queue_read(chip_rx(vec![0u8; 8])); // header echo
+        bus.queue_read(chip_rx(vec![0xa5u8; 8])); // header echo
         for _ in 0..3 {
-            bus.queue_read(chip_rx(vec![0u8; 40])); // data chunks (31+31+2)
+            bus.queue_read(chip_rx(vec![0xa5u8; 40])); // data chunks (non-zero: see framing test)
         }
         let mut backend = CH341ABackend::with_bus(bus);
         let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2041,7 +2409,9 @@ mod tests {
         // inside exactly one CS assertion — never re-addressed per KiB.
         let mut bus = MockBus::new();
         for _ in 0..120 {
-            bus.queue_read(chip_rx(vec![0u8; 40])); // header echo + 31-byte data chunks
+            // Non-zero filler: an all-0x00 range is the dead-bus signature and would
+            // (correctly) trip the contact check. This test is about framing.
+            bus.queue_read(chip_rx(vec![0xa5u8; 40])); // header echo + 31-byte data chunks
         }
         let mut backend = CH341ABackend::with_bus(bus);
         let data = backend.read_range(0, 3 * 1024).unwrap();
