@@ -101,6 +101,11 @@ pub const READ_CHUNK_ATTEMPTS: u32 = 3;
 /// Erase granularity used by write_chip (matches SPI_BLOCK_ERASE / _4B).
 pub const BLOCK_64K: u64 = 64 * 1024;
 
+/// Attempts per block before a write gives up. A block is erased, programmed and
+/// read back as one unit, so a retry re-does the whole unit and cannot leave the
+/// block half-erased.
+pub const WRITE_BLOCK_ATTEMPTS: u32 = 3;
+
 // ─── Pure protocol functions (no I/O) ───────────────────────────────────────
 
 /// Build the SPI-mode-enable UIO packet sent right after claiming the interface.
@@ -702,6 +707,14 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// Whole-chip read without the trailing EX4B: write_chip's backup step runs this
     /// mid-operation while 4-byte mode must stay active.
     fn read_chip_to_file(&mut self, output_path: &Path) -> Result<ReadResult> {
+        self.read_chip_to_file_buf(output_path).map(|(r, _)| r)
+    }
+
+    /// As `read_chip_to_file`, but also hands back the bytes it just read.
+    /// `write_chip_inner` uses the mandatory backup read as its baseline for
+    /// deciding which blocks already hold the target image, so the skip check
+    /// costs no extra probe time.
+    fn read_chip_to_file_buf(&mut self, output_path: &Path) -> Result<(ReadResult, Vec<u8>)> {
         let start = Instant::now();
         let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
         let size = chip.size_bytes as usize;
@@ -715,16 +728,19 @@ impl<B: UsbBus> CH341ABackend<B> {
         let checksum: String = hex_encode(&h.finalize());
         let all_ff = buf.iter().all(|&b| b == 0xff);
         let all_zero = buf.iter().all(|&b| b == 0x00);
-        Ok(ReadResult {
-            success: true,
-            file_path: output_path.display().to_string(),
-            size_bytes: buf.len() as u64,
-            duration_ms: start.elapsed().as_millis() as u64,
-            checksum,
-            all_ff: Some(all_ff),
-            all_zero: Some(all_zero),
-            error: None,
-        })
+        Ok((
+            ReadResult {
+                success: true,
+                file_path: output_path.display().to_string(),
+                size_bytes: buf.len() as u64,
+                duration_ms: start.elapsed().as_millis() as u64,
+                checksum,
+                all_ff: Some(all_ff),
+                all_zero: Some(all_zero),
+                error: None,
+            },
+            buf,
+        ))
     }
 
     /// Read-back comparison without the trailing EX4B: write_chip's verify step runs
@@ -781,71 +797,167 @@ impl<B: UsbBus> CH341ABackend<B> {
         //    A user reflashing a motherboard should never lose their only copy of the old
         //    BIOS — the backup goes to the persistent, owner-only per-user dir (temp_dir
         //    is wiped on reboot and world-readable; dumps can carry NVRAM secrets).
-        let backup_path = if opts.skip_backup {
-            None
+        //    The backup bytes are kept: they are a liveness-checked read of what the chip
+        //    currently holds, which is exactly the baseline needed to decide which blocks
+        //    already match the image. Reusing it makes the skip check free.
+        let (backup_path, baseline) = if opts.skip_backup {
+            (None, None)
         } else {
             let path = super::backup::create_private_backup_path("ratchet-backup")?;
-            self.read_chip_to_file(&path)?;
-            Some(path.display().to_string())
+            let (_, buf) = self.read_chip_to_file_buf(&path)?;
+            (Some(path.display().to_string()), Some(buf))
         };
 
-        // 2. Erase every block the image touches — SPI program can only flip 1→0, so the
-        //    target must be 0xFF first.
-        //    Erase in 64 KB blocks (0xD8/0xDC), not 4 KB sectors (0x20/0x21). Both leave
-        //    the same 0xFF, but a 256 Mb part erases a block in ~150 ms typical and a
-        //    sector in ~45 ms: 512 blocks beats 8192 sectors by roughly five minutes of
-        //    hand-on-probe time. The stride MUST match the issued opcode, or the gaps
-        //    stay unerased and AND stale data into the image.
-        //    Only the tail falls back to 4 KB, when an image ends mid-block.
+        // 2. Walk the image one 64 KB block at a time, and for each block: skip it if the
+        //    chip already holds the target bytes, otherwise erase + program + read back.
+        //
+        //    This ordering is a safety property, not a style choice. Erasing the WHOLE chip
+        //    and then programming it (the obvious structure) leaves every byte at 0xFF for
+        //    the entire programming pass: lose the probe in that window and the board has no
+        //    BIOS at all. Per-block, the erased window is one 64 KB block for the ~2 s it
+        //    takes to erase and program it, and everything outside that block is either
+        //    already-correct new data or still-intact old data.
+        //
+        //    It is also what makes a write resumable. The chip itself is the progress record:
+        //    a re-run reads each block, finds the ones already programmed, and skips them, so
+        //    an interrupted write is continued rather than restarted. No sidecar state to go
+        //    stale, and running the same write twice is harmless.
+        let mut blocks_written = 0usize;
+        let mut blocks_skipped = 0usize;
         let mut addr: u64 = 0;
         let end = firmware.len() as u64;
         while addr < end {
-            if end - addr >= BLOCK_64K {
-                self.block_erase_inner(addr)?;
-                addr += BLOCK_64K;
+            let lo = addr as usize;
+            let block_len = BLOCK_64K.min(end - addr) as usize;
+            let target = &firmware[lo..lo + block_len];
+
+            // The backup read is the baseline. With skip_backup there is none, and this
+            // does NOT go read the chip to synthesise one: the caller opted out of a
+            // whole-chip read, so honour that and just write every block. The cost of
+            // that choice is losing the skip (and with it resume), not correctness.
+            let already_correct = baseline
+                .as_ref()
+                .filter(|b| b.len() >= lo + block_len)
+                .is_some_and(|b| &b[lo..lo + block_len] == target);
+
+            if already_correct {
+                blocks_skipped += 1;
             } else {
-                self.sector_erase_inner(addr)?;
-                addr += 4096;
+                self.write_block_verified(addr, target, page_size, !opts.skip_verify)?;
+                blocks_written += 1;
             }
+            addr += block_len as u64;
             if let Some(cb) = self.progress.as_mut() {
-                cb(addr.min(end), end);
+                cb(addr, end);
             }
         }
 
-        // 3. Program page-by-page, never letting a PAGE_PROGRAM cross a page boundary (the chip
-        //    wraps the address within the page if you do, silently corrupting the write).
-        //    Pages that are entirely 0xFF are skipped: step 2 just erased that range to
-        //    0xFF, so programming all-ones is a no-op that still costs a WREN, a page
-        //    program and a WIP poll. Vendor BIOS images are typically ~45% blank, so this
-        //    is minutes off the write with no change to the resulting bytes.
-        let mut offset = 0usize;
-        while offset < firmware.len() {
-            let page_end = (offset / page_size + 1) * page_size;
-            let chunk_end = page_end.min(firmware.len());
-            let page = &firmware[offset..chunk_end];
-            if !page.iter().all(|&b| b == 0xFF) {
-                self.page_program(offset as u64, page)?;
-            }
-            offset = chunk_end;
-            if let Some(cb) = self.progress.as_mut() {
-                cb(offset as u64, firmware.len() as u64);
-            }
-        }
-
-        // 4. Read back and compare unless the caller opted out.
-        let verified = if opts.skip_verify {
-            false
-        } else {
-            self.verify_against_file(input_path)?.matches
-        };
-
+        // Every block was either read back and compared after programming, or shown to
+        // already hold the target bytes by a liveness-checked read. There is no separate
+        // whole-chip verify pass: it would re-read 32 MB the loop just read, doubling the
+        // time the probe has to stay put for no new information.
+        let _ = (blocks_written, blocks_skipped);
         Ok(WriteResult {
             success: true,
             backup_path,
-            verified,
+            verified: !opts.skip_verify,
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
+    }
+
+    /// Erase + program + read back one block, retrying the whole unit on failure.
+    ///
+    /// Retrying at block granularity is what keeps a wobbling probe survivable: a
+    /// dropout costs this block, not the write. The retry re-erases before
+    /// re-programming, so a half-programmed block from the failed attempt cannot
+    /// leave stale 0 bits ANDed into the result.
+    fn write_block_verified(
+        &mut self,
+        addr: u64,
+        target: &[u8],
+        page_size: usize,
+        verify: bool,
+    ) -> Result<()> {
+        let mut last: Option<String> = None;
+        for attempt in 1..=WRITE_BLOCK_ATTEMPTS {
+            match self.try_write_block(addr, target, page_size, verify) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e.to_string()),
+            }
+            if attempt < WRITE_BLOCK_ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        Err(BackendError::Other(format!(
+            "lost the chip while writing the block at {addr:#x}; {} attempts failed: {}. \
+             Re-seat the probe and re-run the SAME write — blocks already programmed are \
+             skipped, so it resumes here instead of starting over. Do not boot the board \
+             until a write completes: this block is erased or half-programmed.",
+            WRITE_BLOCK_ATTEMPTS,
+            last.unwrap_or_else(|| "unknown".into())
+        )))
+    }
+
+    /// One attempt at making `target` the contents of the chip at `addr`.
+    fn try_write_block(
+        &mut self,
+        addr: u64,
+        target: &[u8],
+        page_size: usize,
+        verify: bool,
+    ) -> Result<()> {
+        // Erase: SPI program only flips 1→0, so the range must read 0xFF first. The
+        // stride MUST match the issued opcode or the gaps stay unerased and AND stale
+        // data into the image. A full block uses BLOCK_ERASE (~150 ms on a 256 Mb part);
+        // only a tail shorter than a block falls back to 4 KB sectors (~45 ms each).
+        let block_end = addr + target.len() as u64;
+        let mut a = addr;
+        while a < block_end {
+            if block_end - a >= BLOCK_64K {
+                self.block_erase_inner(a)?;
+                a += BLOCK_64K;
+            } else {
+                self.sector_erase_inner(a)?;
+                a += 4096;
+            }
+        }
+
+        // Program page-by-page, never letting a PAGE_PROGRAM cross a page boundary (the
+        // chip wraps the address within the page if you do, silently corrupting the write).
+        // All-0xFF pages are skipped: the erase above already left them 0xFF, so
+        // programming all-ones is a no-op that still costs a WREN, a page program and a
+        // WIP poll. Vendor BIOS images run ~45% blank, so this is minutes off the write.
+        let mut off = 0usize;
+        while off < target.len() {
+            let abs = addr as usize + off;
+            let page_end = ((abs / page_size + 1) * page_size - addr as usize).min(target.len());
+            let page = &target[off..page_end];
+            if !page.iter().all(|&b| b == 0xFF) {
+                self.page_program(addr + off as u64, page)?;
+            }
+            off = page_end;
+        }
+
+        // Read back through read_range, so the dropout check applies here too: a block
+        // that "verifies" against a dead bus is exactly the failure this guards.
+        if verify {
+            let back = self.read_range(addr, target.len())?;
+            if back != target {
+                let at = back
+                    .iter()
+                    .zip(target)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
+                return Err(BackendError::Other(format!(
+                    "read-back mismatch at {:#x} (chip {:#04x}, image {:#04x})",
+                    addr + at as u64,
+                    back.get(at).copied().unwrap_or(0),
+                    target.get(at).copied().unwrap_or(0)
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2084,6 +2196,10 @@ mod tests {
         /// SFDP image returned for 0x5A reads. Empty ⇒ the part exposes no SFDP
         /// table (reads answer 0xff, so discovery finds no valid signature).
         sfdp: Vec<u8>,
+        /// Ordered log of (opcode, address) for erase/program, so tests can assert
+        /// not just the final bytes but the SEQUENCE — specifically that an erase
+        /// never runs far ahead of the program that refills it.
+        ops: Vec<(u8, usize)>,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -2096,6 +2212,7 @@ mod tests {
                 wel: false,
                 strict_en4b: false,
                 sfdp: Vec::new(),
+                ops: Vec::new(),
             }
         }
         /// Model a Micron-family part that ignores EN4B/EX4B unless WREN preceded it.
@@ -2183,13 +2300,26 @@ mod tests {
                 op @ (SPI_SECTOR_ERASE | SPI_SECTOR_ERASE_4B) => {
                     let al = self.addr_len(op);
                     let a = Self::decode_addr(&self.frame[1..1 + al]);
+                    self.ops.push((SPI_SECTOR_ERASE, a));
                     for b in self.flash.iter_mut().skip(a).take(4096) {
+                        *b = 0xff;
+                    }
+                }
+                // 64 KB block erase (0xD8 / 0xDC). write_chip issues this as its PRIMARY
+                // erase opcode, so a fake that ignores it would leave stale data that the
+                // program step ANDs into — every end-to-end write test would be a lie.
+                op @ (SPI_BLOCK_ERASE | SPI_BLOCK_ERASE_4B) => {
+                    let al = self.addr_len(op);
+                    let a = Self::decode_addr(&self.frame[1..1 + al]);
+                    self.ops.push((SPI_BLOCK_ERASE, a));
+                    for b in self.flash.iter_mut().skip(a).take(BLOCK_64K as usize) {
                         *b = 0xff;
                     }
                 }
                 op @ (SPI_PAGE_PROGRAM | SPI_PAGE_PROGRAM_4B) => {
                     let al = self.addr_len(op);
                     let a = Self::decode_addr(&self.frame[1..1 + al]);
+                    self.ops.push((SPI_PAGE_PROGRAM, a));
                     for (i, &d) in self.frame[1 + al..].iter().enumerate() {
                         if let Some(cell) = self.flash.get_mut(a + i) {
                             *cell &= d; // program can only clear bits — faithful to NOR flash
@@ -2299,6 +2429,135 @@ mod tests {
         );
         assert_eq!(dump[SIZE_32MB - 1], 0xc3, "top byte of the 32 MB range");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // The blank-window property. Erasing the WHOLE chip and then programming it (the
+    // obvious structure, and what this code used to do) leaves every byte at 0xFF for
+    // the entire programming pass: lose the probe in that window and the board has no
+    // BIOS at all and no way to boot to fix itself. Per-block, only the block being
+    // programmed is ever blank. Asserting on the final bytes cannot catch a regression
+    // here -- both orderings end with the same chip contents -- so assert the SEQUENCE.
+    #[test]
+    fn write_chip_erases_only_the_block_it_is_about_to_program() {
+        const SIZE: usize = 512 * 1024; // 8 blocks
+                                        // |1 keeps every page non-blank, so each block really does get programmed.
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("blank-window.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .unwrap();
+
+        let ops = &backend.bus.as_ref().unwrap().ops;
+        let first_program = ops
+            .iter()
+            .position(|(op, _)| *op == SPI_PAGE_PROGRAM)
+            .expect("something must be programmed");
+        let erases_before_first_program = ops[..first_program]
+            .iter()
+            .filter(|(op, _)| *op == SPI_BLOCK_ERASE)
+            .count();
+        assert_eq!(
+            erases_before_first_program, 1,
+            "only the block about to be programmed may be erased; erasing all 8 up front \
+             would leave the whole chip blank for the entire program pass"
+        );
+
+        // And no erase may run while an earlier block is still blank.
+        let mut blank: Option<usize> = None;
+        for (op, addr) in ops {
+            match *op {
+                SPI_BLOCK_ERASE => {
+                    assert!(
+                        blank.is_none(),
+                        "erased {addr:#x} while {:#x?} was still blank",
+                        blank
+                    );
+                    blank = Some(*addr);
+                }
+                // The block is being refilled, so it is no longer blank.
+                SPI_PAGE_PROGRAM
+                    if blank.is_some_and(|b| *addr >= b && *addr < b + BLOCK_64K as usize) =>
+                {
+                    blank = None;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "chip must still end up matching the image"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The resume property. A write that lost the probe part-way must be continuable by
+    // simply re-running it: blocks already holding the target bytes are skipped, so the
+    // chip itself is the progress record and there is no sidecar state to go stale.
+    #[test]
+    fn write_chip_skips_blocks_that_already_hold_the_target_image() {
+        const SIZE: usize = 1024 * 1024; // 16 blocks
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("resume-skip.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]);
+        // Model an earlier write that finished blocks 0..3, then lost contact.
+        let done = 3 * BLOCK_64K as usize;
+        bus.flash[..done].copy_from_slice(&firmware[..done]);
+
+        let mut backend = CH341ABackend::with_bus(bus);
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: false, // backup read doubles as the baseline
+                    skip_verify: false,
+                },
+            )
+            .unwrap();
+        assert!(w.verified);
+
+        let erased: Vec<usize> = backend
+            .bus
+            .as_ref()
+            .unwrap()
+            .ops
+            .iter()
+            .filter(|(op, _)| *op == SPI_BLOCK_ERASE)
+            .map(|(_, a)| *a)
+            .collect();
+        for b in 0..3 {
+            assert!(
+                !erased.contains(&(b * BLOCK_64K as usize)),
+                "block {b} already held the image and must NOT be re-erased (erased: {erased:x?})"
+            );
+        }
+        for b in 3..16 {
+            assert!(
+                erased.contains(&(b * BLOCK_64K as usize)),
+                "block {b} differs from the image and must be erased (erased: {erased:x?})"
+            );
+        }
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "resumed write must still leave the whole chip matching the image"
+        );
+        if let Some(bp) = w.backup_path {
+            std::fs::remove_file(bp).ok();
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
