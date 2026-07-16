@@ -2484,10 +2484,11 @@ mod tests {
                     );
                     blank = Some(*addr);
                 }
-                SPI_PAGE_PROGRAM => {
-                    if blank.is_some_and(|b| *addr >= b && *addr < b + BLOCK_64K as usize) {
-                        blank = None; // block is being refilled
-                    }
+                // The block is being refilled, so it is no longer blank.
+                SPI_PAGE_PROGRAM
+                    if blank.is_some_and(|b| *addr >= b && *addr < b + BLOCK_64K as usize) =>
+                {
+                    blank = None;
                 }
                 _ => {}
             }
