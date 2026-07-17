@@ -1299,6 +1299,13 @@ impl<B: UsbBus> CH341ABackend<B> {
                 Err(e) => last = Some(e.to_string()),
             }
             if attempt < WRITE_BLOCK_ATTEMPTS {
+                // Deliberately NOT a wait_for_contact here, though it looks like the
+                // obvious place for one. The block's verify readback goes through
+                // read_range -> read_chunk_patient, which already waits out a dropout, so
+                // by the time an attempt fails on mismatched data the probe is back and
+                // the retry lands. Adding a second wait here was tried: removing it again
+                // left every test green, which is the suite correctly reporting that it
+                // bought nothing. See a_write_rides_out_a_dropout_...
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -3291,6 +3298,54 @@ mod tests {
             backend.bus.as_ref().unwrap().flash,
             firmware,
             "waiting for the probe to arrive must still program the whole image"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A write survives a probe that drops out mid-flash and comes back: it does NOT need a
+    // human to re-run it. The mechanism is worth naming because it is not where you would
+    // look: nothing in the block retry loop waits. The block's verify readback goes through
+    // read_range -> read_chunk_patient, which waits for contact, so the failed attempt
+    // ALREADY blocks until the probe returns and the retry then lands.
+    //
+    // Established by mutation, in the direction that costs code rather than adds it: a
+    // second explicit wait_for_contact in the retry loop was written, and deleting it again
+    // left this test green. That is the suite reporting the wait bought nothing, so it was
+    // reverted. Keep this test: it pins the property, whoever provides it.
+    //
+    // Safe for reasons that are NOT obvious, and that a future reader should not re-derive:
+    // losing contact is losing power, so nothing is mid-erase while we wait; the retry
+    // re-erases before re-programming, so an attempt is idempotent; and the dedicated
+    // 4-byte erase/program opcodes cannot be misframed by a chip that came back in its
+    // 3-byte power-on default, which is precisely the trap that made waiting READS land at
+    // addr>>8.
+    #[test]
+    fn a_write_rides_out_a_dropout_and_needs_no_human_to_re_run_it() {
+        const SIZE: usize = 512 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("dropout-midwrite.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        // Contact dies partway through and comes back after a few RDID polls -- which only
+        // happen if something WAITS. The block's verify read is what notices.
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).recovering_after(300_000, 3);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .expect("a probe that flickers mid-write must be waited out, not given up on");
+        assert!(w.verified);
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "riding out a mid-write dropout must still leave the whole image on the chip"
         );
         std::fs::remove_file(&path).ok();
     }
