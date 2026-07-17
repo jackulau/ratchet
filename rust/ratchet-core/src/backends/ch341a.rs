@@ -715,7 +715,22 @@ impl<B: UsbBus> CH341ABackend<B> {
         // into the same stream as the dummy bytes keeps every USB packet full, so
         // the device's replies stay a uniform 31 bytes for the IN ring to frame.
         let mut tx = Vec::with_capacity(5 + n);
-        tx.push(SPI_READ);
+        // The dedicated 4-byte opcode, not plain READ + EN4B, for the same reason
+        // page_program and erase already use theirs: 0x13 carries 4 address bytes by
+        // definition, so it cannot be misframed by what mode the chip happens to be
+        // in. 0x03 is mode-DEPENDENT, and the mode is chip state we do not control:
+        // a chip that loses power reverts to the 3-byte power-on default while
+        // use_4byte_addr stays true here. It then eats 3 of our 4 address bytes as
+        // the address and the 4th as data, so every read lands at addr>>8.
+        //
+        // That is not hypothetical. A probe that flickers IS a power interruption,
+        // and since reads now wait out flickers instead of dying on them, the read
+        // resumes against a chip that silently reset. RDID answers identically in
+        // both modes so the liveness check cannot see it, and the wrong bytes are
+        // deterministic so the per-chunk double-read agrees with itself. It walked
+        // through every gate and produced a "successful" 32 MB dump that was 128 KB
+        // of chip smeared 256x (measured: 99.22% self-similar at chunk_size - 32).
+        tx.push(if use_4byte { SPI_READ_4B } else { SPI_READ });
         tx.extend(address_bytes(addr, use_4byte));
         let header_len = tx.len();
         tx.resize(header_len + n, 0);
@@ -2700,6 +2715,12 @@ mod tests {
                     {
                         self.contact_lost.set(false);
                         self.dead_from.set(None);
+                        // Losing contact IS losing power, and a chip that loses power
+                        // comes back in its 3-byte power-on default. Modelling the
+                        // recovery without this made contact loss look free, which is
+                        // how a read that waits out flickers shipped while silently
+                        // reading at addr>>8 afterwards.
+                        self.four_byte = false;
                     }
                 }
                 // Each read transaction is a fresh pass over the wire, so corrupted
@@ -2939,6 +2960,50 @@ mod tests {
         assert!(
             std::fs::read(&path).unwrap() == content,
             "waiting out a flicker must still produce the chip byte for byte"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Reproduces the dump that started this: a 32 MB read that held contact, passed
+    // every gate, reported success, and was 128 KB of chip smeared across 32 MB.
+    //
+    // The probe flickers. A flicker is a power interruption, so the chip comes back in
+    // its 3-byte power-on default while use_4byte_addr is still true here. Plain READ
+    // (0x03) is mode-DEPENDENT: the chip then takes 3 of our 4 address bytes as the
+    // address and the 4th as data, and every read lands at addr>>8. Nothing catches it
+    // downstream because RDID answers the same in both modes and the wrong bytes are
+    // deterministic, so the per-chunk double-read cheerfully agrees with itself.
+    //
+    // The fix is the one page_program and erase already had: use the dedicated 4-byte
+    // opcode, which cannot be misframed by chip state.
+    #[test]
+    fn a_chip_that_power_cycles_mid_read_must_not_silently_read_at_the_wrong_address() {
+        const SIZE: usize = 32 * 1024 * 1024; // ef6019 = W25Q256JW, needs 4-byte addressing
+        let content: Vec<u8> = (0..SIZE)
+            .map(|i| (i.wrapping_mul(31) % 251) as u8 | 1)
+            .collect();
+        let path = test_tmp("power-cycle-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        // Contact drops early and returns 3 polls later, power-cycling the chip back
+        // into 3-byte mode exactly as real silicon does.
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x60, 0x19]).recovering_after(100_000, 3);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let r = backend
+            .read_chip(&path)
+            .expect("a flicker must not fail the read");
+        assert!(r.success);
+        let got = std::fs::read(&path).unwrap();
+        assert!(
+            got == content,
+            "a chip that reset to 3-byte mode must not be read at addr>>8: \
+             {} of {} bytes wrong",
+            got.iter().zip(&content).filter(|(a, b)| a != b).count(),
+            content.len()
         );
         std::fs::remove_file(&path).ok();
     }
