@@ -640,9 +640,18 @@ impl<B: UsbBus> CH341ABackend<B> {
     ///
     /// Waiting here is as free as it is anywhere else: RDID against a silent chip is
     /// a successful USB transfer reporting `000000`, not an error path.
+    ///
+    /// On timeout it reports WHICH failure happened, because they need different fixes:
+    /// several DIFFERENT ids we could not size is a marginal probe (mechanical), one id
+    /// seen consistently is a chip we lack an entry for (a real refusal), and nothing at
+    /// all is no contact.
     fn identify_chip_patient(&mut self) -> Result<ChipInfo> {
         let deadline = Instant::now() + self.chunk_patience;
         let mut announced = false;
+        // Ids that answered but that neither the chip DB nor SFDP could size. Kept in
+        // sight order, deduped, capped: this is a diagnostic, not a log.
+        let mut unsizable: Vec<String> = Vec::new();
+        let mut unsizable_chip: Option<ChipInfo> = None;
         loop {
             // Nothing in here may escape the wait. Two things that did:
             //
@@ -665,14 +674,42 @@ impl<B: UsbBus> CH341ABackend<B> {
                     }
                     return Ok(chip);
                 }
+                if !unsizable.contains(&chip.jedec_id) && unsizable.len() < 8 {
+                    unsizable.push(chip.jedec_id.clone());
+                }
+                unsizable_chip = Some(chip);
             }
             if Instant::now() >= deadline {
-                return Err(BackendError::ChipNotDetected);
+                // Two DIFFERENT ids we could not size did not come from two chips. A
+                // marginal window shifts a different wrong value in each time, which is
+                // the same discriminator we use for the bus itself: a real part repeats,
+                // a bad contact varies. Naming the garbage matters -- reporting the first
+                // one as "unknown chip capacity for JEDEC id 1fffff" sends someone off to
+                // look up a chip that does not exist, when the fix is mechanical.
+                if unsizable.len() > 1 {
+                    return Err(BackendError::Other(format!(
+                        "no stable chip id in {}s: read {} different ids that match no \
+                         known chip ({}). Different garbage each time means the probe is \
+                         making and breaking contact mid-transfer, NOT that the chip is \
+                         unsupported. Nothing has been written. Reseat the probe (clamped, \
+                         not hand-held) and check it with 'ratchet monitor --samples 100'.",
+                        self.chunk_patience.as_secs(),
+                        unsizable.len(),
+                        unsizable.join(", "),
+                    )));
+                }
+                // Exactly one id, seen consistently: that is an answer, not noise. Hand it
+                // back so the caller can give its own verdict -- write's "unknown chip
+                // capacity, refusing to write blind" is more use than a flat "not detected".
+                return match unsizable_chip {
+                    Some(chip) => Ok(chip),
+                    None => Err(BackendError::ChipNotDetected),
+                };
             }
             if !announced {
                 eprintln!(
                     "no chip answering yet — waiting up to {}s for the probe to make \
-                     contact. Nothing has been read; Ctrl-C is safe.",
+                     contact. Nothing has been read or written; Ctrl-C is safe.",
                     self.chunk_patience.as_secs()
                 );
                 announced = true;
@@ -1130,29 +1167,15 @@ impl<B: UsbBus> CH341ABackend<B> {
         // does NOT make the write itself tolerate a dropout; that is per-block
         // erase/program/verify, and re-running the same command resumes it.
         //
-        // Look FIRST and wait only on a miss, rather than polling before every write.
-        // A seated probe must cost no extra bus traffic: the write tests queue an exact
-        // response sequence and an unconditional probe ate the RDID meant for identify,
-        // which is the mock telling the truth about a real change to the wire.
-        //
-        // Identify NORMALLY here rather than via identify_chip_patient. The patient
-        // version keeps waiting for an id it can SIZE, which is right for a read but
-        // wrong here: a genuinely unsupported chip would spend the whole budget and then
-        // report "chip not detected" when it is present and answering. The honest answer
-        // is the unknown-capacity refusal below. Refusing loudly beats a false absence.
-        let chip = match self.identify_chip()? {
-            Some(chip) => chip,
-            None => {
-                let deadline = Instant::now() + self.chunk_patience;
-                let announce = format!(
-                    "no chip answering yet — waiting up to {}s for the probe to make \
-                     contact. Nothing has been erased or written; Ctrl-C is safe.",
-                    self.chunk_patience.as_secs()
-                );
-                self.wait_for_contact(deadline, &announce);
-                self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?
-            }
-        };
+        // Be exactly as patient about finding the chip as the read is. An earlier version
+        // of this looked once and refused on whatever came back, reasoning that a
+        // genuinely unsupported chip deserves an immediate honest refusal instead of a
+        // wait. Real hardware disagreed within hours: a marginal probe answered `1fffff`,
+        // then `00bfff`, then nothing, and the write refused four times running while
+        // naming ids that do not exist. Garbage shifted in through a bad contact window is
+        // far more common than an unlisted chip, so the patient path is the right default
+        // and identify_chip_patient separates the two by whether the id REPEATS.
+        let chip = self.identify_chip_patient()?;
         let chip_size = chip.size_bytes as usize;
         if chip_size == 0 {
             return Err(BackendError::Other(format!(
@@ -1181,10 +1204,19 @@ impl<B: UsbBus> CH341ABackend<B> {
         //    The backup bytes are kept: they are a liveness-checked read of what the chip
         //    currently holds, which is exactly the baseline needed to decide which blocks
         //    already match the image. Reusing it makes the skip check free.
+        //    The path is keyed on the CHIP, not on the clock, so an interrupted backup
+        //    resumes on the next run. With a timestamped name every attempt started the
+        //    32 MB read from zero and orphaned the sidecar, so a probe that could not hold
+        //    the whole read could never get past this step however many times it was run --
+        //    and the read path's "re-running resumes from here" was a lie inside a write.
         let (backup_path, baseline) = if opts.skip_backup {
             (None, None)
         } else {
-            let path = super::backup::create_private_backup_path("ratchet-backup")?;
+            let path = super::backup::stable_backup_path(
+                "ratchet-backup",
+                &chip.jedec_id,
+                chip.size_bytes,
+            )?;
             let (_, buf) = self.read_chip_to_file_buf(&path)?;
             (Some(path.display().to_string()), Some(buf))
         };
@@ -1267,6 +1299,13 @@ impl<B: UsbBus> CH341ABackend<B> {
                 Err(e) => last = Some(e.to_string()),
             }
             if attempt < WRITE_BLOCK_ATTEMPTS {
+                // Deliberately NOT a wait_for_contact here, though it looks like the
+                // obvious place for one. The block's verify readback goes through
+                // read_range -> read_chunk_patient, which already waits out a dropout, so
+                // by the time an attempt fails on mismatched data the probe is back and
+                // the retry lands. Adding a second wait here was tried: removing it again
+                // left every test green, which is the suite correctly reporting that it
+                // bought nothing. See a_write_rides_out_a_dropout_...
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -2654,8 +2693,10 @@ mod tests {
         floating: std::cell::Cell<bool>,
         /// Model an id read through a marginal window: self-consistent garbage that
         /// misses the chip DB, so it sizes to 0 and is not actionable.
-        garbage_id: Option<[u8; 3]>,
+        garbage_ids: Vec<[u8; 3]>,
         garbage_id_polls: std::cell::Cell<u32>,
+        /// Which garbage id the NEXT id request gets, so successive polls differ.
+        garbage_id_cursor: std::cell::Cell<usize>,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -2676,8 +2717,9 @@ mod tests {
                 corrupt_from: None,
                 read_pass: 0,
                 floating: std::cell::Cell::new(false),
-                garbage_id: None,
+                garbage_ids: Vec::new(),
                 garbage_id_polls: std::cell::Cell::new(0),
+                garbage_id_cursor: std::cell::Cell::new(0),
             }
         }
         /// Model the probe not touching the chip AT ALL when the read starts, then
@@ -2698,8 +2740,20 @@ mod tests {
         /// first `polls` id requests, then the real one. With no SFDP table (the
         /// default) an id that misses the chip DB sizes to 0 bytes, which is the
         /// "chip is answering" / "chip not detected" contradiction from the field.
-        fn garbage_id_until_poll(mut self, id: [u8; 3], polls: u32) -> Self {
-            self.garbage_id = Some(id);
+        fn garbage_id_until_poll(self, id: [u8; 3], polls: u32) -> Self {
+            self.garbage_ids_until_poll(vec![id], polls)
+        }
+        /// As `garbage_id_until_poll`, but cycles through `ids` so each poll reads a
+        /// DIFFERENT wrong value.
+        ///
+        /// This is what a marginal probe actually does, and modelling garbage as one
+        /// fixed wrong id was too kind: a single repeated id is indistinguishable from a
+        /// real chip we lack an entry for, so the fake could not express the difference
+        /// the code now turns on. Real hardware read `1fffff`, then `00bfff`, then
+        /// nothing, within one minute.
+        fn garbage_ids_until_poll(mut self, ids: Vec<[u8; 3]>, polls: u32) -> Self {
+            assert!(!ids.is_empty(), "need at least one garbage id");
+            self.garbage_ids = ids;
             self.garbage_id_polls = std::cell::Cell::new(polls);
             self
         }
@@ -2762,7 +2816,9 @@ mod tests {
                 SPI_RDID if self.contact_lost.get() => 0,
                 SPI_RDID => {
                     if (1..=3).contains(&pos) {
-                        match self.garbage_id {
+                        // The cursor advances per id REQUEST (in commit_frame), not per
+                        // byte, so all three bytes of one answer come from the same id.
+                        match self.garbage_ids.get(self.garbage_id_cursor.get()) {
                             Some(g) if self.garbage_id_polls.get() > 0 => g[pos - 1],
                             _ => self.jedec[pos - 1],
                         }
@@ -2828,10 +2884,13 @@ mod tests {
                         self.four_byte = false;
                     }
                 }
-                // A marginal window settles after a few polls: the garbage id gives
-                // way to the real one.
+                // A marginal window settles after a few polls: the garbage ids give
+                // way to the real one. Each poll advances the cursor so successive
+                // answers DIFFER, which is what tells garbage apart from a real chip.
                 SPI_RDID if self.garbage_id_polls.get() > 0 => {
                     self.garbage_id_polls.set(self.garbage_id_polls.get() - 1);
+                    let next = (self.garbage_id_cursor.get() + 1) % self.garbage_ids.len();
+                    self.garbage_id_cursor.set(next);
                 }
                 // Each read transaction is a fresh pass over the wire, so corrupted
                 // regions hand back different bytes next time.
@@ -3239,6 +3298,228 @@ mod tests {
             backend.bus.as_ref().unwrap().flash,
             firmware,
             "waiting for the probe to arrive must still program the whole image"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A write survives a probe that drops out mid-flash and comes back: it does NOT need a
+    // human to re-run it. The mechanism is worth naming because it is not where you would
+    // look: nothing in the block retry loop waits. The block's verify readback goes through
+    // read_range -> read_chunk_patient, which waits for contact, so the failed attempt
+    // ALREADY blocks until the probe returns and the retry then lands.
+    //
+    // Established by mutation, in the direction that costs code rather than adds it: a
+    // second explicit wait_for_contact in the retry loop was written, and deleting it again
+    // left this test green. That is the suite reporting the wait bought nothing, so it was
+    // reverted. Keep this test: it pins the property, whoever provides it.
+    //
+    // Safe for reasons that are NOT obvious, and that a future reader should not re-derive:
+    // losing contact is losing power, so nothing is mid-erase while we wait; the retry
+    // re-erases before re-programming, so an attempt is idempotent; and the dedicated
+    // 4-byte erase/program opcodes cannot be misframed by a chip that came back in its
+    // 3-byte power-on default, which is precisely the trap that made waiting READS land at
+    // addr>>8.
+    #[test]
+    fn a_write_rides_out_a_dropout_and_needs_no_human_to_re_run_it() {
+        const SIZE: usize = 512 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("dropout-midwrite.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        // Contact dies partway through and comes back after a few RDID polls -- which only
+        // happen if something WAITS. The block's verify read is what notices.
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).recovering_after(300_000, 3);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .expect("a probe that flickers mid-write must be waited out, not given up on");
+        assert!(w.verified);
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "riding out a mid-write dropout must still leave the whole image on the chip"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // write's mandatory pre-write backup used a TIMESTAMPED path, so every attempt began
+    // the 32 MB read at zero and orphaned the previous run's resume sidecar. On a probe
+    // that cannot hold the whole read that makes the write unreachable no matter how many
+    // times it is run -- a cliff, not a slope. It also made the read path's "Ctrl-C is safe
+    // and re-running resumes from here", printed from inside a write, a false promise. The
+    // path must be a function of the CHIP, not of the clock.
+    #[test]
+    fn writes_backup_path_is_stable_across_runs_so_an_interrupted_backup_resumes() {
+        let _guard = crate::backends::test_env::lock();
+        let sandbox = std::env::temp_dir().join(format!(
+            "ratchet-stable-backup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let prev = std::env::var_os("RATCHET_BACKUP_DIR");
+        std::env::set_var("RATCHET_BACKUP_DIR", &sandbox);
+
+        const SIZE: usize = 128 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("stable-backup-write.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let mut backend = CH341ABackend::with_bus(LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]));
+            let w = backend
+                .write_chip(
+                    &path,
+                    WriteOpts {
+                        skip_backup: false, // the backup read IS the baseline
+                        skip_verify: true,
+                    },
+                )
+                .unwrap();
+            seen.push(
+                w.backup_path
+                    .expect("a write must report where it backed up to"),
+            );
+        }
+
+        assert_eq!(
+            seen[0], seen[1],
+            "two runs against the same chip must reuse ONE backup path, else the resume \
+             sidecar is orphaned and the read restarts from zero every attempt"
+        );
+        assert!(
+            seen[0].contains("ef4018"),
+            "the path must be keyed on chip IDENTITY (not the clock) so a sidecar is only \
+             ever reused for the same chip, got: {}",
+            seen[0]
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("RATCHET_BACKUP_DIR", v),
+            None => std::env::remove_var("RATCHET_BACKUP_DIR"),
+        }
+        std::fs::remove_dir_all(&sandbox).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
+    // From the field, 2026-07-17: a marginal probe answered `1fffff`, then `00bfff`, then
+    // nothing, and write refused four times running with "unknown chip capacity for JEDEC
+    // id 1fffff" -- naming a chip that does not exist and sending the user to look it up,
+    // when the fix was mechanical. write looked ONCE and refused on whatever came back, on
+    // the theory that an unlisted chip deserves an instant honest refusal. Garbage from a
+    // bad window is far more common than an unlisted chip; the wait is the right default.
+    #[test]
+    fn write_waits_out_the_varying_garbage_ids_a_marginal_probe_produces() {
+        const SIZE: usize = 256 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("garbage-id-write.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        // The exact ids the user's probe produced, then the real chip.
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).garbage_ids_until_poll(
+            vec![[0x1f, 0xff, 0xff], [0x00, 0xbf, 0xff], [0x1f, 0xff, 0xff]],
+            3,
+        );
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .expect("garbage ids from a marginal window must be waited out, not refused");
+        assert!(w.verified);
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "once the probe settles the write must still program the whole image"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The other half of the same decision: ONE id, seen consistently, is a real answer
+    // from a chip we have no entry for. That must NOT be waited out into a vague timeout
+    // -- it keeps the specific "unknown chip capacity, refusing to write blind" refusal.
+    // Guards the regression I shipped this morning in the opposite direction.
+    #[test]
+    fn a_single_stable_unsizable_id_still_refuses_with_unknown_capacity() {
+        let path = test_tmp("stable-unknown-capacity.bin");
+        std::fs::write(&path, vec![0xa5u8; 4096]).unwrap();
+
+        // aabb11 every poll, no SFDP → sizes to 0 forever. Not noise: an answer.
+        let bus = LoopbackFlash::new(64 * 1024, [0xaa, 0xbb, 0x11]);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_millis(200));
+
+        let err = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown chip capacity"),
+            "a stable unlisted id must keep its specific refusal, got: {msg}"
+        );
+        assert!(
+            !msg.contains("different ids"),
+            "one repeated id is not a marginal probe, got: {msg}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Varying unsizable ids must be diagnosed as what they are. Reporting the first one as
+    // "unknown chip capacity for JEDEC id 1fffff" is a wrong diagnosis, not just a vague
+    // one: it points at the chip when the fault is the probe.
+    #[test]
+    fn varying_unsizable_ids_are_diagnosed_as_a_marginal_probe_not_an_unlisted_chip() {
+        let path = test_tmp("marginal-probe-diag.bin");
+        std::fs::write(&path, vec![0xa5u8; 4096]).unwrap();
+
+        // Never settles: garbage for far more polls than the budget allows.
+        let bus = LoopbackFlash::new(64 * 1024, [0xef, 0x40, 0x18])
+            .garbage_ids_until_poll(vec![[0x1f, 0xff, 0xff], [0x00, 0xbf, 0xff]], 100_000);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_millis(200));
+
+        let err = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: true,
+                },
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("different ids"),
+            "varying garbage must be called out as a probe fault, got: {msg}"
+        );
+        assert!(
+            msg.contains("1fffff") && msg.contains("00bfff"),
+            "the diagnosis must name the garbage it actually saw, got: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing has been written"),
+            "a write that refused must say so plainly, got: {msg}"
         );
         std::fs::remove_file(&path).ok();
     }
