@@ -51,6 +51,11 @@ enum Command {
         output: String,
         #[arg(long)]
         json: bool,
+        /// Seconds to wait for a flickering probe to come back before giving up on
+        /// a chunk. Raise it to grind a backup out of marginal contact: completed
+        /// chunks persist, so waiting costs only time.
+        #[arg(long, default_value = "120")]
+        patience: u64,
     },
     /// Write a file to the chip.
     Write {
@@ -607,7 +612,11 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Status { json }) => cmd_status(json)?,
         Some(Command::Detect { json }) => cmd_detect(json)?,
         Some(Command::Identify { json }) => cmd_identify(json)?,
-        Some(Command::Read { output, json }) => cmd_read(&output, json)?,
+        Some(Command::Read {
+            output,
+            json,
+            patience,
+        }) => cmd_read(&output, json, patience)?,
         Some(Command::Write {
             input,
             json,
@@ -1215,9 +1224,10 @@ fn cmd_identify(json: bool) -> anyhow::Result<()> {
     })
 }
 
-fn cmd_read(output: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_read(output: &str, json: bool, patience: u64) -> anyhow::Result<()> {
     let (mut m, kind) = open_dyn_checked("read")?;
     with_progress(&mut *m, "read", json);
+    m.set_chunk_patience(std::time::Duration::from_secs(patience));
     let r = m.read_chip(std::path::Path::new(output))?;
     let env = AgentEnvelope::ok("read", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || {
