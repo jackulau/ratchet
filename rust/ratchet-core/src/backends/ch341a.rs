@@ -449,15 +449,23 @@ impl<B: UsbBus> CH341ABackend<B> {
         Ok(buf)
     }
 
-    /// Read one chunk, retrying on transport errors and on a dead-bus result.
+    /// Read one chunk and confirm the chip was still there when it finished.
     ///
-    /// A run of solid 0x00 is the dead-bus signature (see the Dead diagnosis in
-    /// connection_test), but it is also legal firmware content, so it cannot be
-    /// failed on alone. The discriminator is the chip itself: re-read the JEDEC
-    /// id, and if the chip no longer answers, contact dropped and the zeros are
-    /// garbage. Without this a wobbling probe yields a dump that is two-thirds
-    /// zeros and a "successful" backup that would have been worthless in a
-    /// restore.
+    /// Contact is not a fact established once at identify time; it decays. So the
+    /// chunk's bytes are never the evidence -- the chip is. After every chunk, ask
+    /// for the JEDEC id: the expected id back means the probe held for that chunk
+    /// and the data is trustworthy whatever it contains; silence or a changed id
+    /// means contact dropped and the chunk is garbage.
+    ///
+    /// Inspecting the DATA instead cannot work, and two real dropouts prove it. A
+    /// probe that drops MID-chunk leaves real data followed by dropout bytes, so the
+    /// chunk is not uniform and any "is it all 0x00?" test waves it through. A probe
+    /// whose MISO floats high leaves 0xFF, which is byte-for-byte identical to erased
+    /// flash (a lifted probe on this part reads ffffff). Both are silently-corrupt
+    /// chunks under a data-inspection rule; neither survives asking the chip.
+    ///
+    /// Cost is one RDID per 64 KB: ~350 us per chunk, ~0.2 s over a 32 MB dump.
+    /// That is the cheapest correctness in this file.
     fn read_chunk_checked(&mut self, addr: u64, n: usize) -> Result<Vec<u8>> {
         let expect = self.jedec_expect;
         let mut last: Option<String> = None;
@@ -465,30 +473,24 @@ impl<B: UsbBus> CH341ABackend<B> {
             let use_4byte = self.use_4byte_addr;
             let bus = self.bus.as_mut().ok_or(BackendError::NotConnected)?;
             match Self::read_one_chunk(bus, addr, n, use_4byte) {
-                Ok(data) => {
-                    if !data.iter().all(|&b| b == 0x00) {
-                        return Ok(data);
-                    }
-                    // All-zero: ask the chip whether it is still there.
-                    match self.rdid() {
-                        Ok(id) => {
-                            let live = [id.manufacturer, id.memory_type, id.capacity];
-                            if expect.is_none_or(|e| e == live) && live != [0, 0, 0] {
-                                return Ok(data); // chip answers: the zeros are real data
-                            }
-                            last = Some(format!(
-                                "chip id went {:02x}{:02x}{:02x} mid-read (expected {})",
-                                live[0],
-                                live[1],
-                                live[2],
-                                expect
-                                    .map(|e| format!("{:02x}{:02x}{:02x}", e[0], e[1], e[2]))
-                                    .unwrap_or_else(|| "a stable id".into())
-                            ));
+                Ok(data) => match self.rdid() {
+                    Ok(id) => {
+                        let live = [id.manufacturer, id.memory_type, id.capacity];
+                        if expect.is_none_or(|e| e == live) && live != [0, 0, 0] {
+                            return Ok(data); // chip still answering: the chunk is real
                         }
-                        Err(e) => last = Some(format!("chip stopped answering ({e})")),
+                        last = Some(format!(
+                            "chip id went {:02x}{:02x}{:02x} mid-read (expected {})",
+                            live[0],
+                            live[1],
+                            live[2],
+                            expect
+                                .map(|e| format!("{:02x}{:02x}{:02x}", e[0], e[1], e[2]))
+                                .unwrap_or_else(|| "a stable id".into())
+                        ));
                     }
-                }
+                    Err(e) => last = Some(format!("chip stopped answering ({e})")),
+                },
                 Err(e) => last = Some(e.to_string()),
             }
             if attempt < READ_CHUNK_ATTEMPTS {
@@ -721,8 +723,9 @@ impl<B: UsbBus> CH341ABackend<B> {
         if size == 0 {
             return Err(BackendError::ChipNotDetected);
         }
-        let buf = self.read_range(0, size)?;
+        let buf = self.read_chip_resumable(output_path, &chip.jedec_id, size)?;
         std::fs::write(output_path, &buf)?;
+        super::resume::ResumeState::clear(output_path);
         let mut h = Sha256::new();
         h.update(&buf);
         let checksum: String = hex_encode(&h.finalize());
@@ -741,6 +744,71 @@ impl<B: UsbBus> CH341ABackend<B> {
             },
             buf,
         ))
+    }
+
+    /// Whole-chip read that keeps the chunks it completed when contact drops.
+    ///
+    /// A 32 MB read needs minutes of unbroken contact; a probe on a leadless part
+    /// realistically gives tens of seconds. Those numbers do not have to meet: each
+    /// attempt keeps its completed 64 KB chunks in the output file and records them
+    /// in a sidecar, so re-running reads only what is still missing and enough
+    /// attempts add up to a whole dump. Without this, a marginal probe yields no
+    /// backup at all -- and no backup is what makes a reflash lose the board's MAC
+    /// permanently, since the MAC lives in flash and is not in the vendor image.
+    fn read_chip_resumable(
+        &mut self,
+        output_path: &Path,
+        jedec: &str,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        use super::resume::ResumeState;
+        let chunk = READ_CHUNK as u32;
+        let (mut state, partial) = ResumeState::load(output_path, jedec, size as u64, chunk);
+        // 0xFF, not 0x00: if anything ever escapes with holes, erased-flash bytes are
+        // the honest filler. A zero-filled hole is indistinguishable from the dead-bus
+        // dumps this whole subsystem exists to reject.
+        let mut buf = partial.unwrap_or_else(|| vec![0xffu8; size]);
+        let resumed = state.completed_bytes();
+        if resumed > 0 {
+            eprintln!(
+                "resuming read of {jedec}: {resumed}/{size} bytes ({:.1}%) already captured; \
+                 reading only what is missing",
+                resumed as f64 * 100.0 / size as f64
+            );
+        }
+
+        for i in 0..state.done.len() {
+            if state.done[i] {
+                continue;
+            }
+            let addr = i as u64 * READ_CHUNK as u64;
+            let n = (size - addr as usize).min(READ_CHUNK);
+            match self.read_chunk_checked(addr, n) {
+                Ok(data) => {
+                    buf[addr as usize..addr as usize + n].copy_from_slice(&data);
+                    state.done[i] = true;
+                }
+                Err(e) => {
+                    // Persist before surfacing the error: this attempt's chunks are the
+                    // only thing standing between the user and starting from zero.
+                    let saved = state.completed_bytes();
+                    std::fs::write(output_path, &buf)?;
+                    state.save(output_path)?;
+                    return Err(BackendError::Other(format!(
+                        "{e}\n\nProgress saved: {saved}/{size} bytes ({:.1}%) captured so far. \
+                         Re-seat the probe and re-run the SAME command -- it resumes from here \
+                         and reads only what is missing, so short attempts still add up to a \
+                         complete dump. The partial file is NOT a usable backup until the read \
+                         finishes.",
+                        saved as f64 * 100.0 / size as f64
+                    )));
+                }
+            }
+            if let Some(cb) = self.progress.as_mut() {
+                cb(state.completed_bytes(), size as u64);
+            }
+        }
+        Ok(buf)
     }
 
     /// Read-back comparison without the trailing EX4B: write_chip's verify step runs
@@ -1703,9 +1771,16 @@ mod tests {
         let path = test_tmp("ex4b-verify.bin");
         std::fs::write(&path, vec![0xa5u8; 32]).unwrap();
         let mut bus = MockBus::new();
-        bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x19])); // RDID → W25Q256
-        for _ in 0..8 {
-            bus.queue_read(chip_rx(vec![0xa5u8; 40])); // EN4B + read chunks + EX4B (don't-care)
+        // Filler that ALSO decodes as ef4019 when read as an RDID response: read_range
+        // now re-checks the chip id after every chunk, so a plain 0xa5 filler would
+        // decode as a5a5a5 and (correctly) trip the contact check.
+        let rdid_ok = || {
+            let mut v = vec![0x00, 0xef, 0x40, 0x19];
+            v.resize(40, 0xa5);
+            chip_rx(v)
+        };
+        for _ in 0..10 {
+            bus.queue_read(rdid_ok()); // identify RDID, EN4B, read chunk, liveness RDID, EX4B
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend.verify_chip(&path).unwrap();
@@ -2200,6 +2275,12 @@ mod tests {
         /// not just the final bytes but the SEQUENCE — specifically that an erase
         /// never runs far ahead of the program that refills it.
         ops: Vec<(u8, usize)>,
+        /// Model a probe that loses contact partway: a READ at or past this offset
+        /// returns 0x00 and latches `contact_lost`, after which RDID goes silent
+        /// too. That is the real signature — zeros on the data lines AND a chip
+        /// that stops answering — and it is what read_chunk_checked keys off.
+        dead_from: Option<usize>,
+        contact_lost: std::cell::Cell<bool>,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -2213,7 +2294,14 @@ mod tests {
                 strict_en4b: false,
                 sfdp: Vec::new(),
                 ops: Vec::new(),
+                dead_from: None,
+                contact_lost: std::cell::Cell::new(false),
             }
+        }
+        /// Lose contact at `offset`, as a marginally clamped probe does in practice.
+        fn losing_contact_at(mut self, offset: usize) -> Self {
+            self.dead_from = Some(offset);
+            self
         }
         /// Model a Micron-family part that ignores EN4B/EX4B unless WREN preceded it.
         fn micron_like(mut self) -> Self {
@@ -2246,6 +2334,10 @@ mod tests {
                 return 0;
             }
             match self.frame[0] {
+                // Once contact is gone the chip cannot answer an id request either.
+                // This is the discriminator read_chunk_checked relies on to tell a
+                // dropout apart from legitimately-zero firmware content.
+                SPI_RDID if self.contact_lost.get() => 0,
                 SPI_RDID => {
                     if (1..=3).contains(&pos) {
                         self.jedec[pos - 1]
@@ -2259,7 +2351,12 @@ mod tests {
                     let data_start = 1 + addr_len;
                     if pos >= data_start && self.frame.len() >= data_start {
                         let base = Self::decode_addr(&self.frame[1..data_start]);
-                        *self.flash.get(base + (pos - data_start)).unwrap_or(&0xff)
+                        let a = base + (pos - data_start);
+                        if self.dead_from.is_some_and(|d| a >= d) {
+                            self.contact_lost.set(true);
+                            return 0x00;
+                        }
+                        *self.flash.get(a).unwrap_or(&0xff)
                     } else {
                         0
                     }
@@ -2429,6 +2526,89 @@ mod tests {
         );
         assert_eq!(dump[SIZE_32MB - 1], 0xc3, "top byte of the 32 MB range");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // The read-resume property, end to end, against the exact failure seen on real
+    // hardware: probe holds for a couple of chunks, then contact drops, reads go to
+    // 0x00 and the chip stops answering RDID.
+    //
+    // This is the difference between "no backup at all" and "a backup". A 32 MB read
+    // needs minutes of contact; a marginal probe gives tens of seconds. Without resume
+    // those numbers have to meet. With it, short attempts accumulate.
+    #[test]
+    fn read_resumes_from_saved_progress_after_contact_drops() {
+        // SIZE must be the chip DB's size for this JEDEC id (ef4018 = W25Q128, 16 MB):
+        // read_chip trusts identify_chip, not the fake's buffer length.
+        const SIZE: usize = 16 * 1024 * 1024;
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("resume-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        // Attempt 1: dies partway through the third chunk.
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).losing_contact_at(150_000);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        let err = backend.read_chip(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("Progress saved"),
+            "a failed read must report what it kept, got: {err}"
+        );
+
+        // The kept chunks must be on disk, and the sidecar must exist.
+        let sidecar = super::super::resume::resume_path(&path);
+        assert!(sidecar.exists(), "sidecar must survive the failure");
+        let partial = std::fs::read(&path).unwrap();
+        assert_eq!(partial.len(), SIZE, "partial is preallocated to full size");
+        assert!(
+            partial[..128 * 1024] == content[..128 * 1024],
+            "the two chunks that completed before the drop must be real data"
+        );
+
+        // Attempt 2: probe re-seated (healthy bus), same command, same path.
+        let mut bus2 = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]);
+        bus2.flash.copy_from_slice(&content);
+        let mut backend2 = CH341ABackend::with_bus(bus2);
+        let r = backend2.read_chip(&path).unwrap();
+        assert!(r.success);
+        // Compare with assert!, not assert_eq!: a failing assert_eq! on 16 MB vectors
+        // dumps both of them into the test log.
+        assert!(
+            std::fs::read(&path).unwrap() == content,
+            "resumed read must produce the whole chip, byte for byte"
+        );
+        assert!(
+            !sidecar.exists(),
+            "a completed read must clear the sidecar, or the next read looks half-done"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A sidecar from a DIFFERENT chip must never be honoured: resuming across chips
+    // would splice two dumps into one file that looks like a valid backup.
+    #[test]
+    fn read_ignores_resume_progress_from_a_different_chip() {
+        const SIZE: usize = 16 * 1024 * 1024; // ef4018 = W25Q128
+        let path = test_tmp("resume-wrong-chip.bin");
+        std::fs::remove_file(&path).ok();
+
+        // Claim chunk 0 of some OTHER part is already done, and back it with a file
+        // so the "partial must exist" guard cannot be what rejects it.
+        let mut stale = super::super::resume::ResumeState::fresh("aabbcc", SIZE as u64, 65536);
+        stale.done[0] = true;
+        std::fs::write(&path, vec![0x11u8; SIZE]).unwrap();
+        stale.save(&path).unwrap();
+
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 241) as u8 | 1).collect();
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]); // ef4018, not aabbcc
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.read_chip(&path).unwrap();
+        assert!(
+            std::fs::read(&path).unwrap() == content,
+            "stale sidecar from another chip must be ignored and every chunk re-read"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     // The blank-window property. Erasing the WHOLE chip and then programming it (the
@@ -2681,6 +2861,15 @@ mod tests {
             .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_READ)
             .count();
         assert_eq!(read_opcodes, 1, "READ (0x03) must go out once per range");
+        let rdids = writes
+            .iter()
+            .filter(|w| w.len() >= 2 && w[0] == CMD_SPI_STREAM && w[1] == SPI_RDID)
+            .count();
+        assert_eq!(
+            rdids, 1,
+            "exactly one liveness RDID after the chunk — contact is re-checked per \
+             chunk, not per KiB"
+        );
         let cs_asserts = writes
             .iter()
             .filter(|w| w.as_slice() == cs_assert_packet())
@@ -2689,7 +2878,12 @@ mod tests {
             .iter()
             .filter(|w| w.as_slice() == cs_deassert_packet())
             .count();
-        assert_eq!((cs_asserts, cs_deasserts), (1, 1), "one CS pulse per range");
+        assert_eq!(
+            (cs_asserts, cs_deasserts),
+            (2, 2),
+            "one CS pulse for the range's READ, one for the liveness RDID — the READ \
+             must never be re-addressed per KiB"
+        );
     }
 
     #[test]
