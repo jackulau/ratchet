@@ -50,6 +50,10 @@ pub trait Backend: Send {
     /// gives up on a chunk. The default ignores it (mocks have no contact to
     /// lose); the live backends honour it. See `ch341a::CHUNK_PATIENCE`.
     fn set_chunk_patience(&mut self, _d: std::time::Duration) {}
+    /// Bytes per read transaction. On a marginal probe this is the number that
+    /// decides whether a read progresses at all: a chunk only counts if it finishes
+    /// inside one unbroken contact window. See `ch341a::READ_CHUNK`.
+    fn set_read_chunk(&mut self, _bytes: usize) {}
     fn detect_programmer(&mut self) -> Result<ProgrammerInfo>;
     fn open(&mut self) -> Result<()>;
     fn close(&mut self) -> Result<()>;

@@ -93,7 +93,22 @@ pub const SIZE_16MB: u64 = 16 * 1024 * 1024;
 /// retryable, so this is the blast radius of one contact dropout. Big enough to
 /// amortise USB latency across the IN ring (a 64 KB chunk is ~2100 packets),
 /// small enough that a retry is cheap and progress stays responsive.
+///
+/// It is also the single most important number on a marginal probe, because a
+/// chunk only counts if it finishes inside ONE unbroken contact window. At the
+/// measured 121 KiB/s a 64 KB chunk needs 0.53 s of contact, and a backup chunk is
+/// read twice, so 1.06 s. A probe that cannot hold for 1.06 s makes NO progress at
+/// this size, however many windows it gets: the chunk always dies partway and is
+/// discarded. Halving the chunk halves the contact each one needs. That is a cliff
+/// rather than a slope, which is why this is tunable (`ratchet read --chunk-kb`)
+/// and why the fix is worth more than any throughput work.
 pub const READ_CHUNK: usize = 64 * 1024;
+
+/// Bounds for `--chunk-kb`. The floor keeps a chunk worth more than the two RDID
+/// liveness checks bracketing it (~0.7 ms); the ceiling keeps one dropout from
+/// costing minutes of re-reading.
+pub const READ_CHUNK_KB_MIN: usize = 1;
+pub const READ_CHUNK_KB_MAX: usize = 1024;
 
 /// How long to keep waiting for contact on a single chunk before a read gives up
 /// and fails closed.
@@ -347,6 +362,9 @@ pub struct CH341ABackend<B: UsbBus> {
     jedec_expect: Option<[u8; 3]>,
     /// Per-chunk contact-wait budget; see [`CHUNK_PATIENCE`].
     chunk_patience: Duration,
+    /// Bytes per read transaction; see [`READ_CHUNK`]. Sized to fit the probe's
+    /// contact window, not to maximise throughput.
+    read_chunk: usize,
 }
 
 /// How much evidence a chunk needs before it is believed.
@@ -375,6 +393,7 @@ impl<B: UsbBus> CH341ABackend<B> {
             progress: None,
             jedec_expect: None,
             chunk_patience: DEFAULT_CHUNK_PATIENCE,
+            read_chunk: READ_CHUNK,
         }
     }
 
@@ -485,7 +504,7 @@ impl<B: UsbBus> CH341ABackend<B> {
         }
         let mut buf = Vec::with_capacity(len);
         while buf.len() < len {
-            let n = (len - buf.len()).min(READ_CHUNK);
+            let n = (len - buf.len()).min(self.read_chunk);
             let addr = start_addr + buf.len() as u64;
             let chunk = self.read_chunk_patient(addr, n, ChunkTrust::LivenessOnly)?;
             buf.extend_from_slice(&chunk);
@@ -893,7 +912,11 @@ impl<B: UsbBus> CH341ABackend<B> {
     ) -> Result<Vec<u8>> {
         use super::resume::ResumeState;
         use std::io::{Seek, SeekFrom, Write};
-        let chunk = READ_CHUNK as u32;
+        // The sidecar records the stride, and load() rejects a sidecar whose stride
+        // differs -- so changing --chunk-kb restarts the dump rather than interleaving
+        // two different griddings of the same chip. That is the intended trade: pick
+        // the size once, from the probe's contact window.
+        let chunk = self.read_chunk as u32;
         let (mut state, partial) = ResumeState::load(output_path, jedec, size as u64, chunk);
         // 0xFF, not 0x00: if anything ever escapes with holes, erased-flash bytes are
         // the honest filler. A zero-filled hole is indistinguishable from the dead-bus
@@ -931,8 +954,8 @@ impl<B: UsbBus> CH341ABackend<B> {
             if state.done[i] {
                 continue;
             }
-            let addr = i as u64 * READ_CHUNK as u64;
-            let n = (size - addr as usize).min(READ_CHUNK);
+            let addr = i as u64 * self.read_chunk as u64;
+            let n = (size - addr as usize).min(self.read_chunk);
             // DoubleRead: a backup is the one read with nothing to check it against
             // later, so each chunk carries its own proof.
             match self.read_chunk_patient(addr, n, ChunkTrust::DoubleRead) {
@@ -1195,6 +1218,10 @@ impl<B: UsbBus> CH341ABackend<B> {
 impl<B: UsbBus> Backend for CH341ABackend<B> {
     fn set_chunk_patience(&mut self, d: Duration) {
         self.chunk_patience = d;
+    }
+
+    fn set_read_chunk(&mut self, bytes: usize) {
+        self.read_chunk = bytes.clamp(READ_CHUNK_KB_MIN * 1024, READ_CHUNK_KB_MAX * 1024);
     }
 
     fn detect_programmer(&mut self) -> Result<ProgrammerInfo> {
@@ -2831,6 +2858,68 @@ mod tests {
             "waiting out a flicker must still produce the chip byte for byte"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    // Chunk size is the lever that decides whether a marginal probe makes progress at
+    // all: a chunk only counts if it finishes inside ONE unbroken contact window, so
+    // halving it halves the contact each one needs. At 121 KiB/s a 64KB backup chunk
+    // needs 1.06s of held contact and an 8KB one needs 0.13s, which on a probe that
+    // holds for tenths of a second is the whole difference between a dump and nothing.
+    //
+    // Observe the grid the READ ITSELF used, via the sidecar it writes on failure.
+    // Asserting on a ResumeState this test built would prove nothing about the read:
+    // an earlier version of this test did exactly that and stayed green when
+    // set_read_chunk was mutated to ignore its argument.
+    #[test]
+    fn smaller_read_chunks_regrid_the_dump_and_still_read_the_whole_chip() {
+        const SIZE: usize = 16 * 1024 * 1024; // ef4018 = W25Q128
+        const KB8: u32 = 8 * 1024;
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("chunked-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        // Contact dies inside the third 8KB chunk, so the read must save a sidecar
+        // describing whatever grid it was actually walking.
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).losing_contact_at(20_000);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_read_chunk(KB8 as usize);
+        backend.read_chip(&path).unwrap_err();
+
+        let (grid8, _) = super::super::resume::ResumeState::load(&path, "ef4018", SIZE as u64, KB8);
+        assert_eq!(
+            grid8.done.len(),
+            SIZE / KB8 as usize,
+            "the read must walk an 8KB grid, giving 8x the chunks of the 64KB default"
+        );
+        assert!(
+            grid8.done[0] && grid8.done[1] && !grid8.done[2],
+            "the two 8KB chunks before the drop must bank and the one that died must not: {:?}",
+            &grid8.done[..3]
+        );
+        // The read's own sidecar must NOT be readable as the 64KB default: that is what
+        // proves the knob reached the read loop rather than being accepted and dropped.
+        let (as64k, _) =
+            super::super::resume::ResumeState::load(&path, "ef4018", SIZE as u64, 64 * 1024);
+        assert!(
+            !as64k.done[0],
+            "an 8KB-gridded sidecar must never be honoured as a 64KB one: mixing griddings \
+             would bank bytes that were never verified at this stride"
+        );
+
+        // And the shrunken grid still has to produce the whole chip, byte for byte.
+        let mut bus2 = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]);
+        bus2.flash.copy_from_slice(&content);
+        let mut backend2 = CH341ABackend::with_bus(bus2);
+        backend2.set_read_chunk(KB8 as usize);
+        assert!(backend2.read_chip(&path).unwrap().success);
+        assert!(
+            std::fs::read(&path).unwrap() == content,
+            "an 8KB grid must still produce the chip byte for byte"
+        );
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
     }
 
     // Progress must survive a Ctrl-C, not just a clean failure. A 32 MB read on a bad
