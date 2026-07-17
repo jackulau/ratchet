@@ -758,6 +758,7 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// requiring as much agreement as `trust` demands.
     fn read_chunk_patient(&mut self, addr: u64, n: usize, trust: ChunkTrust) -> Result<Vec<u8>> {
         let deadline = Instant::now() + self.chunk_patience;
+        let mut announced_retry = false;
         let reason = loop {
             let why = match self.read_chunk_once(addr, n) {
                 Ok(first) if trust == ChunkTrust::LivenessOnly => return Ok(first),
@@ -774,6 +775,20 @@ impl<B: UsbBus> CH341ABackend<B> {
             };
             if Instant::now() >= deadline {
                 break why;
+            }
+            // Say something. This branch can retry for the WHOLE patience budget without
+            // wait_for_contact ever printing, because that only speaks when the chip stops
+            // answering -- and the case we are in is the chip answering perfectly while the
+            // chunk comes back wrong. Minutes of silence with a live process reads as a
+            // hang, and was reported from the bench as exactly that: "stuck".
+            if !announced_retry {
+                eprintln!(
+                    "chunk at {addr:#x} came back wrong but the chip is still answering \
+                     ({why}). Re-reading for up to {}s — the probe is flickering mid-chunk, \
+                     not hung. Nothing is being written; Ctrl-C is safe.",
+                    deadline.saturating_duration_since(Instant::now()).as_secs()
+                );
+                announced_retry = true;
             }
             // Pace every retry, not just the ones that wait for contact. A chunk can
             // fail while the chip answers RDID perfectly -- two reads disagreeing is
@@ -1417,10 +1432,20 @@ impl<B: UsbBus> CH341ABackend<B> {
                 // exactly what happened: three runs died at blocks 40, 28 and 2 reporting
                 // "chip 0x00" against a chip that was fine.
                 //
-                // So make the chip prove it, with the same evidence a backup demands: two
-                // reads that agree. The happy path pays nothing -- this only runs once a
-                // mismatch is already on the table.
-                let confirm = self.read_range_quiet(addr, target.len(), ChunkTrust::DoubleRead)?;
+                // So look again before believing it. The happy path pays nothing -- this
+                // only runs once a mismatch is already on the table.
+                //
+                // LivenessOnly, NOT DoubleRead, and the difference is not a detail. A
+                // backup needs two agreeing reads because it has nothing to check against
+                // and gets trusted forever. A read-back has the image: 64 KB matching the
+                // target byte-for-byte cannot be a flicker, so matching is self-validating
+                // and a third read adds no evidence. DoubleRead here was reached for out of
+                // habit and it HUNG a real write: two reads through a flickering probe never
+                // agree, and read_chunk_patient's retry loop is silent while the chip still
+                // answers RDID, so it spun the whole patience budget per attempt with
+                // nothing on screen. A wrong-and-fast failure had become a right-and-never.
+                let confirm =
+                    self.read_range_quiet(addr, target.len(), ChunkTrust::LivenessOnly)?;
                 if confirm == target {
                     return Ok(());
                 }
@@ -1430,8 +1455,8 @@ impl<B: UsbBus> CH341ABackend<B> {
                     .position(|(a, b)| a != b)
                     .unwrap_or(0);
                 return Err(BackendError::Other(format!(
-                    "read-back mismatch at {:#x} (chip {:#04x}, image {:#04x}), confirmed by \
-                     two agreeing reads",
+                    "read-back mismatch at {:#x} (chip {:#04x}, image {:#04x}), still wrong on \
+                     a second read",
                     addr + at as u64,
                     confirm.get(at).copied().unwrap_or(0),
                     target.get(at).copied().unwrap_or(0)
