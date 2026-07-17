@@ -56,6 +56,14 @@ enum Command {
         /// chunks persist, so waiting costs only time.
         #[arg(long, default_value = "120")]
         patience: u64,
+        /// KB per read transaction. A chunk only counts if it finishes inside ONE
+        /// unbroken contact window, so on a marginal probe this decides whether the
+        /// read progresses at all. At ~121 KiB/s a backup chunk is read twice, so
+        /// 64KB needs 1.06s of contact, 16KB needs 0.26s, 4KB needs 0.07s. Lower it
+        /// until chunks land. Changing it restarts the dump (the sidecar records the
+        /// stride and will not mix two griddings of one chip).
+        #[arg(long, default_value = "64")]
+        chunk_kb: usize,
     },
     /// Write a file to the chip.
     Write {
@@ -616,7 +624,8 @@ fn main() -> anyhow::Result<()> {
             output,
             json,
             patience,
-        }) => cmd_read(&output, json, patience)?,
+            chunk_kb,
+        }) => cmd_read(&output, json, patience, chunk_kb)?,
         Some(Command::Write {
             input,
             json,
@@ -1224,10 +1233,17 @@ fn cmd_identify(json: bool) -> anyhow::Result<()> {
     })
 }
 
-fn cmd_read(output: &str, json: bool, patience: u64) -> anyhow::Result<()> {
+fn cmd_read(output: &str, json: bool, patience: u64, chunk_kb: usize) -> anyhow::Result<()> {
+    use ratchet_core::backends::ch341a::{READ_CHUNK_KB_MAX, READ_CHUNK_KB_MIN};
+    if !(READ_CHUNK_KB_MIN..=READ_CHUNK_KB_MAX).contains(&chunk_kb) {
+        anyhow::bail!(
+            "--chunk-kb must be {READ_CHUNK_KB_MIN}..={READ_CHUNK_KB_MAX}, got {chunk_kb}"
+        );
+    }
     let (mut m, kind) = open_dyn_checked("read")?;
     with_progress(&mut *m, "read", json);
     m.set_chunk_patience(std::time::Duration::from_secs(patience));
+    m.set_read_chunk(chunk_kb * 1024);
     let r = m.read_chip(std::path::Path::new(output))?;
     let env = AgentEnvelope::ok("read", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || {
