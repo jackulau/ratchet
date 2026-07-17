@@ -384,9 +384,18 @@ pub struct CH341ABackend<B: UsbBus> {
 /// How much evidence a chunk needs before it is believed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChunkTrust {
-    /// One read plus a liveness check. For callers that compare the bytes against
-    /// a known image anyway (verify, write read-back): a bad read there fails
-    /// closed as a mismatch, so a second read would only buy a nicer error.
+    /// One read plus a liveness check. Catches a dropout that is STILL PRESENT when
+    /// the chunk ends, because the chip cannot answer RDID through a dead bus.
+    ///
+    /// It is blind to a flicker that starts and ends INSIDE the chunk: the data lines
+    /// go 0x00, the probe comes back, and the post-chunk id answers healthy, so the
+    /// zeros are trusted. Only reading twice sees that.
+    ///
+    /// So this is safe only where garbage is cheap. It is NOT enough on its own to
+    /// convict a write of failing -- see try_write_block, which re-reads with
+    /// DoubleRead before believing a mismatch. This doc used to claim a second read
+    /// there "would only buy a nicer error"; that reasoning cost a real board three
+    /// dead write runs.
     LivenessOnly,
     /// Two independent reads that must agree, each liveness-checked. For a backup,
     /// which has nothing to compare against and gets trusted forever after.
@@ -513,6 +522,15 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// of corrupting the whole dump, and each chunk's bytes are streamed through
     /// an overlapped IN ring rather than one round-trip per 31 bytes.
     pub fn read_range(&mut self, start_addr: u64, len: usize) -> Result<Vec<u8>> {
+        self.read_range_trust(start_addr, len, ChunkTrust::LivenessOnly)
+    }
+
+    fn read_range_trust(
+        &mut self,
+        start_addr: u64,
+        len: usize,
+        trust: ChunkTrust,
+    ) -> Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -520,13 +538,27 @@ impl<B: UsbBus> CH341ABackend<B> {
         while buf.len() < len {
             let n = (len - buf.len()).min(self.read_chunk);
             let addr = start_addr + buf.len() as u64;
-            let chunk = self.read_chunk_patient(addr, n, ChunkTrust::LivenessOnly)?;
+            let chunk = self.read_chunk_patient(addr, n, trust)?;
             buf.extend_from_slice(&chunk);
             if let Some(cb) = self.progress.as_mut() {
                 cb(buf.len() as u64, len as u64);
             }
         }
         Ok(buf)
+    }
+
+    /// `read_range` with the progress callback muted for the duration.
+    ///
+    /// A write's read-back is not progress anyone asked to watch. `read_range` reports
+    /// against the length IT was handed, so a 64 KB block read-back prints
+    /// "write: 100% (65536/65536 bytes)" once per block and buries the write's real
+    /// 0->100% across the whole chip under 512 lines that all say 100%. Reported from
+    /// the bench as "confusing saying it is already 100%", which it was.
+    fn read_range_quiet(&mut self, addr: u64, len: usize, trust: ChunkTrust) -> Result<Vec<u8>> {
+        let saved = self.progress.take();
+        let out = self.read_range_trust(addr, len, trust);
+        self.progress = saved;
+        out
     }
 
     /// Read one chunk and confirm the chip was still there when it finished.
@@ -726,6 +758,7 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// requiring as much agreement as `trust` demands.
     fn read_chunk_patient(&mut self, addr: u64, n: usize, trust: ChunkTrust) -> Result<Vec<u8>> {
         let deadline = Instant::now() + self.chunk_patience;
+        let mut announced_retry = false;
         let reason = loop {
             let why = match self.read_chunk_once(addr, n) {
                 Ok(first) if trust == ChunkTrust::LivenessOnly => return Ok(first),
@@ -742,6 +775,20 @@ impl<B: UsbBus> CH341ABackend<B> {
             };
             if Instant::now() >= deadline {
                 break why;
+            }
+            // Say something. This branch can retry for the WHOLE patience budget without
+            // wait_for_contact ever printing, because that only speaks when the chip stops
+            // answering -- and the case we are in is the chip answering perfectly while the
+            // chunk comes back wrong. Minutes of silence with a live process reads as a
+            // hang, and was reported from the bench as exactly that: "stuck".
+            if !announced_retry {
+                eprintln!(
+                    "chunk at {addr:#x} came back wrong but the chip is still answering \
+                     ({why}). Re-reading for up to {}s — the probe is flickering mid-chunk, \
+                     not hung. Nothing is being written; Ctrl-C is safe.",
+                    deadline.saturating_duration_since(Instant::now()).as_secs()
+                );
+                announced_retry = true;
             }
             // Pace every retry, not just the ones that wait for contact. A chunk can
             // fail while the chip answers RDID perfectly -- two reads disagreeing is
@@ -1285,6 +1332,11 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// dropout costs this block, not the write. The retry re-erases before
     /// re-programming, so a half-programmed block from the failed attempt cannot
     /// leave stale 0 bits ANDed into the result.
+    ///
+    /// Retries are bounded by the PATIENCE budget, not by a fixed attempt count, for the
+    /// same reason the read path is: a marginal probe fails a block for reasons that are
+    /// transient and uncorrelated, so the answer is to try again rather than to give up
+    /// on the write. WRITE_BLOCK_ATTEMPTS is the floor, not the ceiling.
     fn write_block_verified(
         &mut self,
         addr: u64,
@@ -1292,30 +1344,71 @@ impl<B: UsbBus> CH341ABackend<B> {
         page_size: usize,
         verify: bool,
     ) -> Result<()> {
-        let mut last: Option<String> = None;
-        for attempt in 1..=WRITE_BLOCK_ATTEMPTS {
-            match self.try_write_block(addr, target, page_size, verify) {
-                Ok(()) => return Ok(()),
-                Err(e) => last = Some(e.to_string()),
+        let deadline = Instant::now() + self.chunk_patience;
+        let mut attempt: u32 = 0;
+        let mut announced = false;
+        let last = loop {
+            attempt += 1;
+            let why = match self.try_write_block(addr, target, page_size, verify) {
+                Ok(()) => {
+                    if announced {
+                        eprintln!("block at {addr:#x} landed on attempt {attempt}");
+                    }
+                    return Ok(());
+                }
+                Err(e) => e.to_string(),
+            };
+            // Keep trying until the patience budget says stop, not after a fixed three
+            // strikes. Three was the wrong SHAPE for a marginal probe, and it is what kept
+            // killing real writes long after the read path had learned better: the read
+            // spends the whole --patience budget riding out flickers, while the write gave
+            // a block three tries and quit. If a glitch costs one page program in three, a
+            // block fails ~12% of the time; across 512 blocks that is not a risk, it is a
+            // certainty, and every run died around block 30 no matter what else was fixed.
+            //
+            // The rule the read path already states applies verbatim here: contact is the
+            // scarce resource and patience is free, so spend it retrying the block rather
+            // than on failing. WRITE_BLOCK_ATTEMPTS stays as the FLOOR, so a caller that
+            // asks for no patience still gets the old three tries.
+            if attempt >= WRITE_BLOCK_ATTEMPTS && Instant::now() >= deadline {
+                break why;
             }
-            if attempt < WRITE_BLOCK_ATTEMPTS {
-                // Deliberately NOT a wait_for_contact here, though it looks like the
-                // obvious place for one. The block's verify readback goes through
-                // read_range -> read_chunk_patient, which already waits out a dropout, so
-                // by the time an attempt fails on mismatched data the probe is back and
-                // the retry lands. Adding a second wait here was tried: removing it again
-                // left every test green, which is the suite correctly reporting that it
-                // bought nothing. See a_write_rides_out_a_dropout_...
+            if !announced {
+                eprintln!(
+                    "block at {addr:#x} did not land ({why}) — retrying for up to {}s. \
+                     Each retry re-erases first, so this is safe to repeat; the block is \
+                     erased or half-programmed until one succeeds.",
+                    deadline.saturating_duration_since(Instant::now()).as_secs()
+                );
+                announced = true;
+            }
+            {
+                // Still deliberately NOT a wait_for_contact, but the ORIGINAL reasoning
+                // here was wrong and worth recording, because it looked airtight.
+                //
+                // It said: read_chunk_patient already waits out a dropout, and deleting an
+                // extra wait left every test green, so the wait bought nothing. The first
+                // half is true only for a dropout still PRESENT at the post-chunk RDID --
+                // the chip cannot answer through a dead bus, so that one gets caught and
+                // waited out. The second half was the fake talking: every dropout it could
+                // model was one of those. It had no way to express a flicker that clears
+                // before the id check, which is the one that actually killed a write.
+                //
+                // A wait would not have helped that anyway -- the chip is answering. The
+                // real defence is refusing to convict on a single read (see
+                // try_write_block). By the time an attempt fails for a CONFIRMED mismatch,
+                // contact is genuinely gone and read_chunk_patient is already waiting on
+                // it, so there is nothing left for a wait here to buy.
                 std::thread::sleep(Duration::from_millis(20));
             }
-        }
+        };
         Err(BackendError::Other(format!(
-            "lost the chip while writing the block at {addr:#x}; {} attempts failed: {}. \
-             Re-seat the probe and re-run the SAME write — blocks already programmed are \
-             skipped, so it resumes here instead of starting over. Do not boot the board \
-             until a write completes: this block is erased or half-programmed.",
-            WRITE_BLOCK_ATTEMPTS,
-            last.unwrap_or_else(|| "unknown".into())
+            "lost the chip while writing the block at {addr:#x}; {attempt} attempts over {}s \
+             failed: {last}. Re-seat the probe and re-run the SAME write — blocks already \
+             programmed are skipped, so it resumes here instead of starting over. Do not \
+             boot the board until a write completes: this block is erased or \
+             half-programmed.",
+            self.chunk_patience.as_secs(),
         )))
     }
 
@@ -1362,17 +1455,47 @@ impl<B: UsbBus> CH341ABackend<B> {
         // Read back through read_range, so the dropout check applies here too: a block
         // that "verifies" against a dead bus is exactly the failure this guards.
         if verify {
-            let back = self.read_range(addr, target.len())?;
+            let back = self.read_range_quiet(addr, target.len(), ChunkTrust::LivenessOnly)?;
             if back != target {
-                let at = back
+                // A mismatch here is EQUALLY evidence of a bad read and of a bad write,
+                // and LivenessOnly cannot tell those apart. Its doc used to argue a second
+                // read "would only buy a nicer error", because the bytes get compared to a
+                // known image anyway. That is wrong, and a real board proved it: a flicker
+                // that starts and ends inside one chunk leaves 0x00 on the data lines while
+                // the post-chunk RDID answers healthy, so the zeros pass liveness and
+                // compare as a failed program. The error is not nicer, it is FALSE -- and
+                // believing it spends one of only WRITE_BLOCK_ATTEMPTS tries. Three unlucky
+                // flickers then kill a write whose every block had actually landed, which is
+                // exactly what happened: three runs died at blocks 40, 28 and 2 reporting
+                // "chip 0x00" against a chip that was fine.
+                //
+                // So look again before believing it. The happy path pays nothing -- this
+                // only runs once a mismatch is already on the table.
+                //
+                // LivenessOnly, NOT DoubleRead, and the difference is not a detail. A
+                // backup needs two agreeing reads because it has nothing to check against
+                // and gets trusted forever. A read-back has the image: 64 KB matching the
+                // target byte-for-byte cannot be a flicker, so matching is self-validating
+                // and a third read adds no evidence. DoubleRead here was reached for out of
+                // habit and it HUNG a real write: two reads through a flickering probe never
+                // agree, and read_chunk_patient's retry loop is silent while the chip still
+                // answers RDID, so it spun the whole patience budget per attempt with
+                // nothing on screen. A wrong-and-fast failure had become a right-and-never.
+                let confirm =
+                    self.read_range_quiet(addr, target.len(), ChunkTrust::LivenessOnly)?;
+                if confirm == target {
+                    return Ok(());
+                }
+                let at = confirm
                     .iter()
                     .zip(target)
                     .position(|(a, b)| a != b)
                     .unwrap_or(0);
                 return Err(BackendError::Other(format!(
-                    "read-back mismatch at {:#x} (chip {:#04x}, image {:#04x})",
+                    "read-back mismatch at {:#x} (chip {:#04x}, image {:#04x}), still wrong on \
+                     a second read",
                     addr + at as u64,
-                    back.get(at).copied().unwrap_or(0),
+                    confirm.get(at).copied().unwrap_or(0),
                     target.get(at).copied().unwrap_or(0)
                 )));
             }
@@ -2675,6 +2798,19 @@ mod tests {
         /// that stops answering — and it is what the liveness check keys off.
         dead_from: std::cell::Cell<Option<usize>>,
         contact_lost: std::cell::Cell<bool>,
+        /// Model the dropout that actually killed a write on real hardware: the data
+        /// lines go 0x00 partway through a chunk, but the probe is BACK by the time the
+        /// post-chunk RDID is asked, so the id answers healthy and the liveness check
+        /// trusts the zeros.
+        ///
+        /// `dead_from` cannot express this, and that is the whole point: it LATCHES
+        /// contact_lost, so the id goes silent too -- precisely the case liveness DOES
+        /// catch. Every dropout this fake could model was one the code already handled.
+        /// A fake whose dropouts are always still present at the id check is kinder than
+        /// physics, and being kinder here let a mutation run bless deleting the retry
+        /// wait while three real write runs died at blocks 40, 28 and 2.
+        flicker_zeros_from: Option<usize>,
+        flicker_passes: std::cell::Cell<u8>,
         /// Model a probe that FLICKERS rather than dies: contact returns after this
         /// many RDID polls. This is the real behaviour of a marginal clamp, and the
         /// case `wait_for_contact` exists to ride out.
@@ -2714,6 +2850,8 @@ mod tests {
                 contact_lost: std::cell::Cell::new(false),
                 recover_after_polls: None,
                 rdid_polls_while_dead: 0,
+                flicker_zeros_from: None,
+                flicker_passes: std::cell::Cell::new(0),
                 corrupt_from: None,
                 read_pass: 0,
                 floating: std::cell::Cell::new(false),
@@ -2755,6 +2893,15 @@ mod tests {
             assert!(!ids.is_empty(), "need at least one garbage id");
             self.garbage_ids = ids;
             self.garbage_id_polls = std::cell::Cell::new(polls);
+            self
+        }
+        /// Zeros on the data lines from `offset`, for the next `passes` read passes,
+        /// with the chip answering RDID normally the whole time. The probe flickered
+        /// and settled before the id check, so nothing downstream can tell these zeros
+        /// from firmware content except reading again.
+        fn flickering_zeros_at(mut self, offset: usize, passes: u8) -> Self {
+            self.flicker_zeros_from = Some(offset);
+            self.flicker_passes = std::cell::Cell::new(passes);
             self
         }
         /// Lose contact at `offset` and never regain it, as a probe knocked off the
@@ -2837,6 +2984,15 @@ mod tests {
                             self.contact_lost.set(true);
                             return 0x00;
                         }
+                        // Zeros WITHOUT latching contact_lost: the probe is back before
+                        // the post-chunk id check, so RDID answers healthy and liveness
+                        // has nothing to see. Byte-for-byte identical to a dead bus, and
+                        // indistinguishable from it except by reading twice.
+                        if self.flicker_zeros_from.is_some_and(|f| a >= f)
+                            && self.flicker_passes.get() > 0
+                        {
+                            return 0x00;
+                        }
                         // Different garbage every pass, chip still answering: the
                         // dropout a liveness check is blind to.
                         if self.corrupt_from.is_some_and(|c| a >= c) {
@@ -2894,7 +3050,14 @@ mod tests {
                 }
                 // Each read transaction is a fresh pass over the wire, so corrupted
                 // regions hand back different bytes next time.
-                SPI_READ | SPI_READ_4B => self.read_pass = self.read_pass.wrapping_add(1),
+                SPI_READ | SPI_READ_4B => {
+                    self.read_pass = self.read_pass.wrapping_add(1);
+                    // A flicker passes. Spending it per read transaction is what lets a
+                    // re-read succeed where the first one came back full of zeros.
+                    if self.flicker_passes.get() > 0 {
+                        self.flicker_passes.set(self.flicker_passes.get() - 1);
+                    }
+                }
                 SPI_CHIP_ERASE => self.flash.iter_mut().for_each(|b| *b = 0xff),
                 SPI_WREN => self.wel = true,
                 SPI_EN4B => {
@@ -3346,6 +3509,110 @@ mod tests {
             backend.bus.as_ref().unwrap().flash,
             firmware,
             "riding out a mid-write dropout must still leave the whole image on the chip"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The write failure that actually happened on the bench, reproduced from the artifact.
+    //
+    // Three runs died reporting "read-back mismatch (chip 0x00, image XX)" at blocks 40,
+    // 28 and 2 -- always chip 0x00, never 0xff. That number is the whole diagnosis: erased
+    // flash reads 0xff and a failed program LEAVES 0xff, so 0x00 was never the chip's
+    // content. It was the data lines with nothing driving them. The blocks had been
+    // written correctly and the READ lied.
+    //
+    // The way in: the probe flickers inside the verify chunk and settles before the
+    // post-chunk RDID, so the id answers healthy, LivenessOnly trusts the zeros, and the
+    // compare calls a good block a failed program. That verdict spends one of only
+    // WRITE_BLOCK_ATTEMPTS tries -- so three unlucky flickers kill a write whose every
+    // block landed, and the worse contact gets the earlier it dies. That is the 40 -> 28
+    // -> 2 the bench saw: not a degrading chip, a read losing a coin-flip sooner.
+    //
+    // Erase COUNT is the assertion because it is what separates the fix from the bug. Both
+    // end with the right bytes on the chip; only the broken one gets there by believing a
+    // lying read and re-erasing a block that was already correct.
+    #[test]
+    fn a_flickering_readback_must_not_convict_a_write_that_landed() {
+        const SIZE: usize = 128 * 1024; // two blocks
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("readback-flicker.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        // One flickered read pass, landing on block 0's verify read-back. RDID stays
+        // healthy throughout, so nothing waits and nothing retries: this is invisible to
+        // every check the read path has.
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).flickering_zeros_at(0, 1);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .expect("a flicker in the READ-BACK is not a failed write");
+        assert!(w.verified);
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "the block was written correctly the first time; only the read lied"
+        );
+
+        let erases = backend
+            .bus
+            .as_ref()
+            .unwrap()
+            .ops
+            .iter()
+            .filter(|&&(op, a)| op == SPI_BLOCK_ERASE && a == 0)
+            .count();
+        assert_eq!(
+            erases, 1,
+            "a brief read-back flicker must cost ZERO retries: block 0 was programmed \
+             correctly, so re-erasing it means the zeros were believed and an attempt was \
+             spent. Three spent attempts is a dead write."
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A hard three-strike limit is the wrong SHAPE for a marginal probe, and it outlived
+    // every other fix: real runs kept dying around block 30 whatever else was corrected.
+    // The arithmetic is unforgiving. If a glitch costs one attempt in three, a block fails
+    // ~12% of the time, and 512 blocks at 12% is not a risk, it is a certainty. Meanwhile
+    // the READ path had long since learned the rule -- contact is scarce, patience is free
+    // -- and spends the whole budget riding flickers out. The write just never got it.
+    #[test]
+    fn a_block_that_needs_more_than_three_tries_still_lands_while_patience_remains() {
+        const SIZE: usize = 128 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("write-patience.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        // Eight flickered read passes. Each attempt spends two of them (the read-back and
+        // its confirm), so the first four attempts fail: one more than WRITE_BLOCK_ATTEMPTS
+        // allowed. Three strikes kills this write. Patience lands it on the fifth.
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).flickering_zeros_at(0, 8);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .expect("a block must keep retrying while patience remains, not quit at three");
+        assert!(w.verified);
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "riding out a run of bad attempts must still leave the whole image on the chip"
         );
         std::fs::remove_file(&path).ok();
     }
