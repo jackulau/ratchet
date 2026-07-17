@@ -1332,6 +1332,11 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// dropout costs this block, not the write. The retry re-erases before
     /// re-programming, so a half-programmed block from the failed attempt cannot
     /// leave stale 0 bits ANDed into the result.
+    ///
+    /// Retries are bounded by the PATIENCE budget, not by a fixed attempt count, for the
+    /// same reason the read path is: a marginal probe fails a block for reasons that are
+    /// transient and uncorrelated, so the answer is to try again rather than to give up
+    /// on the write. WRITE_BLOCK_ATTEMPTS is the floor, not the ceiling.
     fn write_block_verified(
         &mut self,
         addr: u64,
@@ -1339,13 +1344,45 @@ impl<B: UsbBus> CH341ABackend<B> {
         page_size: usize,
         verify: bool,
     ) -> Result<()> {
-        let mut last: Option<String> = None;
-        for attempt in 1..=WRITE_BLOCK_ATTEMPTS {
-            match self.try_write_block(addr, target, page_size, verify) {
-                Ok(()) => return Ok(()),
-                Err(e) => last = Some(e.to_string()),
+        let deadline = Instant::now() + self.chunk_patience;
+        let mut attempt: u32 = 0;
+        let mut announced = false;
+        let last = loop {
+            attempt += 1;
+            let why = match self.try_write_block(addr, target, page_size, verify) {
+                Ok(()) => {
+                    if announced {
+                        eprintln!("block at {addr:#x} landed on attempt {attempt}");
+                    }
+                    return Ok(());
+                }
+                Err(e) => e.to_string(),
+            };
+            // Keep trying until the patience budget says stop, not after a fixed three
+            // strikes. Three was the wrong SHAPE for a marginal probe, and it is what kept
+            // killing real writes long after the read path had learned better: the read
+            // spends the whole --patience budget riding out flickers, while the write gave
+            // a block three tries and quit. If a glitch costs one page program in three, a
+            // block fails ~12% of the time; across 512 blocks that is not a risk, it is a
+            // certainty, and every run died around block 30 no matter what else was fixed.
+            //
+            // The rule the read path already states applies verbatim here: contact is the
+            // scarce resource and patience is free, so spend it retrying the block rather
+            // than on failing. WRITE_BLOCK_ATTEMPTS stays as the FLOOR, so a caller that
+            // asks for no patience still gets the old three tries.
+            if attempt >= WRITE_BLOCK_ATTEMPTS && Instant::now() >= deadline {
+                break why;
             }
-            if attempt < WRITE_BLOCK_ATTEMPTS {
+            if !announced {
+                eprintln!(
+                    "block at {addr:#x} did not land ({why}) — retrying for up to {}s. \
+                     Each retry re-erases first, so this is safe to repeat; the block is \
+                     erased or half-programmed until one succeeds.",
+                    deadline.saturating_duration_since(Instant::now()).as_secs()
+                );
+                announced = true;
+            }
+            {
                 // Still deliberately NOT a wait_for_contact, but the ORIGINAL reasoning
                 // here was wrong and worth recording, because it looked airtight.
                 //
@@ -1364,14 +1401,14 @@ impl<B: UsbBus> CH341ABackend<B> {
                 // it, so there is nothing left for a wait here to buy.
                 std::thread::sleep(Duration::from_millis(20));
             }
-        }
+        };
         Err(BackendError::Other(format!(
-            "lost the chip while writing the block at {addr:#x}; {} attempts failed: {}. \
-             Re-seat the probe and re-run the SAME write — blocks already programmed are \
-             skipped, so it resumes here instead of starting over. Do not boot the board \
-             until a write completes: this block is erased or half-programmed.",
-            WRITE_BLOCK_ATTEMPTS,
-            last.unwrap_or_else(|| "unknown".into())
+            "lost the chip while writing the block at {addr:#x}; {attempt} attempts over {}s \
+             failed: {last}. Re-seat the probe and re-run the SAME write — blocks already \
+             programmed are skipped, so it resumes here instead of starting over. Do not \
+             boot the board until a write completes: this block is erased or \
+             half-programmed.",
+            self.chunk_patience.as_secs(),
         )))
     }
 
@@ -3539,6 +3576,44 @@ mod tests {
              spent. Three spent attempts is a dead write."
         );
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A hard three-strike limit is the wrong SHAPE for a marginal probe, and it outlived
+    // every other fix: real runs kept dying around block 30 whatever else was corrected.
+    // The arithmetic is unforgiving. If a glitch costs one attempt in three, a block fails
+    // ~12% of the time, and 512 blocks at 12% is not a risk, it is a certainty. Meanwhile
+    // the READ path had long since learned the rule -- contact is scarce, patience is free
+    // -- and spends the whole budget riding flickers out. The write just never got it.
+    #[test]
+    fn a_block_that_needs_more_than_three_tries_still_lands_while_patience_remains() {
+        const SIZE: usize = 128 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("write-patience.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        // Eight flickered read passes. Each attempt spends two of them (the read-back and
+        // its confirm), so the first four attempts fail: one more than WRITE_BLOCK_ATTEMPTS
+        // allowed. Three strikes kills this write. Patience lands it on the fifth.
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).flickering_zeros_at(0, 8);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .expect("a block must keep retrying while patience remains, not quit at three");
+        assert!(w.verified);
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "riding out a run of bad attempts must still leave the whole image on the chip"
+        );
         std::fs::remove_file(&path).ok();
     }
 
