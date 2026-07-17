@@ -601,7 +601,12 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// patience and nothing else, and patience is the one resource we have plenty of.
     ///
     /// Contact is the scarce resource; spend it on chunks, not on failing.
-    fn wait_for_contact(&mut self, deadline: Instant) -> bool {
+    ///
+    /// `announce` is printed once, only if we actually end up waiting. The caller owns
+    /// the wording because the two waits are not the same event: mid-read the news is
+    /// "contact lost, your finished chunks are safe", while at startup nothing has been
+    /// lost yet and nothing is on disk to reassure anyone about.
+    fn wait_for_contact(&mut self, deadline: Instant, announce: &str) -> bool {
         let mut announced = false;
         loop {
             if self.chip_answers() {
@@ -616,12 +621,7 @@ impl<B: UsbBus> CH341ABackend<B> {
             // A read that goes quiet for minutes reads as a hang, and a user who
             // thinks it hung kills it. Say what is happening and that stopping is safe.
             if !announced {
-                eprintln!(
-                    "contact lost — waiting up to {}s for the probe to come back. \
-                     Completed chunks are already saved; Ctrl-C is safe and re-running \
-                     resumes from here.",
-                    deadline.saturating_duration_since(Instant::now()).as_secs()
-                );
+                eprintln!("{announce}");
                 announced = true;
             }
             std::thread::sleep(CONTACT_POLL_INTERVAL);
@@ -712,7 +712,13 @@ impl<B: UsbBus> CH341ABackend<B> {
             // this the loop would re-read at full tilt for the whole patience budget.
             // Hammering a marginal bus is the one response guaranteed not to help.
             std::thread::sleep(CONTACT_POLL_INTERVAL);
-            if !self.wait_for_contact(deadline) {
+            let announce = format!(
+                "contact lost — waiting up to {}s for the probe to come back. \
+                 Completed chunks are already saved; Ctrl-C is safe and re-running \
+                 resumes from here.",
+                deadline.saturating_duration_since(Instant::now()).as_secs()
+            );
+            if !self.wait_for_contact(deadline, &announce) {
                 break why;
             }
         };
@@ -1092,9 +1098,11 @@ impl<B: UsbBus> CH341ABackend<B> {
     fn verify_against_file(&mut self, file_path: &Path) -> Result<VerifyResult> {
         let start = Instant::now();
         let file_data = std::fs::read(file_path)?;
-        // Identify first so 4-byte mode (EN4B) is active before reading back a >16 MB chip;
-        // a standalone `verify` would otherwise read with 3-byte addressing.
-        self.identify_chip()?;
+        // Identify first so the chip is sized and 4-byte addressing is settled before
+        // reading back a >16 MB chip. Patient for the same reason the read path is:
+        // a verify that fails closed in 11 ms because the probe was mid-flicker tells
+        // you nothing about the chip.
+        self.identify_chip_patient()?;
         let chip_data = self.read_range(0, file_data.len())?;
         let mut hc = Sha256::new();
         hc.update(&chip_data);
@@ -1115,7 +1123,36 @@ impl<B: UsbBus> CH341ABackend<B> {
         let start = Instant::now();
         let firmware = std::fs::read(input_path)?;
         reject_blank_image(&firmware)?;
-        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        // Wait for the probe here for the same reason reads do: the pads on a WSON
+        // part are under the package, so "press enter during a contact window" is not
+        // something a human can do. Safe at this point specifically because nothing
+        // has been erased or programmed yet -- this is still startup. It deliberately
+        // does NOT make the write itself tolerate a dropout; that is per-block
+        // erase/program/verify, and re-running the same command resumes it.
+        //
+        // Look FIRST and wait only on a miss, rather than polling before every write.
+        // A seated probe must cost no extra bus traffic: the write tests queue an exact
+        // response sequence and an unconditional probe ate the RDID meant for identify,
+        // which is the mock telling the truth about a real change to the wire.
+        //
+        // Identify NORMALLY here rather than via identify_chip_patient. The patient
+        // version keeps waiting for an id it can SIZE, which is right for a read but
+        // wrong here: a genuinely unsupported chip would spend the whole budget and then
+        // report "chip not detected" when it is present and answering. The honest answer
+        // is the unknown-capacity refusal below. Refusing loudly beats a false absence.
+        let chip = match self.identify_chip()? {
+            Some(chip) => chip,
+            None => {
+                let deadline = Instant::now() + self.chunk_patience;
+                let announce = format!(
+                    "no chip answering yet — waiting up to {}s for the probe to make \
+                     contact. Nothing has been erased or written; Ctrl-C is safe.",
+                    self.chunk_patience.as_secs()
+                );
+                self.wait_for_contact(deadline, &announce);
+                self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?
+            }
+        };
         let chip_size = chip.size_bytes as usize;
         if chip_size == 0 {
             return Err(BackendError::Other(format!(
@@ -3166,6 +3203,42 @@ mod tests {
         assert!(
             std::fs::read(&path).unwrap() == content,
             "waiting for the probe to arrive must still produce the chip byte for byte"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The same startup trap as the read above, one command later: write identified the
+    // chip in ~11ms and failed closed, so "seat the probe, THEN hit enter" was the only
+    // order that worked -- and on a WSON part the pads are under the package, so that is
+    // pressing enter inside a window you cannot see. Waiting is safe HERE and only here:
+    // this is startup, before any erase. The write itself still refuses to ride out a
+    // dropout; that is per-block erase/program/verify plus re-running to resume.
+    #[test]
+    fn write_waits_for_contact_before_it_gives_up_on_finding_the_chip() {
+        const SIZE: usize = 1024 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("absent-at-start-write.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        // Nothing on the bus when the command starts; the probe lands 3 polls later.
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).absent_until_poll(3);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .expect("a probe seated shortly after the command starts must not fail the write");
+        assert!(w.verified);
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "waiting for the probe to arrive must still program the whole image"
         );
         std::fs::remove_file(&path).ok();
     }
