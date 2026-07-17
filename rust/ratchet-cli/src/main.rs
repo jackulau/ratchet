@@ -7,7 +7,7 @@ use ratchet_core::agent::envelope::{AgentEnvelope, AgentError};
 use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind, RawBus};
 use ratchet_core::diagnostics::spi_integrity::{
     analyze_spi_readings, classify_dead_bus, dead_bus_hint, format_score_bar, SpiPattern,
-    SpiReading,
+    SpiReading, USB_ERROR_READING,
 };
 use serde_json::json;
 use std::sync::OnceLock;
@@ -1861,9 +1861,28 @@ fn cmd_monitor(interval_ms: u32, samples: u32, json: bool) -> anyhow::Result<()>
     let samples = samples.max(1);
     let start = std::time::Instant::now();
     let mut readings = Vec::with_capacity(samples as usize);
+    let mut usb_errors = 0u32;
     for i in 0..samples {
-        let id = m.read_jedec_id()?.to_hex();
-        if !json {
+        // A transfer error must not end the run. This is the tool you reach for when
+        // the connection is bad, so dying on a bad connection defeats it: one glitch
+        // at read 8 of 500 threw away the other 492 and told you nothing. The bus
+        // layer clears the endpoint stall underneath, so the next sample can succeed
+        // and the run reports what actually happened over its whole length.
+        let id = match m.read_jedec_id() {
+            Ok(id) => id.to_hex(),
+            Err(e) => {
+                usb_errors += 1;
+                if !json {
+                    eprintln!("read {}/{samples}: USB ERROR ({e}) — continuing", i + 1);
+                }
+                // Distinct from 000000: that means "bus fine, chip silent" (a contact
+                // problem). This means the programmer link itself failed, which is a
+                // different fault with a different fix, and scoring them as the same
+                // reading would blame the probe for the cable.
+                USB_ERROR_READING.to_string()
+            }
+        };
+        if !json && id != USB_ERROR_READING {
             eprintln!("read {}/{samples}: jedec={id}", i + 1);
         }
         readings.push(SpiReading {
@@ -1873,6 +1892,14 @@ fn cmd_monitor(interval_ms: u32, samples: u32, json: bool) -> anyhow::Result<()>
         if i + 1 < samples {
             std::thread::sleep(std::time::Duration::from_millis(interval_ms as u64));
         }
+    }
+    if usb_errors > 0 {
+        eprintln!(
+            "\n{usb_errors}/{samples} samples failed at the USB layer, not the probe. \
+             That is the programmer link (cable, port, hub, or the CH341A itself), not \
+             contact with the chip — reseating the probe will not fix it. Try a different \
+             cable and a direct port, no hub."
+        );
     }
     let report = analyze_spi_readings(readings);
     let stable = report.pattern == SpiPattern::Stable;

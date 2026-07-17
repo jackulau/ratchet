@@ -18,7 +18,19 @@ pub enum SpiPattern {
     Noisy,
     Dead,
     NoChip,
+    /// The programmer link itself failed (USB transfer errors), so most samples are
+    /// not chip readings at all. Distinct from `Dead`, which means the bus worked and
+    /// the chip stayed silent. Same symptom to a human, opposite fix: `Dead` says
+    /// reseat the probe, this says the probe is not the problem.
+    LinkError,
 }
+
+/// Recorded instead of a JEDEC id when a sample fails at the USB layer.
+///
+/// Deliberately not hex. `000000` means the transfer SUCCEEDED and reported a silent
+/// chip (a contact fault); this means the transfer itself failed (a cable, port, hub
+/// or programmer fault). Scoring them alike would blame the probe for the cable.
+pub const USB_ERROR_READING: &str = "usb-error";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpiIntegrityReport {
@@ -118,7 +130,15 @@ pub fn analyze_spi_readings(readings: Vec<SpiReading>) -> SpiIntegrityReport {
     let total_reads = readings.len() as u32;
     let score = ((dominant_count as f64 / total_reads as f64) * 100.0).round() as u32;
 
-    let pattern = if dominant_id == "000000" || dominant_id == "ffffff" {
+    let pattern = if dominant_id == USB_ERROR_READING {
+        // Must be checked BEFORE the score branches. These samples are not chip
+        // readings, so consistency among them means nothing: a run where every
+        // transfer failed is perfectly "consistent" and would otherwise score 100 and
+        // report Stable / "safe to proceed with read/write". A broken instrument
+        // reporting a solid connection is the exact failure this whole file exists to
+        // prevent, and it is worse than no reading at all.
+        SpiPattern::LinkError
+    } else if dominant_id == "000000" || dominant_id == "ffffff" {
         SpiPattern::Dead
     } else if score == 100 {
         SpiPattern::Stable
@@ -128,14 +148,27 @@ pub fn analyze_spi_readings(readings: Vec<SpiReading>) -> SpiIntegrityReport {
         SpiPattern::Noisy
     };
     // Score means connection QUALITY, not read consistency: a dead bus reads
-    // 0x000000 with perfect consistency, but 100% next to "Dead" is a lie.
-    let score = if pattern == SpiPattern::Dead {
+    // 0x000000 with perfect consistency, but 100% next to "Dead" is a lie. The same
+    // applies to a link that failed every transfer.
+    let score = if pattern == SpiPattern::Dead || pattern == SpiPattern::LinkError {
         0
     } else {
         score
     };
 
     let recommendation: String = match pattern {
+        SpiPattern::LinkError => "Most samples failed at the USB layer, so they are not chip \
+             readings at all  -  the programmer link itself is broken. THE PROBE IS NOT THE \
+             PROBLEM: reseating it cannot fix this, and no read or write can be trusted until \
+             the link is solid. Check, in order: \
+             (1) the USB CABLE  -  many CH341A cables are charge-only or marginal; swap it first; \
+             (2) plug the programmer DIRECTLY into the machine, no hub; \
+             (3) a different USB port; \
+             (4) if a transfer died mid-flight the host controller may be wedged  -  if the OS \
+             now shows ZERO usb devices (a hub included), reboot rather than diagnosing the \
+             programmer, because a hub cannot unplug itself; \
+             (5) only then suspect the CH341A itself."
+            .to_string(),
         SpiPattern::Dead => "All reads identical (0x000000 or 0xFFFFFF)  -  no chip responding. \
              A PERFECTLY STABLE dead value is not a loose clip (that gives varying reads): it means \
              no contact at all, no power, or a package/tool mismatch. Check: \
@@ -173,6 +206,82 @@ pub fn format_score_bar(score: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    // A run where every transfer failed at the USB layer is perfectly CONSISTENT, and
+    // consistency is what the score measures. Without an explicit branch it scores 100
+    // and reports Stable / "safe to proceed with read/write operations" -- a broken
+    // instrument certifying a connection it never made. That is the single worst thing
+    // this file could say, and it is the failure mode this project has already eaten
+    // twice (a wedged USB stack read as a dead programmer; a dropout dump read as a
+    // backup).
+    #[test]
+    fn a_run_of_pure_usb_errors_is_never_reported_as_a_good_connection() {
+        let readings: Vec<SpiReading> = (0..50)
+            .map(|i| SpiReading {
+                jedec_id: USB_ERROR_READING.to_string(),
+                timestamp: i,
+            })
+            .collect();
+        let r = analyze_spi_readings(readings);
+        assert_eq!(r.pattern, SpiPattern::LinkError);
+        assert_eq!(r.score, 0, "100% consistent link failure is 0% connection");
+        assert!(
+            !r.recommendation.contains("Connection is solid")
+                && !r.recommendation.contains("Safe to proceed"),
+            "must never certify a link that failed every transfer: {}",
+            r.recommendation
+        );
+        assert!(
+            r.recommendation.contains("PROBE IS NOT THE PROBLEM"),
+            "must send the user at the link, not the probe: {}",
+            r.recommendation
+        );
+    }
+
+    // The two dead readings are NOT the same fault and must not collapse together:
+    // 000000/ffffff mean the transfer WORKED and the chip was silent (reseat the
+    // probe), usb-error means the transfer itself failed (the probe is irrelevant).
+    #[test]
+    fn link_errors_are_classified_apart_from_a_silent_chip() {
+        let dead: Vec<SpiReading> = (0..10)
+            .map(|i| SpiReading {
+                jedec_id: "ffffff".into(),
+                timestamp: i,
+            })
+            .collect();
+        assert_eq!(analyze_spi_readings(dead).pattern, SpiPattern::Dead);
+
+        let link: Vec<SpiReading> = (0..10)
+            .map(|i| SpiReading {
+                jedec_id: USB_ERROR_READING.into(),
+                timestamp: i,
+            })
+            .collect();
+        assert_eq!(analyze_spi_readings(link).pattern, SpiPattern::LinkError);
+    }
+
+    // A few link glitches among good reads must dent the score, not be ignored: they
+    // are real connection failures, just not the probe's fault.
+    #[test]
+    fn occasional_link_errors_drop_a_run_below_stable() {
+        let mut readings: Vec<SpiReading> = (0..90)
+            .map(|i| SpiReading {
+                jedec_id: "ef6019".into(),
+                timestamp: i,
+            })
+            .collect();
+        readings.extend((90..100).map(|i| SpiReading {
+            jedec_id: USB_ERROR_READING.to_string(),
+            timestamp: i,
+        }));
+        let r = analyze_spi_readings(readings);
+        assert_ne!(
+            r.pattern,
+            SpiPattern::Stable,
+            "10% of samples failing at the USB layer is not a stable connection"
+        );
+        assert_eq!(r.score, 90);
+    }
     use super::*;
 
     fn reading(id: &str) -> SpiReading {
