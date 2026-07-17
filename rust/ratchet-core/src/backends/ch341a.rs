@@ -95,8 +95,34 @@ pub const SIZE_16MB: u64 = 16 * 1024 * 1024;
 /// small enough that a retry is cheap and progress stays responsive.
 pub const READ_CHUNK: usize = 64 * 1024;
 
-/// Attempts per chunk before a read gives up and fails closed.
-pub const READ_CHUNK_ATTEMPTS: u32 = 3;
+/// How long to keep waiting for contact on a single chunk before a read gives up
+/// and fails closed.
+///
+/// A marginal probe does not fail, it flickers: contact comes back if you wait.
+/// The old rule (three attempts, ~60 ms) gave up during the first flicker and
+/// threw away the read, which is how a 32 MB dump died at 7%. Waiting is the
+/// right response because waiting is free -- see [`CH341ABackend::wait_for_contact`].
+///
+/// Two minutes is "the probe is off, go fix it" rather than "the probe flickered".
+/// It costs nothing when contact is good (a healthy chunk never waits) and, since
+/// completed chunks persist, giving up is no longer expensive either.
+pub const CHUNK_PATIENCE: Duration = Duration::from_secs(120);
+
+/// Gap between contact polls while waiting. Short enough not to miss a contact
+/// window (observed windows are ~1 s), long enough not to spin the USB bus.
+pub const CONTACT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Patience a freshly built backend starts with.
+///
+/// Unit tests get a near-zero budget. A fake bus has no physical probe that might
+/// flicker back, so every second spent waiting on one is dead test time -- and a
+/// dead-bus test otherwise sits through the entire production budget, which cost
+/// four of them 120 s each. Tests that exercise the waiting itself set their own
+/// budget, which is also the honest way to mark a test as one that waits.
+#[cfg(test)]
+const DEFAULT_CHUNK_PATIENCE: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const DEFAULT_CHUNK_PATIENCE: Duration = CHUNK_PATIENCE;
 
 /// Erase granularity used by write_chip (matches SPI_BLOCK_ERASE / _4B).
 pub const BLOCK_64K: u64 = 64 * 1024;
@@ -319,6 +345,26 @@ pub struct CH341ABackend<B: UsbBus> {
     /// JEDEC id observed at identify time. Long operations re-check against it to
     /// tell a dead bus apart from legitimately zero-filled flash.
     jedec_expect: Option<[u8; 3]>,
+    /// Per-chunk contact-wait budget; see [`CHUNK_PATIENCE`].
+    chunk_patience: Duration,
+}
+
+/// How much evidence a chunk needs before it is believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkTrust {
+    /// One read plus a liveness check. For callers that compare the bytes against
+    /// a known image anyway (verify, write read-back): a bad read there fails
+    /// closed as a mismatch, so a second read would only buy a nicer error.
+    LivenessOnly,
+    /// Two independent reads that must agree, each liveness-checked. For a backup,
+    /// which has nothing to compare against and gets trusted forever after.
+    ///
+    /// This is the same guarantee as the project's "two full reads, matching
+    /// hashes" gate -- every byte read twice and matched -- applied per 64 KB
+    /// instead of per 32 MB. The point is the contact budget: matching two whole
+    /// dumps needs minutes of unbroken contact twice over, matching one chunk
+    /// needs about a second. Same evidence, reachable with the grip we have.
+    DoubleRead,
 }
 
 impl<B: UsbBus> CH341ABackend<B> {
@@ -328,6 +374,7 @@ impl<B: UsbBus> CH341ABackend<B> {
             use_4byte_addr: false,
             progress: None,
             jedec_expect: None,
+            chunk_patience: DEFAULT_CHUNK_PATIENCE,
         }
     }
 
@@ -440,7 +487,7 @@ impl<B: UsbBus> CH341ABackend<B> {
         while buf.len() < len {
             let n = (len - buf.len()).min(READ_CHUNK);
             let addr = start_addr + buf.len() as u64;
-            let chunk = self.read_chunk_checked(addr, n)?;
+            let chunk = self.read_chunk_patient(addr, n, ChunkTrust::LivenessOnly)?;
             buf.extend_from_slice(&chunk);
             if let Some(cb) = self.progress.as_mut() {
                 cb(buf.len() as u64, len as u64);
@@ -466,43 +513,121 @@ impl<B: UsbBus> CH341ABackend<B> {
     ///
     /// Cost is one RDID per 64 KB: ~350 us per chunk, ~0.2 s over a 32 MB dump.
     /// That is the cheapest correctness in this file.
-    fn read_chunk_checked(&mut self, addr: u64, n: usize) -> Result<Vec<u8>> {
+    fn read_chunk_once(&mut self, addr: u64, n: usize) -> std::result::Result<Vec<u8>, String> {
         let expect = self.jedec_expect;
-        let mut last: Option<String> = None;
-        for attempt in 1..=READ_CHUNK_ATTEMPTS {
-            let use_4byte = self.use_4byte_addr;
-            let bus = self.bus.as_mut().ok_or(BackendError::NotConnected)?;
-            match Self::read_one_chunk(bus, addr, n, use_4byte) {
-                Ok(data) => match self.rdid() {
-                    Ok(id) => {
-                        let live = [id.manufacturer, id.memory_type, id.capacity];
-                        if expect.is_none_or(|e| e == live) && live != [0, 0, 0] {
-                            return Ok(data); // chip still answering: the chunk is real
-                        }
-                        last = Some(format!(
-                            "chip id went {:02x}{:02x}{:02x} mid-read (expected {})",
-                            live[0],
-                            live[1],
-                            live[2],
-                            expect
-                                .map(|e| format!("{:02x}{:02x}{:02x}", e[0], e[1], e[2]))
-                                .unwrap_or_else(|| "a stable id".into())
-                        ));
-                    }
-                    Err(e) => last = Some(format!("chip stopped answering ({e})")),
-                },
-                Err(e) => last = Some(e.to_string()),
+        let use_4byte = self.use_4byte_addr;
+        let bus = match self.bus.as_mut() {
+            Some(b) => b,
+            None => return Err("backend not connected".into()),
+        };
+        let data = Self::read_one_chunk(bus, addr, n, use_4byte).map_err(|e| e.to_string())?;
+        match self.rdid() {
+            Ok(id) => {
+                let live = [id.manufacturer, id.memory_type, id.capacity];
+                if expect.is_none_or(|e| e == live) && live != [0, 0, 0] {
+                    Ok(data) // chip still answering: the chunk is real
+                } else {
+                    Err(format!(
+                        "chip id went {:02x}{:02x}{:02x} mid-read (expected {})",
+                        live[0],
+                        live[1],
+                        live[2],
+                        expect
+                            .map(|e| format!("{:02x}{:02x}{:02x}", e[0], e[1], e[2]))
+                            .unwrap_or_else(|| "a stable id".into())
+                    ))
+                }
             }
-            if attempt < READ_CHUNK_ATTEMPTS {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            Err(e) => Err(format!("chip stopped answering ({e})")),
         }
+    }
+
+    /// True if the chip answers RDID with the id identify saw.
+    fn chip_answers(&mut self) -> bool {
+        let expect = self.jedec_expect;
+        match self.rdid() {
+            Ok(id) => {
+                let live = [id.manufacturer, id.memory_type, id.capacity];
+                live != [0, 0, 0] && expect.is_none_or(|e| e == live)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Block until the chip answers again, or `deadline` passes. Returns whether
+    /// contact came back.
+    ///
+    /// This is the whole trick, and it works because polling is free: when the probe
+    /// is not touching, RDID is a SUCCESSFUL USB transfer that reports `000000`. It
+    /// is a reading, not an error -- nothing retries, nothing times out, no transfer
+    /// is left in flight to wedge the host controller. So a marginal probe costs
+    /// patience and nothing else, and patience is the one resource we have plenty of.
+    ///
+    /// Contact is the scarce resource; spend it on chunks, not on failing.
+    fn wait_for_contact(&mut self, deadline: Instant) -> bool {
+        let mut announced = false;
+        loop {
+            if self.chip_answers() {
+                if announced {
+                    eprintln!("contact is back — continuing");
+                }
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            // A read that goes quiet for minutes reads as a hang, and a user who
+            // thinks it hung kills it. Say what is happening and that stopping is safe.
+            if !announced {
+                eprintln!(
+                    "contact lost — waiting up to {}s for the probe to come back. \
+                     Completed chunks are already saved; Ctrl-C is safe and re-running \
+                     resumes from here.",
+                    deadline.saturating_duration_since(Instant::now()).as_secs()
+                );
+                announced = true;
+            }
+            std::thread::sleep(CONTACT_POLL_INTERVAL);
+        }
+    }
+
+    /// Read one chunk, waiting out contact dropouts up to the patience budget and
+    /// requiring as much agreement as `trust` demands.
+    fn read_chunk_patient(&mut self, addr: u64, n: usize, trust: ChunkTrust) -> Result<Vec<u8>> {
+        let deadline = Instant::now() + self.chunk_patience;
+        let reason = loop {
+            let why = match self.read_chunk_once(addr, n) {
+                Ok(first) if trust == ChunkTrust::LivenessOnly => return Ok(first),
+                Ok(first) => match self.read_chunk_once(addr, n) {
+                    // Two reads taken through a probe that flickered would have to
+                    // flicker identically to agree; agreement is the evidence.
+                    Ok(second) if second == first => return Ok(first),
+                    Ok(_) => "two reads of this chunk disagreed, so contact dropped during one \
+                              of them"
+                        .to_string(),
+                    Err(e) => e,
+                },
+                Err(e) => e,
+            };
+            if Instant::now() >= deadline {
+                break why;
+            }
+            // Pace every retry, not just the ones that wait for contact. A chunk can
+            // fail while the chip answers RDID perfectly -- two reads disagreeing is
+            // exactly that -- and then wait_for_contact returns instantly, so without
+            // this the loop would re-read at full tilt for the whole patience budget.
+            // Hammering a marginal bus is the one response guaranteed not to help.
+            std::thread::sleep(CONTACT_POLL_INTERVAL);
+            if !self.wait_for_contact(deadline) {
+                break why;
+            }
+        };
         Err(BackendError::Other(format!(
-            "lost contact with the chip at offset {addr:#x} and could not recover in \
-             {READ_CHUNK_ATTEMPTS} attempts: {}. The probe is not holding — reseat it and \
-             re-run. (Refusing to write a dead-bus read to disk: a dump padded with zeros \
-             looks like a valid backup and is not.)",
-            last.unwrap_or_else(|| "unknown".into())
+            "lost contact with the chip at offset {addr:#x} and it did not come back within \
+             {}s: {reason}. The probe is not holding — reseat it and re-run. (Refusing to \
+             write a dead-bus read to disk: a dump padded with zeros looks like a valid \
+             backup and is not.)",
+            self.chunk_patience.as_secs(),
         )))
     }
 
@@ -755,6 +880,11 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// attempts add up to a whole dump. Without this, a marginal probe yields no
     /// backup at all -- and no backup is what makes a reflash lose the board's MAC
     /// permanently, since the MAC lives in flash and is not in the vendor image.
+    ///
+    /// Progress is persisted as each chunk lands, not just when the read fails.
+    /// Killing a running read is a thing users do -- a slow read on a bad probe looks
+    /// exactly like a hang -- and a Ctrl-C that silently threw away nine minutes of
+    /// captured chunks would defeat the entire point.
     fn read_chip_resumable(
         &mut self,
         output_path: &Path,
@@ -762,11 +892,13 @@ impl<B: UsbBus> CH341ABackend<B> {
         size: usize,
     ) -> Result<Vec<u8>> {
         use super::resume::ResumeState;
+        use std::io::{Seek, SeekFrom, Write};
         let chunk = READ_CHUNK as u32;
         let (mut state, partial) = ResumeState::load(output_path, jedec, size as u64, chunk);
         // 0xFF, not 0x00: if anything ever escapes with holes, erased-flash bytes are
         // the honest filler. A zero-filled hole is indistinguishable from the dead-bus
         // dumps this whole subsystem exists to reject.
+        let resuming = partial.is_some();
         let mut buf = partial.unwrap_or_else(|| vec![0xffu8; size]);
         let resumed = state.completed_bytes();
         if resumed > 0 {
@@ -777,22 +909,53 @@ impl<B: UsbBus> CH341ABackend<B> {
             );
         }
 
+        // Chunks are written in place as they land, so the file must exist at full
+        // size first. Lay down the 0xFF filler on a fresh read: growing the file with
+        // set_len would fill the holes with 0x00, and a half-finished dump full of
+        // zeros is precisely the artefact that must never be mistaken for a backup.
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(output_path)?;
+        if !resuming {
+            f.write_all(&buf)?;
+            // A stale file at this path may be longer than the chip. Cut the tail now:
+            // left behind, it makes the partial the wrong size, and a resume rejects a
+            // wrong-size partial and starts over -- silently discarding the chunks a
+            // killed read had banked.
+            f.set_len(size as u64)?;
+        }
+
         for i in 0..state.done.len() {
             if state.done[i] {
                 continue;
             }
             let addr = i as u64 * READ_CHUNK as u64;
             let n = (size - addr as usize).min(READ_CHUNK);
-            match self.read_chunk_checked(addr, n) {
+            // DoubleRead: a backup is the one read with nothing to check it against
+            // later, so each chunk carries its own proof.
+            match self.read_chunk_patient(addr, n, ChunkTrust::DoubleRead) {
                 Ok(data) => {
                     buf[addr as usize..addr as usize + n].copy_from_slice(&data);
+                    // ORDER IS LOAD-BEARING: bytes first, then the record saying they
+                    // are there. Reversed, a kill in the gap leaves a sidecar claiming a
+                    // chunk that is still 0xFF filler on disk -- the resume then skips it
+                    // and hands back a "complete" backup with a hole in it, which is the
+                    // silently-corrupt-backup failure this whole subsystem exists for.
+                    // This way round a kill in the gap only costs a re-read of one chunk.
+                    // Not enforced by a test: catching it needs the process killed between
+                    // these two syscalls, which is not worth the harness it would take.
+                    f.seek(SeekFrom::Start(addr))?;
+                    f.write_all(&data)?;
                     state.done[i] = true;
+                    state.save(output_path)?;
                 }
                 Err(e) => {
                     // Persist before surfacing the error: this attempt's chunks are the
                     // only thing standing between the user and starting from zero.
                     let saved = state.completed_bytes();
-                    std::fs::write(output_path, &buf)?;
+                    f.flush()?;
                     state.save(output_path)?;
                     return Err(BackendError::Other(format!(
                         "{e}\n\nProgress saved: {saved}/{size} bytes ({:.1}%) captured so far. \
@@ -1030,6 +1193,10 @@ impl<B: UsbBus> CH341ABackend<B> {
 }
 
 impl<B: UsbBus> Backend for CH341ABackend<B> {
+    fn set_chunk_patience(&mut self, d: Duration) {
+        self.chunk_patience = d;
+    }
+
     fn detect_programmer(&mut self) -> Result<ProgrammerInfo> {
         Ok(ProgrammerInfo {
             kind: "ch341a".into(),
@@ -2278,9 +2445,20 @@ mod tests {
         /// Model a probe that loses contact partway: a READ at or past this offset
         /// returns 0x00 and latches `contact_lost`, after which RDID goes silent
         /// too. That is the real signature — zeros on the data lines AND a chip
-        /// that stops answering — and it is what read_chunk_checked keys off.
-        dead_from: Option<usize>,
+        /// that stops answering — and it is what the liveness check keys off.
+        dead_from: std::cell::Cell<Option<usize>>,
         contact_lost: std::cell::Cell<bool>,
+        /// Model a probe that FLICKERS rather than dies: contact returns after this
+        /// many RDID polls. This is the real behaviour of a marginal clamp, and the
+        /// case `wait_for_contact` exists to ride out.
+        recover_after_polls: Option<u32>,
+        rdid_polls_while_dead: u32,
+        /// Model the nastiest dropout: data corrupts from this offset but the chip
+        /// KEEPS ANSWERING RDID. Each pass over the region returns different bytes,
+        /// as a probe glitching SCK would. A liveness check cannot see this — the id
+        /// is healthy before and after — so only comparing two reads catches it.
+        corrupt_from: Option<usize>,
+        read_pass: u8,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -2294,13 +2472,30 @@ mod tests {
                 strict_en4b: false,
                 sfdp: Vec::new(),
                 ops: Vec::new(),
-                dead_from: None,
+                dead_from: std::cell::Cell::new(None),
                 contact_lost: std::cell::Cell::new(false),
+                recover_after_polls: None,
+                rdid_polls_while_dead: 0,
+                corrupt_from: None,
+                read_pass: 0,
             }
         }
-        /// Lose contact at `offset`, as a marginally clamped probe does in practice.
-        fn losing_contact_at(mut self, offset: usize) -> Self {
-            self.dead_from = Some(offset);
+        /// Lose contact at `offset` and never regain it, as a probe knocked off the
+        /// chip does.
+        fn losing_contact_at(self, offset: usize) -> Self {
+            self.dead_from.set(Some(offset));
+            self
+        }
+        /// Lose contact at `offset` but flicker back after `polls` contact polls —
+        /// a marginal clamp, which is what the user actually has.
+        fn recovering_after(mut self, offset: usize, polls: u32) -> Self {
+            self.dead_from.set(Some(offset));
+            self.recover_after_polls = Some(polls);
+            self
+        }
+        /// Corrupt reads from `offset` while the chip keeps answering RDID.
+        fn corrupting_from(mut self, offset: usize) -> Self {
+            self.corrupt_from = Some(offset);
             self
         }
         /// Model a Micron-family part that ignores EN4B/EX4B unless WREN preceded it.
@@ -2352,9 +2547,14 @@ mod tests {
                     if pos >= data_start && self.frame.len() >= data_start {
                         let base = Self::decode_addr(&self.frame[1..data_start]);
                         let a = base + (pos - data_start);
-                        if self.dead_from.is_some_and(|d| a >= d) {
+                        if self.dead_from.get().is_some_and(|d| a >= d) {
                             self.contact_lost.set(true);
                             return 0x00;
+                        }
+                        // Different garbage every pass, chip still answering: the
+                        // dropout a liveness check is blind to.
+                        if self.corrupt_from.is_some_and(|c| a >= c) {
+                            return 0xa0 ^ self.read_pass;
                         }
                         *self.flash.get(a).unwrap_or(&0xff)
                     } else {
@@ -2380,6 +2580,21 @@ mod tests {
                 return;
             }
             match self.frame[0] {
+                // A poll taken while contact is gone. A flickering probe comes back
+                // between polls, so recovery lands on the NEXT id request.
+                SPI_RDID if self.contact_lost.get() => {
+                    self.rdid_polls_while_dead += 1;
+                    if self
+                        .recover_after_polls
+                        .is_some_and(|r| self.rdid_polls_while_dead >= r)
+                    {
+                        self.contact_lost.set(false);
+                        self.dead_from.set(None);
+                    }
+                }
+                // Each read transaction is a fresh pass over the wire, so corrupted
+                // regions hand back different bytes next time.
+                SPI_READ | SPI_READ_4B => self.read_pass = self.read_pass.wrapping_add(1),
                 SPI_CHIP_ERASE => self.flash.iter_mut().for_each(|b| *b = 0xff),
                 SPI_WREN => self.wel = true,
                 SPI_EN4B => {
@@ -2582,6 +2797,134 @@ mod tests {
             "a completed read must clear the sidecar, or the next read looks half-done"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    // The point of waiting: a probe that flickers must not cost the read. Contact
+    // drops mid-dump and returns a few polls later, and the read simply carries on
+    // and produces the whole chip. Before this, three attempts ~60 ms apart expired
+    // during the first flicker and threw the dump away.
+    //
+    // This is the difference between "reseat and re-run, forever" and "start it and
+    // walk away".
+    #[test]
+    fn read_waits_out_a_flickering_probe_and_still_gets_the_whole_chip() {
+        const SIZE: usize = 16 * 1024 * 1024; // ef4018 = W25Q128
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("flicker-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        // Contact drops inside chunk 2 and comes back after 3 polls — no reseat, no
+        // second invocation, no human.
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).recovering_after(150_000, 3);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        // This test is ABOUT waiting, so it needs a budget the recovery fits inside
+        // (3 polls at CONTACT_POLL_INTERVAL ~= 150 ms). Everything else in this
+        // module runs on the near-zero test default.
+        backend.set_chunk_patience(Duration::from_secs(5));
+        let r = backend.read_chip(&path).unwrap();
+
+        assert!(r.success, "a flicker must not fail the read");
+        assert!(
+            std::fs::read(&path).unwrap() == content,
+            "waiting out a flicker must still produce the chip byte for byte"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Progress must survive a Ctrl-C, not just a clean failure. A 32 MB read on a bad
+    // probe takes ~9 minutes and looks identical to a hang, so users kill it -- and a
+    // kill that discarded the captured chunks would defeat the point of resuming.
+    // There is no error path to hang the save off, so each chunk must persist as it
+    // lands. The progress hook fires in exactly the gap a Ctrl-C would land in, so it
+    // is the honest place to look at the disk mid-read.
+    #[test]
+    fn read_persists_each_chunk_as_it_lands_not_only_when_it_fails() {
+        use std::sync::{Arc, Mutex};
+        const SIZE: usize = 16 * 1024 * 1024; // ef4018 = W25Q128
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("killed-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+
+        /// What a Ctrl-C landing in the first gap between chunks would have left behind.
+        struct Salvage {
+            sidecar: bool,
+            head: Vec<u8>,
+        }
+        let snapshot: Arc<Mutex<Option<Salvage>>> = Arc::new(Mutex::new(None));
+        let probe = Arc::clone(&snapshot);
+        let p = path.clone();
+        backend.set_progress_callback(Box::new(move |_done, _total| {
+            let mut slot = probe.lock().unwrap();
+            if slot.is_some() {
+                return; // only the first pause matters
+            }
+            *slot = Some(Salvage {
+                sidecar: super::super::resume::resume_path(&p).exists(),
+                head: std::fs::read(&p)
+                    .map(|b| b[..65536].to_vec())
+                    .unwrap_or_default(),
+            });
+        }));
+        backend.read_chip(&path).unwrap();
+
+        let salvage = snapshot.lock().unwrap().take().expect("progress fired");
+        assert!(
+            salvage.sidecar,
+            "the sidecar must exist after the FIRST chunk, or a Ctrl-C here loses everything"
+        );
+        assert!(
+            salvage.head == content[..65536],
+            "chunk 0 must be on disk the moment it is counted as done, not buffered until the end"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The dropout a liveness check cannot see: data corrupts mid-chunk but the chip
+    // keeps answering RDID, so the id is healthy before AND after and the chunk looks
+    // fine. Only reading it twice and comparing catches this.
+    //
+    // Mutation-checked: switching read_chip_resumable to ChunkTrust::LivenessOnly
+    // makes this test pass a corrupt dump straight through to disk, which is exactly
+    // the fake-backup failure the project already ate once.
+    #[test]
+    fn read_rejects_a_chunk_that_reads_differently_twice() {
+        const SIZE: usize = 16 * 1024 * 1024; // ef4018 = W25Q128
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("corrupt-chunk-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).corrupting_from(150_000);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        let err = backend.read_chip(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("two reads of this chunk disagreed"),
+            "a chunk that will not reproduce must be named as such, got: {err}"
+        );
+        // The clean chunks before the corruption still bank, as always.
+        let partial = std::fs::read(&path).unwrap();
+        assert!(
+            partial[..128 * 1024] == content[..128 * 1024],
+            "chunks read before the corruption are still real data and must persist"
+        );
+        // And the corrupt region must NOT be marked done, or a re-run would skip it
+        // and the garbage would end up in a backup the user trusts.
+        let state = super::super::resume::ResumeState::load(&path, "ef4018", SIZE as u64, 65536).0;
+        assert!(
+            !state.done[2],
+            "the chunk that failed to reproduce must stay unread, not bank as done"
+        );
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
     }
 
     // A sidecar from a DIFFERENT chip must never be honoured: resuming across chips

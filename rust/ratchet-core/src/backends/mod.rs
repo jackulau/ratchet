@@ -46,6 +46,10 @@ pub trait Backend: Send {
     /// default ignores it, so mocks and adapters are unaffected; the live
     /// backends report per-chunk progress through it.
     fn set_progress_callback(&mut self, _cb: ProgressFn) {}
+    /// How long a long read waits for a flickering probe to come back before it
+    /// gives up on a chunk. The default ignores it (mocks have no contact to
+    /// lose); the live backends honour it. See `ch341a::CHUNK_PATIENCE`.
+    fn set_chunk_patience(&mut self, _d: std::time::Duration) {}
     fn detect_programmer(&mut self) -> Result<ProgrammerInfo>;
     fn open(&mut self) -> Result<()>;
     fn close(&mut self) -> Result<()>;
