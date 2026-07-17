@@ -51,9 +51,46 @@ pub fn create_private_backup_path(prefix: &str) -> io::Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = dir.join(format!("{prefix}-{ts}.bin"));
+    create_private_backup_file(dir.join(format!("{prefix}-{ts}.bin")), true)
+}
+
+/// A backup path that is the SAME for the same chip on every run, so an
+/// interrupted backup read resumes instead of restarting.
+///
+/// The timestamped [`create_private_backup_path`] is right for a keepsake dump but
+/// wrong for write's mandatory pre-write backup: a new name every run orphans the
+/// resume sidecar, so on a marginal probe each attempt re-reads the whole chip from
+/// zero and can never get past its own backup. It also made the read path's "Ctrl-C
+/// is safe and re-running resumes from here" a false promise inside a write.
+///
+/// Keying on chip identity (not on time) is what makes reuse safe: the sidecar is
+/// only honoured for a dump of the same jedec id and size.
+///
+/// Resuming across a partially-completed write is sound. The baseline decides only
+/// whether a block is skipped, and a block is skipped only when baseline == image.
+/// Any block read before an earlier write ran holds old content, which differs from
+/// the image, so it is re-erased and re-programmed rather than skipped. A stale
+/// baseline can cost time; it cannot skip a block that still needs writing.
+pub fn stable_backup_path(prefix: &str, jedec_id: &str, size_bytes: u64) -> io::Result<PathBuf> {
+    let dir = backup_dir()?;
+    let safe: String = jedec_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    create_private_backup_file(dir.join(format!("{prefix}-{safe}-{size_bytes}.bin")), false)
+}
+
+/// Open (or create) `path` with owner-only 0600 permissions. `exclusive` fails if it
+/// already exists; otherwise an existing file is left intact so its resume sidecar
+/// still describes it.
+fn create_private_backup_file(path: PathBuf, exclusive: bool) -> io::Result<PathBuf> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
+    opts.write(true);
+    if exclusive {
+        opts.create_new(true);
+    } else {
+        opts.create(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

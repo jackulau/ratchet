@@ -1204,10 +1204,19 @@ impl<B: UsbBus> CH341ABackend<B> {
         //    The backup bytes are kept: they are a liveness-checked read of what the chip
         //    currently holds, which is exactly the baseline needed to decide which blocks
         //    already match the image. Reusing it makes the skip check free.
+        //    The path is keyed on the CHIP, not on the clock, so an interrupted backup
+        //    resumes on the next run. With a timestamped name every attempt started the
+        //    32 MB read from zero and orphaned the sidecar, so a probe that could not hold
+        //    the whole read could never get past this step however many times it was run --
+        //    and the read path's "re-running resumes from here" was a lie inside a write.
         let (backup_path, baseline) = if opts.skip_backup {
             (None, None)
         } else {
-            let path = super::backup::create_private_backup_path("ratchet-backup")?;
+            let path = super::backup::stable_backup_path(
+                "ratchet-backup",
+                &chip.jedec_id,
+                chip.size_bytes,
+            )?;
             let (_, buf) = self.read_chip_to_file_buf(&path)?;
             (Some(path.display().to_string()), Some(buf))
         };
@@ -3283,6 +3292,67 @@ mod tests {
             firmware,
             "waiting for the probe to arrive must still program the whole image"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // write's mandatory pre-write backup used a TIMESTAMPED path, so every attempt began
+    // the 32 MB read at zero and orphaned the previous run's resume sidecar. On a probe
+    // that cannot hold the whole read that makes the write unreachable no matter how many
+    // times it is run -- a cliff, not a slope. It also made the read path's "Ctrl-C is safe
+    // and re-running resumes from here", printed from inside a write, a false promise. The
+    // path must be a function of the CHIP, not of the clock.
+    #[test]
+    fn writes_backup_path_is_stable_across_runs_so_an_interrupted_backup_resumes() {
+        let _guard = crate::backends::test_env::lock();
+        let sandbox = std::env::temp_dir().join(format!(
+            "ratchet-stable-backup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let prev = std::env::var_os("RATCHET_BACKUP_DIR");
+        std::env::set_var("RATCHET_BACKUP_DIR", &sandbox);
+
+        const SIZE: usize = 128 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("stable-backup-write.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let mut backend = CH341ABackend::with_bus(LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]));
+            let w = backend
+                .write_chip(
+                    &path,
+                    WriteOpts {
+                        skip_backup: false, // the backup read IS the baseline
+                        skip_verify: true,
+                    },
+                )
+                .unwrap();
+            seen.push(
+                w.backup_path
+                    .expect("a write must report where it backed up to"),
+            );
+        }
+
+        assert_eq!(
+            seen[0], seen[1],
+            "two runs against the same chip must reuse ONE backup path, else the resume \
+             sidecar is orphaned and the read restarts from zero every attempt"
+        );
+        assert!(
+            seen[0].contains("ef4018"),
+            "the path must be keyed on chip IDENTITY (not the clock) so a sidecar is only \
+             ever reused for the same chip, got: {}",
+            seen[0]
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("RATCHET_BACKUP_DIR", v),
+            None => std::env::remove_var("RATCHET_BACKUP_DIR"),
+        }
+        std::fs::remove_dir_all(&sandbox).ok();
         std::fs::remove_file(&path).ok();
     }
 
