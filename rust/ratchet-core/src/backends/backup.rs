@@ -8,7 +8,7 @@
 // persistent per-user data dir with owner-only permissions.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Resolve (and create, with owner-only 0700 permissions) the persistent
@@ -78,6 +78,36 @@ pub fn stable_backup_path(prefix: &str, jedec_id: &str, size_bytes: u64) -> io::
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
     create_private_backup_file(dir.join(format!("{prefix}-{safe}-{size_bytes}.bin")), false)
+}
+
+/// The complete backup already on disk for this chip, if there is one.
+///
+/// A write's backup must capture the chip as it was BEFORE the write. After a run that
+/// programmed even one block, that state is no longer readable from the chip: a re-read
+/// returns a mongrel of old and new, and writing THAT over the backup destroys the only
+/// copy of the original. It destroys it silently, too, since the result is still exactly
+/// chip-sized and looks like a valid dump.
+///
+/// This is a hazard [`stable_backup_path`] created. The timestamped path it replaced could
+/// not clobber anything (every run made a new file); it merely orphaned the resume sidecar.
+/// Keying on chip identity fixed the resume and handed the same name to every run, so the
+/// guard has to live here: an existing complete backup is the original, and it wins.
+///
+/// Keeping it also skips a 32 MB read on every re-run, which is the difference between a
+/// write that is reachable on a marginal probe and one that is not. Nothing is lost by not
+/// re-reading: the backup is no longer doubled up as the write's baseline (the write asks
+/// the chip block by block instead), so its only job is to hold the original, and the copy
+/// already on disk does that better than any later read can.
+///
+/// "Complete" is: right size, and no resume sidecar. The sidecar exists only while a read
+/// is unfinished, and a finished read clears it.
+pub fn complete_backup_exists(path: &Path, size_bytes: u64) -> bool {
+    if super::resume::resume_path(path).exists() {
+        return false; // an interrupted read: let it resume rather than trusting a partial
+    }
+    std::fs::metadata(path)
+        .map(|m| m.len() == size_bytes)
+        .unwrap_or(false)
 }
 
 /// Open (or create) `path` with owner-only 0600 permissions. `exclusive` fails if it
