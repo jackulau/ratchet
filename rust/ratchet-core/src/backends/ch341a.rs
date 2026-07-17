@@ -1248,9 +1248,11 @@ impl<B: UsbBus> CH341ABackend<B> {
         //    A user reflashing a motherboard should never lose their only copy of the old
         //    BIOS — the backup goes to the persistent, owner-only per-user dir (temp_dir
         //    is wiped on reboot and world-readable; dumps can carry NVRAM secrets).
-        //    The backup bytes are kept: they are a liveness-checked read of what the chip
-        //    currently holds, which is exactly the baseline needed to decide which blocks
-        //    already match the image. Reusing it makes the skip check free.
+        //    The backup is ONLY a backup. It used to double as the write's baseline, which
+        //    conflated two opposites: a backup must hold the chip as it was ORIGINALLY,
+        //    a baseline must describe it as it is RIGHT NOW. Those agree only until the
+        //    first block is programmed, and after that one read cannot serve both. The
+        //    write asks the chip block by block instead (see below).
         //    The path is keyed on the CHIP, not on the clock, so an interrupted backup
         //    resumes on the next run. With a timestamped name every attempt started the
         //    32 MB read from zero and orphaned the sidecar, so a probe that could not hold
@@ -1264,8 +1266,38 @@ impl<B: UsbBus> CH341ABackend<B> {
                 &chip.jedec_id,
                 chip.size_bytes,
             )?;
-            let (_, buf) = self.read_chip_to_file_buf(&path)?;
-            (Some(path.display().to_string()), Some(buf))
+            // A complete backup already on disk WINS over anything the chip can tell us
+            // now, and this is the load-bearing line of the whole file. Once a previous run
+            // has programmed a block, the original is no longer readable: a re-read returns
+            // a mongrel of old and new, and writing THAT over the backup destroys the only
+            // copy of the old BIOS. Silently, too, since the result is still exactly
+            // chip-sized and looks like a valid dump. Re-reading here is precisely the
+            // failure this module exists to prevent.
+            //
+            // It also skips a 32 MB read per re-run, which decides whether a write is
+            // reachable at all on a probe that cannot hold one.
+            if super::backup::complete_backup_exists(&path, chip.size_bytes) {
+                eprintln!(
+                    "using the backup already at {} — it holds the chip as it was BEFORE \
+                     any write. Re-reading now would capture a half-written chip over the \
+                     top of the only copy of the original.",
+                    path.display()
+                );
+                // No baseline from it, deliberately. Those bytes are the chip as it was
+                // before an earlier run programmed anything, so as a baseline they are
+                // STALE: they would fail to skip the very blocks that run already wrote,
+                // which is the resume this is supposed to provide. The loop asks the chip
+                // per block instead.
+                (Some(path.display().to_string()), None)
+            } else {
+                // A backup we just read IS a valid baseline: nothing has been programmed
+                // yet, so it describes the chip as it is right now, and it cost a read that
+                // had to happen regardless. That is why the skip is free on a first run,
+                // and it is worth keeping: pre-reading each block instead would pay for a
+                // read that the block's own verify read-back already covers.
+                let (_, buf) = self.read_chip_to_file_buf(&path)?;
+                (Some(path.display().to_string()), Some(buf))
+            }
         };
 
         // 2. Walk the image one 64 KB block at a time, and for each block: skip it if the
@@ -1291,14 +1323,37 @@ impl<B: UsbBus> CH341ABackend<B> {
             let block_len = BLOCK_64K.min(end - addr) as usize;
             let target = &firmware[lo..lo + block_len];
 
-            // The backup read is the baseline. With skip_backup there is none, and this
-            // does NOT go read the chip to synthesise one: the caller opted out of a
-            // whole-chip read, so honour that and just write every block. The cost of
-            // that choice is losing the skip (and with it resume), not correctness.
-            let already_correct = baseline
-                .as_ref()
-                .filter(|b| b.len() >= lo + block_len)
-                .is_some_and(|b| &b[lo..lo + block_len] == target);
+            // Two ways to know whether this block already holds the target, and which is
+            // right turns on whether we have a FRESH read of the chip.
+            //
+            // A backup read THIS run is fresh (nothing is programmed yet) and free (it had
+            // to happen anyway), so it is the baseline. That is why the skip costs nothing
+            // on a first run, and it is worth keeping: pre-reading each block instead would
+            // pay for a read that the block's own verify read-back already covers.
+            //
+            // Any other run has no such read. Re-reading the chip would overwrite the only
+            // copy of the original, and the backup already on disk is by then STALE: it
+            // predates whatever an earlier run programmed, so it would fail to skip exactly
+            // the blocks that run wrote. That is the conflation this used to carry -- a
+            // BACKUP must hold the chip as it was ORIGINALLY, a BASELINE must describe it
+            // as it is RIGHT NOW, and those agree only until the first block is programmed.
+            //
+            // So with no fresh baseline, ask the chip, one block at a time. It costs a read
+            // per block and buys the resume: the chip itself becomes the progress record,
+            // which is what makes an interrupted write continuable, and what --skip-backup
+            // used to forfeit entirely.
+            //
+            // Either way a bad read can only cost work, never correctness: garbage never
+            // matches 64 KB of the target byte-for-byte, so it means the block is rewritten
+            // (which is idempotent), never wrongly skipped. Matching is self-validating.
+            let already_correct = match baseline.as_ref() {
+                Some(b) if b.len() >= lo + block_len => &b[lo..lo + block_len] == target,
+                Some(_) => false,
+                None => self
+                    .read_range_quiet(addr, block_len, ChunkTrust::LivenessOnly)
+                    .map(|b| b == target)
+                    .unwrap_or(false),
+            };
 
             if already_correct {
                 blocks_skipped += 1;
@@ -2036,8 +2091,11 @@ mod tests {
         std::fs::write(&path, vec![0xa5u8; 8192]).unwrap();
         let mut bus = MockBus::new();
         bus.queue_read(chip_rx(vec![0x00, 0x1c, 0x20, 0x10])); // RDID → EN25P05 (64 KB, sectorSize 64 KB)
-        for _ in 0..600 {
-            bus.queue_read(chip_rx(vec![0u8; 40])); // WP guard, WREN/erase/poll, program chunks
+                                                               // WP guard, the pre-write read that decides the skip, WREN/erase/poll, program
+                                                               // chunks. The pre-write read is why this queue is deeper than the traffic looks:
+                                                               // with no backup read to act as a baseline, skip_backup asks the chip per block.
+        for _ in 0..3000 {
+            bus.queue_read(chip_rx(vec![0u8; 40]));
         }
         let mut backend = CH341ABackend::with_bus(bus);
         backend
@@ -2075,7 +2133,10 @@ mod tests {
         std::fs::write(&path, vec![0xa5u8; len]).unwrap();
         let mut bus = MockBus::new();
         bus.queue_read(chip_rx(vec![0x00, 0xef, 0x40, 0x18])); // RDID → W25Q128, 16 MB, 3-byte addr
-        for _ in 0..6000 {
+                                                               // Deep queue: with no backup read to serve as a baseline, the write now reads each
+                                                               // block before deciding to write it, so skip_backup costs real traffic here. That
+                                                               // read is what makes an interrupted skip_backup write resumable.
+        for _ in 0..30000 {
             bus.queue_read(chip_rx(vec![0u8; 40]));
         }
         let mut backend = CH341ABackend::with_bus(bus);
@@ -3617,6 +3678,111 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // The hazard stable_backup_path created, and the reason it is worth guarding rather
+    // than reverting.
+    //
+    // A write's backup must capture the chip as it was BEFORE the write. After a run has
+    // programmed even one block that state is gone from the chip, so a re-read returns a
+    // mix of old and new. Handing every run the SAME filename means run 2 writes that mix
+    // over run 1's good backup and the only copy of the old BIOS is gone -- silently, since
+    // the result is still exactly chip-sized and looks like a valid dump. That is the
+    // failure mode this whole module exists to prevent, reintroduced by the fix for the
+    // resume cliff. The timestamped path could not do this; it just orphaned the sidecar.
+    #[test]
+    fn a_completed_backup_is_never_overwritten_by_a_later_run_reading_a_half_written_chip() {
+        let _guard = crate::backends::test_env::lock();
+        let sandbox = std::env::temp_dir().join(format!(
+            "ratchet-backup-clobber-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let prev = std::env::var_os("RATCHET_BACKUP_DIR");
+        std::env::set_var("RATCHET_BACKUP_DIR", &sandbox);
+
+        const SIZE: usize = 128 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("backup-clobber.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        // The chip as it was before anything touched it. This is what a backup MUST hold.
+        let original: Vec<u8> = (0..SIZE).map(|i| (i % 199) as u8 | 0x80).collect();
+
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]);
+        bus.flash = original.clone();
+        let mut backend = CH341ABackend::with_bus(bus);
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: false,
+                    skip_verify: true,
+                },
+            )
+            .unwrap();
+        let backup_file = w.backup_path.expect("a write must report its backup path");
+        // Compare the fake's region only: ef4018 sizes to 16 MB from the chip DB, so the
+        // backup is that long and everything past the 128 KB fake is 0xff filler. The
+        // interesting bytes are the ones the chip actually has.
+        assert_eq!(
+            std::fs::read(&backup_file).unwrap()[..SIZE],
+            original[..],
+            "the first run's backup must hold the chip as it was"
+        );
+
+        // Run 2, as it happens on the bench: the chip now holds what run 1 programmed, so
+        // re-reading it can only produce a half-written mongrel, never the original.
+        let mut bus2 = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]);
+        bus2.flash = firmware.clone();
+        let mut backend2 = CH341ABackend::with_bus(bus2);
+        backend2
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: false,
+                    skip_verify: true,
+                },
+            )
+            .unwrap();
+
+        // The other half of the property, and the one that makes reusing the backup safe
+        // rather than merely non-destructive. Reusing it means there is no fresh baseline,
+        // so the write must ask the CHIP per block -- and the chip already holds the image,
+        // so nothing may be erased. Handing the stale backup in as a baseline instead would
+        // re-erase all sixteen blocks: it describes the chip before run 1, so every block
+        // would look like it still needs writing. That is the resume, and it is exactly what
+        // gets lost if a backup is treated as a baseline after any write has happened.
+        let erased2: Vec<usize> = backend2
+            .bus
+            .as_ref()
+            .unwrap()
+            .ops
+            .iter()
+            .filter(|(op, _)| *op == SPI_BLOCK_ERASE)
+            .map(|(_, a)| *a)
+            .collect();
+        assert!(
+            erased2.is_empty(),
+            "the chip already holds the image, so a re-run must skip every block and erase \
+             nothing (erased: {erased2:x?})"
+        );
+
+        assert_eq!(
+            std::fs::read(&backup_file).unwrap()[..SIZE],
+            original[..],
+            "re-running a write must NOT overwrite a complete backup: the chip no longer \
+             holds the original, so a re-read destroys the only copy of the old BIOS and \
+             leaves a chip-sized file that still looks like a valid dump"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&sandbox).ok();
+        match prev {
+            Some(v) => std::env::set_var("RATCHET_BACKUP_DIR", v),
+            None => std::env::remove_var("RATCHET_BACKUP_DIR"),
+        }
+    }
+
     // write's mandatory pre-write backup used a TIMESTAMPED path, so every attempt began
     // the 32 MB read at zero and orphaned the previous run's resume sidecar. On a probe
     // that cannot hold the whole read that makes the write unreachable no matter how many
@@ -4089,6 +4255,21 @@ mod tests {
     // chip itself is the progress record and there is no sidecar state to go stale.
     #[test]
     fn write_chip_skips_blocks_that_already_hold_the_target_image() {
+        // Sandbox the backup dir. Without this the test reads and writes the REAL
+        // ~/.local/share/ratchet/backups, where it collides with the other write tests and
+        // with whatever the user actually has on disk: it was seen resuming a half-finished
+        // 16 MB dump another test had left behind ("resuming read of ef4018: 41.4% already
+        // captured"). A test must never touch a user's only copy of their old BIOS.
+        let _guard = crate::backends::test_env::lock();
+        let sandbox = std::env::temp_dir().join(format!(
+            "ratchet-skip-blocks-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let prev = std::env::var_os("RATCHET_BACKUP_DIR");
+        std::env::set_var("RATCHET_BACKUP_DIR", &sandbox);
+
         const SIZE: usize = 1024 * 1024; // 16 blocks
         let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
         let path = test_tmp("resume-skip.bin");
@@ -4141,6 +4322,11 @@ mod tests {
             std::fs::remove_file(bp).ok();
         }
         std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&sandbox).ok();
+        match prev {
+            Some(v) => std::env::set_var("RATCHET_BACKUP_DIR", v),
+            None => std::env::remove_var("RATCHET_BACKUP_DIR"),
+        }
     }
 
     #[test]
