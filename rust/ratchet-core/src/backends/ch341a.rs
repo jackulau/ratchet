@@ -127,6 +127,20 @@ pub const CHUNK_PATIENCE: Duration = Duration::from_secs(120);
 /// window (observed windows are ~1 s), long enough not to spin the USB bus.
 pub const CONTACT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// True if a JEDEC id triple is a dead bus rather than a chip.
+///
+/// `000000` is MISO stuck low. `ffffff` is MISO floating high, which is the more
+/// dangerous of the two: it is byte-for-byte identical to erased flash, and it is
+/// what a lifted probe reads on this part. No real part answers either.
+///
+/// Every liveness decision must reject BOTH. Testing only for `000000` looks fine
+/// while an id is anchored (a floating bus fails the equality check instead), but
+/// before identify anchors one there is nothing else standing in the way, and a
+/// floating bus reads as a perfectly healthy chip.
+fn is_dead_bus(id: [u8; 3]) -> bool {
+    id == [0x00, 0x00, 0x00] || id == [0xff, 0xff, 0xff]
+}
+
 /// Patience a freshly built backend starts with.
 ///
 /// Unit tests get a near-zero budget. A fake bus has no physical probe that might
@@ -543,7 +557,7 @@ impl<B: UsbBus> CH341ABackend<B> {
         match self.rdid() {
             Ok(id) => {
                 let live = [id.manufacturer, id.memory_type, id.capacity];
-                if expect.is_none_or(|e| e == live) && live != [0, 0, 0] {
+                if expect.is_none_or(|e| e == live) && !is_dead_bus(live) {
                     Ok(data) // chip still answering: the chunk is real
                 } else {
                     Err(format!(
@@ -562,12 +576,16 @@ impl<B: UsbBus> CH341ABackend<B> {
     }
 
     /// True if the chip answers RDID with the id identify saw.
+    ///
+    /// `jedec_expect` is None until identify anchors an id, so a caller that waits
+    /// for contact BEFORE identify (`identify_chip_patient`) has only `is_dead_bus`
+    /// between it and a floating bus.
     fn chip_answers(&mut self) -> bool {
         let expect = self.jedec_expect;
         match self.rdid() {
             Ok(id) => {
                 let live = [id.manufacturer, id.memory_type, id.capacity];
-                live != [0, 0, 0] && expect.is_none_or(|e| e == live)
+                !is_dead_bus(live) && expect.is_none_or(|e| e == live)
             }
             Err(_) => false,
         }
@@ -606,6 +624,47 @@ impl<B: UsbBus> CH341ABackend<B> {
                 );
                 announced = true;
             }
+            std::thread::sleep(CONTACT_POLL_INTERVAL);
+        }
+    }
+
+    /// Identify the chip, waiting out a dropout the same way chunks do.
+    ///
+    /// Without this the wait-for-contact design is defeated at step one. A backup
+    /// rides contact windows for 32 MB, but it still has to be STARTED, and plain
+    /// identify fails closed in ~11 ms against a probe that was going to come back
+    /// a second later. That forces the user to hit enter during a window they cannot
+    /// see (the pads on a WSON part are underneath the package), which is the one
+    /// thing this whole design exists to avoid. "Start it and walk away" only works
+    /// if the start waits too.
+    ///
+    /// Waiting here is as free as it is anywhere else: RDID against a silent chip is
+    /// a successful USB transfer reporting `000000`, not an error path.
+    fn identify_chip_patient(&mut self) -> Result<ChipInfo> {
+        let deadline = Instant::now() + self.chunk_patience;
+        let mut announced = false;
+        loop {
+            if let Some(chip) = self.identify_chip()? {
+                if announced {
+                    eprintln!("chip is answering — starting the read");
+                }
+                return Ok(chip);
+            }
+            if Instant::now() >= deadline {
+                return Err(BackendError::ChipNotDetected);
+            }
+            if !announced {
+                eprintln!(
+                    "no chip answering yet — waiting up to {}s for the probe to make \
+                     contact. Nothing has been read; Ctrl-C is safe.",
+                    self.chunk_patience.as_secs()
+                );
+                announced = true;
+            }
+            // Pace every attempt. Deliberately not built on `wait_for_contact`: that
+            // returns the instant RDID answers, so a bus flickering between a valid
+            // id and a dead one would spin here at full USB rate for the whole budget
+            // (the same hot-spin `read_chunk_patient` had to be fixed for).
             std::thread::sleep(CONTACT_POLL_INTERVAL);
         }
     }
@@ -862,7 +921,7 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// costs no extra probe time.
     fn read_chip_to_file_buf(&mut self, output_path: &Path) -> Result<(ReadResult, Vec<u8>)> {
         let start = Instant::now();
-        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        let chip = self.identify_chip_patient()?;
         let size = chip.size_bytes as usize;
         if size == 0 {
             return Err(BackendError::ChipNotDetected);
@@ -2486,6 +2545,11 @@ mod tests {
         /// is healthy before and after — so only comparing two reads catches it.
         corrupt_from: Option<usize>,
         read_pass: u8,
+        /// Model a probe whose MISO FLOATS instead of being pulled low: every read
+        /// answers 0xff. Distinct from `contact_lost` because it is the dangerous
+        /// one -- 0xff is indistinguishable from erased flash by inspection, so only
+        /// asking whether the id is a dead-bus value catches it.
+        floating: std::cell::Cell<bool>,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -2505,7 +2569,22 @@ mod tests {
                 rdid_polls_while_dead: 0,
                 corrupt_from: None,
                 read_pass: 0,
+                floating: std::cell::Cell::new(false),
             }
+        }
+        /// Model the probe not touching the chip AT ALL when the read starts, then
+        /// making contact after `polls` id requests. This is the user's actual
+        /// situation: they run the command, then seat the probe.
+        fn absent_until_poll(mut self, polls: u32) -> Self {
+            self.contact_lost.set(true);
+            self.dead_from.set(Some(0));
+            self.recover_after_polls = Some(polls);
+            self
+        }
+        /// Model a lifted probe whose MISO floats high: everything reads 0xff.
+        fn floating_high(self) -> Self {
+            self.floating.set(true);
+            self
         }
         /// Lose contact at `offset` and never regain it, as a probe knocked off the
         /// chip does.
@@ -2554,6 +2633,10 @@ mod tests {
         fn response_byte(&self, pos: usize) -> u8 {
             if self.frame.is_empty() {
                 return 0;
+            }
+            // A floating bus answers everything with 0xff, id requests included.
+            if self.floating.get() {
+                return 0xff;
             }
             match self.frame[0] {
                 // Once contact is gone the chip cannot answer an id request either.
@@ -2856,6 +2939,76 @@ mod tests {
         assert!(
             std::fs::read(&path).unwrap() == content,
             "waiting out a flicker must still produce the chip byte for byte"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The read waits for contact per CHUNK, but it still had to be STARTED, and
+    // identify failed closed in ~11 ms if the probe was not already touching. So the
+    // user had to hit enter inside a contact window they cannot see (WSON pads are
+    // under the package). That defeated the whole point: the command must be startable
+    // first and seated second.
+    #[test]
+    fn read_waits_for_contact_before_it_gives_up_on_identifying_the_chip() {
+        const SIZE: usize = 16 * 1024 * 1024; // ef4018 = W25Q128
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("absent-at-start-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        // Nothing on the bus when the read starts; the probe lands 3 polls later.
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).absent_until_poll(3);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let r = backend
+            .read_chip(&path)
+            .expect("a probe seated shortly after the command starts must not fail the read");
+        assert!(r.success);
+        assert!(
+            std::fs::read(&path).unwrap() == content,
+            "waiting for the probe to arrive must still produce the chip byte for byte"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ffffff is the dangerous dead-bus value: MISO floating high is byte-for-byte
+    // identical to erased flash, so nothing about the DATA can catch it. Before
+    // is_dead_bus, chip_answers only rejected 000000 -- fine once identify anchors an
+    // id (a float fails the equality check), but identify_chip_patient waits BEFORE an
+    // id exists, where expect is None and every guard is is_none_or(true). A floating
+    // probe would have read as a healthy chip and handed back 16 MB of 0xff as a
+    // "successful" backup.
+    #[test]
+    fn a_floating_bus_is_never_mistaken_for_a_chip_that_is_answering() {
+        const SIZE: usize = 16 * 1024 * 1024;
+        let path = test_tmp("floating-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).floating_high();
+        let mut backend = CH341ABackend::with_bus(bus);
+        // No id is anchored yet, so this is exactly the unguarded window.
+        assert!(
+            !backend.chip_answers(),
+            "ffffff is a floating bus, not a chip answering"
+        );
+        assert!(
+            backend.identify_chip().unwrap().is_none(),
+            "ffffff must not identify as a part"
+        );
+        let err = backend
+            .read_chip(&path)
+            .expect_err("a floating bus must never produce a backup");
+        assert!(
+            matches!(err, BackendError::ChipNotDetected),
+            "expected ChipNotDetected, got {err:?}"
+        );
+        assert!(
+            !path.exists(),
+            "a floating bus must not leave a file on disk: 0xff is indistinguishable \
+             from erased flash and would pass every blank check as a real backup"
         );
         std::fs::remove_file(&path).ok();
     }
