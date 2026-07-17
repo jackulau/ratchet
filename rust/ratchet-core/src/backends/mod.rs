@@ -9,6 +9,7 @@ pub mod errors;
 pub mod factory;
 pub mod libusb_bus;
 pub mod mock;
+pub mod resume;
 
 pub use factory::{open_default, open_raw_bus, BackendKind, OpenResult, RawBus, RawBusError};
 
