@@ -7,7 +7,7 @@ use ratchet_core::agent::envelope::{AgentEnvelope, AgentError};
 use ratchet_core::backends::{open_default, open_raw_bus, Backend, BackendKind, RawBus};
 use ratchet_core::diagnostics::spi_integrity::{
     analyze_spi_readings, classify_dead_bus, dead_bus_hint, format_score_bar, SpiPattern,
-    SpiReading,
+    SpiReading, USB_ERROR_READING,
 };
 use serde_json::json;
 use std::sync::OnceLock;
@@ -74,6 +74,12 @@ enum Command {
         skip_backup: bool,
         #[arg(long)]
         skip_verify: bool,
+        /// Seconds to wait for a flickering probe, both when finding the chip at
+        /// startup and per block during the write. Raise it to start the command
+        /// first and seat the probe second: waiting costs only time, and a block
+        /// that has been programmed stays programmed.
+        #[arg(long, default_value = "120")]
+        patience: u64,
     },
     /// Erase the entire chip.
     Erase {
@@ -85,6 +91,11 @@ enum Command {
         file: String,
         #[arg(long)]
         json: bool,
+        /// Seconds to wait for a flickering probe. Same reason as read: a verify
+        /// that gives up because the probe was mid-flicker has told you nothing
+        /// about the chip.
+        #[arg(long, default_value = "120")]
+        patience: u64,
     },
     /// Analyze a BIOS image (UEFI volumes, vendor, regions, health).
     Analyze {
@@ -631,9 +642,14 @@ fn main() -> anyhow::Result<()> {
             json,
             skip_backup,
             skip_verify,
-        }) => cmd_write(&input, json, skip_backup, skip_verify)?,
+            patience,
+        }) => cmd_write(&input, json, skip_backup, skip_verify, patience)?,
         Some(Command::Erase { json }) => cmd_erase(json)?,
-        Some(Command::Verify { file, json }) => cmd_verify(&file, json)?,
+        Some(Command::Verify {
+            file,
+            json,
+            patience,
+        }) => cmd_verify(&file, json, patience)?,
         Some(Command::Analyze { file, json }) => cmd_analyze(&file, json)?,
         Some(Command::Diff { a, b, json }) => cmd_diff(&a, &b, json)?,
         Some(Command::Checksum { file, json }) => cmd_checksum(&file, json)?,
@@ -1254,10 +1270,17 @@ fn cmd_read(output: &str, json: bool, patience: u64, chunk_kb: usize) -> anyhow:
     })
 }
 
-fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> anyhow::Result<()> {
+fn cmd_write(
+    input: &str,
+    json: bool,
+    skip_backup: bool,
+    skip_verify: bool,
+    patience: u64,
+) -> anyhow::Result<()> {
     use ratchet_core::backends::WriteOpts;
     let (mut m, kind) = open_dyn_checked("write")?;
     with_progress(&mut *m, "write", json);
+    m.set_chunk_patience(std::time::Duration::from_secs(patience));
     let r = m.write_chip(
         std::path::Path::new(input),
         WriteOpts {
@@ -1329,9 +1352,10 @@ fn check_exit_code(ok: bool) -> i32 {
     }
 }
 
-fn cmd_verify(file: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_verify(file: &str, json: bool, patience: u64) -> anyhow::Result<()> {
     let (mut m, kind) = open_dyn_checked("verify")?;
     with_progress(&mut *m, "verify", json);
+    m.set_chunk_patience(std::time::Duration::from_secs(patience));
     let r = m.verify_chip(std::path::Path::new(file))?;
     let env = AgentEnvelope::ok("verify", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || println!("matches={}", r.matches))?;
@@ -1861,9 +1885,28 @@ fn cmd_monitor(interval_ms: u32, samples: u32, json: bool) -> anyhow::Result<()>
     let samples = samples.max(1);
     let start = std::time::Instant::now();
     let mut readings = Vec::with_capacity(samples as usize);
+    let mut usb_errors = 0u32;
     for i in 0..samples {
-        let id = m.read_jedec_id()?.to_hex();
-        if !json {
+        // A transfer error must not end the run. This is the tool you reach for when
+        // the connection is bad, so dying on a bad connection defeats it: one glitch
+        // at read 8 of 500 threw away the other 492 and told you nothing. The bus
+        // layer clears the endpoint stall underneath, so the next sample can succeed
+        // and the run reports what actually happened over its whole length.
+        let id = match m.read_jedec_id() {
+            Ok(id) => id.to_hex(),
+            Err(e) => {
+                usb_errors += 1;
+                if !json {
+                    eprintln!("read {}/{samples}: USB ERROR ({e}) — continuing", i + 1);
+                }
+                // Distinct from 000000: that means "bus fine, chip silent" (a contact
+                // problem). This means the programmer link itself failed, which is a
+                // different fault with a different fix, and scoring them as the same
+                // reading would blame the probe for the cable.
+                USB_ERROR_READING.to_string()
+            }
+        };
+        if !json && id != USB_ERROR_READING {
             eprintln!("read {}/{samples}: jedec={id}", i + 1);
         }
         readings.push(SpiReading {
@@ -1873,6 +1916,14 @@ fn cmd_monitor(interval_ms: u32, samples: u32, json: bool) -> anyhow::Result<()>
         if i + 1 < samples {
             std::thread::sleep(std::time::Duration::from_millis(interval_ms as u64));
         }
+    }
+    if usb_errors > 0 {
+        eprintln!(
+            "\n{usb_errors}/{samples} samples failed at the USB layer, not the probe. \
+             That is the programmer link (cable, port, hub, or the CH341A itself), not \
+             contact with the chip — reseating the probe will not fix it. Try a different \
+             cable and a direct port, no hub."
+        );
     }
     let report = analyze_spi_readings(readings);
     let stable = report.pattern == SpiPattern::Stable;

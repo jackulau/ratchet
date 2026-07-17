@@ -45,11 +45,35 @@ impl LibusbBus {
         self
     }
 
+    /// Un-stall the endpoints after an I/O error, then hand the error back unchanged.
+    ///
+    /// `LIBUSB_ERROR_IO` on a bulk endpoint is usually a STALL, and a stall is
+    /// LATCHED: every later transfer fails identically until the host clears it. So
+    /// one glitch turned every subsequent command into an error and killed the run,
+    /// which is exactly what `ratchet monitor` kept doing at read 8 of 500. Clearing
+    /// costs one control transfer and makes the next attempt possible.
+    ///
+    /// Deliberately does NOT retry here. Every caller is mid-CS-frame (assert, then
+    /// command, then deassert), so re-issuing the transfer would splice a second SPI
+    /// transaction into a frame the chip is already interpreting, and hand back bytes
+    /// that look valid and are not. Clearing the stall is the whole job: the retry
+    /// belongs to the caller, which re-frames CS properly.
+    fn unstall_on_io_error<T>(&self, r: Result<T>) -> Result<T> {
+        if matches!(r, Err(BackendError::Usb(ratchet_usb::UsbError::Io))) {
+            // Both directions: we cannot tell which halted, and clearing a healthy
+            // endpoint is a no-op on the device.
+            let _ = self.handle.clear_halt(self.ep_in);
+            let _ = self.handle.clear_halt(self.ep_out);
+        }
+        r
+    }
+
     fn bulk_out_all(&self, buf: &[u8]) -> Result<()> {
-        let n = self
-            .handle
-            .bulk_out(self.ep_out, buf, self.timeout_ms)
-            .map_err(BackendError::Usb)?;
+        let n = self.unstall_on_io_error(
+            self.handle
+                .bulk_out(self.ep_out, buf, self.timeout_ms)
+                .map_err(BackendError::Usb),
+        )?;
         if n != buf.len() {
             return Err(BackendError::Other(format!(
                 "short bulk_out: wrote {n} of {} bytes",
@@ -66,11 +90,12 @@ impl LibusbBus {
     }
 
     fn bulk_in_exact_into(&self, buf: &mut [u8]) -> Result<()> {
-        fill_exact_into(buf, |chunk| {
+        let r = fill_exact_into(buf, |chunk| {
             self.handle
                 .bulk_in(self.ep_in, chunk, self.timeout_ms)
                 .map_err(BackendError::Usb)
-        })
+        });
+        self.unstall_on_io_error(r)
     }
 }
 
@@ -116,7 +141,8 @@ impl UsbBus for LibusbBus {
         // Overlap OUT with a ring of INs. The trait default alternates one packet
         // at a time (~350 us per 31 bytes); on real silicon that is the whole
         // reason a 32 MB dump takes six minutes.
-        self.handle
+        let r = self
+            .handle
             .bulk_out_in_parallel(
                 self.ep_out,
                 out,
@@ -126,7 +152,8 @@ impl UsbBus for LibusbBus {
                 IN_RING,
                 self.timeout_ms,
             )
-            .map_err(BackendError::Usb)
+            .map_err(BackendError::Usb);
+        self.unstall_on_io_error(r)
     }
 }
 

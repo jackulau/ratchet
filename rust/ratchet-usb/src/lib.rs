@@ -359,6 +359,24 @@ impl DeviceHandle {
         }
     }
 
+    /// Clear a halted (stalled) endpoint, via CLEAR_FEATURE(ENDPOINT_HALT).
+    ///
+    /// A stall is LATCHED, not transient: once an endpoint halts, every subsequent
+    /// transfer on it fails with the same `LIBUSB_ERROR_IO` until the host clears
+    /// the condition. That makes retrying-without-clearing pure noise, and makes an
+    /// unrecoverable-looking error out of one that costs a single control transfer
+    /// to fix. Also resets the endpoint's data toggle, which is exactly what a
+    /// device that lost sync needs.
+    pub fn clear_halt(&self, endpoint: u8) -> Result<()> {
+        // SAFETY: ptr valid; libusb issues a synchronous control transfer.
+        let rc = unsafe { sys::libusb_clear_halt(self.ptr.as_ptr(), endpoint as c_uchar) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(map_err(rc))
+        }
+    }
+
     /// Bulk IN transfer. Returns number of bytes read into `buf` (≤ `buf.len()`).
     pub fn bulk_in(&self, endpoint: u8, buf: &mut [u8], timeout_ms: u32) -> Result<usize> {
         debug_assert!(

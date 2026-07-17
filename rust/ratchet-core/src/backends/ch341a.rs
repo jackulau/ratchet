@@ -127,6 +127,20 @@ pub const CHUNK_PATIENCE: Duration = Duration::from_secs(120);
 /// window (observed windows are ~1 s), long enough not to spin the USB bus.
 pub const CONTACT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// True if a JEDEC id triple is a dead bus rather than a chip.
+///
+/// `000000` is MISO stuck low. `ffffff` is MISO floating high, which is the more
+/// dangerous of the two: it is byte-for-byte identical to erased flash, and it is
+/// what a lifted probe reads on this part. No real part answers either.
+///
+/// Every liveness decision must reject BOTH. Testing only for `000000` looks fine
+/// while an id is anchored (a floating bus fails the equality check instead), but
+/// before identify anchors one there is nothing else standing in the way, and a
+/// floating bus reads as a perfectly healthy chip.
+fn is_dead_bus(id: [u8; 3]) -> bool {
+    id == [0x00, 0x00, 0x00] || id == [0xff, 0xff, 0xff]
+}
+
 /// Patience a freshly built backend starts with.
 ///
 /// Unit tests get a near-zero budget. A fake bus has no physical probe that might
@@ -543,7 +557,7 @@ impl<B: UsbBus> CH341ABackend<B> {
         match self.rdid() {
             Ok(id) => {
                 let live = [id.manufacturer, id.memory_type, id.capacity];
-                if expect.is_none_or(|e| e == live) && live != [0, 0, 0] {
+                if expect.is_none_or(|e| e == live) && !is_dead_bus(live) {
                     Ok(data) // chip still answering: the chunk is real
                 } else {
                     Err(format!(
@@ -562,12 +576,16 @@ impl<B: UsbBus> CH341ABackend<B> {
     }
 
     /// True if the chip answers RDID with the id identify saw.
+    ///
+    /// `jedec_expect` is None until identify anchors an id, so a caller that waits
+    /// for contact BEFORE identify (`identify_chip_patient`) has only `is_dead_bus`
+    /// between it and a floating bus.
     fn chip_answers(&mut self) -> bool {
         let expect = self.jedec_expect;
         match self.rdid() {
             Ok(id) => {
                 let live = [id.manufacturer, id.memory_type, id.capacity];
-                live != [0, 0, 0] && expect.is_none_or(|e| e == live)
+                !is_dead_bus(live) && expect.is_none_or(|e| e == live)
             }
             Err(_) => false,
         }
@@ -583,7 +601,12 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// patience and nothing else, and patience is the one resource we have plenty of.
     ///
     /// Contact is the scarce resource; spend it on chunks, not on failing.
-    fn wait_for_contact(&mut self, deadline: Instant) -> bool {
+    ///
+    /// `announce` is printed once, only if we actually end up waiting. The caller owns
+    /// the wording because the two waits are not the same event: mid-read the news is
+    /// "contact lost, your finished chunks are safe", while at startup nothing has been
+    /// lost yet and nothing is on disk to reassure anyone about.
+    fn wait_for_contact(&mut self, deadline: Instant, announce: &str) -> bool {
         let mut announced = false;
         loop {
             if self.chip_answers() {
@@ -598,14 +621,66 @@ impl<B: UsbBus> CH341ABackend<B> {
             // A read that goes quiet for minutes reads as a hang, and a user who
             // thinks it hung kills it. Say what is happening and that stopping is safe.
             if !announced {
+                eprintln!("{announce}");
+                announced = true;
+            }
+            std::thread::sleep(CONTACT_POLL_INTERVAL);
+        }
+    }
+
+    /// Identify the chip, waiting out a dropout the same way chunks do.
+    ///
+    /// Without this the wait-for-contact design is defeated at step one. A backup
+    /// rides contact windows for 32 MB, but it still has to be STARTED, and plain
+    /// identify fails closed in ~11 ms against a probe that was going to come back
+    /// a second later. That forces the user to hit enter during a window they cannot
+    /// see (the pads on a WSON part are underneath the package), which is the one
+    /// thing this whole design exists to avoid. "Start it and walk away" only works
+    /// if the start waits too.
+    ///
+    /// Waiting here is as free as it is anywhere else: RDID against a silent chip is
+    /// a successful USB transfer reporting `000000`, not an error path.
+    fn identify_chip_patient(&mut self) -> Result<ChipInfo> {
+        let deadline = Instant::now() + self.chunk_patience;
+        let mut announced = false;
+        loop {
+            // Nothing in here may escape the wait. Two things that did:
+            //
+            // A USB error is a transient LINK fault (a stall we just cleared, a
+            // re-enumeration), not a verdict on the chip. Propagating it with `?`
+            // killed a read whose entire job was to wait ("Error: usb error: I/O
+            // error", ~2s into a 600s budget). `chip_answers` already treats a failed
+            // RDID as "not answering"; this must agree with it.
+            //
+            // An identification we cannot SIZE is not an identification. An id read
+            // through a marginal contact window can be self-consistent garbage that
+            // misses both the chip DB and SFDP, leaving size_bytes 0. The caller then
+            // turned that into ChipNotDetected, so this printed "chip is answering --
+            // starting the read" and immediately failed with "chip not detected".
+            // Keep waiting for an id we can actually act on.
+            if let Ok(Some(chip)) = self.identify_chip() {
+                if chip.size_bytes > 0 {
+                    if announced {
+                        eprintln!("chip is answering — starting the read");
+                    }
+                    return Ok(chip);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(BackendError::ChipNotDetected);
+            }
+            if !announced {
                 eprintln!(
-                    "contact lost — waiting up to {}s for the probe to come back. \
-                     Completed chunks are already saved; Ctrl-C is safe and re-running \
-                     resumes from here.",
-                    deadline.saturating_duration_since(Instant::now()).as_secs()
+                    "no chip answering yet — waiting up to {}s for the probe to make \
+                     contact. Nothing has been read; Ctrl-C is safe.",
+                    self.chunk_patience.as_secs()
                 );
                 announced = true;
             }
+            // Pace every attempt. Deliberately not built on `wait_for_contact`: that
+            // returns the instant RDID answers, so a bus flickering between a valid
+            // id and a dead one would spin here at full USB rate for the whole budget
+            // (the same hot-spin `read_chunk_patient` had to be fixed for).
             std::thread::sleep(CONTACT_POLL_INTERVAL);
         }
     }
@@ -637,7 +712,13 @@ impl<B: UsbBus> CH341ABackend<B> {
             // this the loop would re-read at full tilt for the whole patience budget.
             // Hammering a marginal bus is the one response guaranteed not to help.
             std::thread::sleep(CONTACT_POLL_INTERVAL);
-            if !self.wait_for_contact(deadline) {
+            let announce = format!(
+                "contact lost — waiting up to {}s for the probe to come back. \
+                 Completed chunks are already saved; Ctrl-C is safe and re-running \
+                 resumes from here.",
+                deadline.saturating_duration_since(Instant::now()).as_secs()
+            );
+            if !self.wait_for_contact(deadline, &announce) {
                 break why;
             }
         };
@@ -656,7 +737,22 @@ impl<B: UsbBus> CH341ABackend<B> {
         // into the same stream as the dummy bytes keeps every USB packet full, so
         // the device's replies stay a uniform 31 bytes for the IN ring to frame.
         let mut tx = Vec::with_capacity(5 + n);
-        tx.push(SPI_READ);
+        // The dedicated 4-byte opcode, not plain READ + EN4B, for the same reason
+        // page_program and erase already use theirs: 0x13 carries 4 address bytes by
+        // definition, so it cannot be misframed by what mode the chip happens to be
+        // in. 0x03 is mode-DEPENDENT, and the mode is chip state we do not control:
+        // a chip that loses power reverts to the 3-byte power-on default while
+        // use_4byte_addr stays true here. It then eats 3 of our 4 address bytes as
+        // the address and the 4th as data, so every read lands at addr>>8.
+        //
+        // That is not hypothetical. A probe that flickers IS a power interruption,
+        // and since reads now wait out flickers instead of dying on them, the read
+        // resumes against a chip that silently reset. RDID answers identically in
+        // both modes so the liveness check cannot see it, and the wrong bytes are
+        // deterministic so the per-chunk double-read agrees with itself. It walked
+        // through every gate and produced a "successful" 32 MB dump that was 128 KB
+        // of chip smeared 256x (measured: 99.22% self-similar at chunk_size - 32).
+        tx.push(if use_4byte { SPI_READ_4B } else { SPI_READ });
         tx.extend(address_bytes(addr, use_4byte));
         let header_len = tx.len();
         tx.resize(header_len + n, 0);
@@ -862,7 +958,7 @@ impl<B: UsbBus> CH341ABackend<B> {
     /// costs no extra probe time.
     fn read_chip_to_file_buf(&mut self, output_path: &Path) -> Result<(ReadResult, Vec<u8>)> {
         let start = Instant::now();
-        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        let chip = self.identify_chip_patient()?;
         let size = chip.size_bytes as usize;
         if size == 0 {
             return Err(BackendError::ChipNotDetected);
@@ -1002,9 +1098,11 @@ impl<B: UsbBus> CH341ABackend<B> {
     fn verify_against_file(&mut self, file_path: &Path) -> Result<VerifyResult> {
         let start = Instant::now();
         let file_data = std::fs::read(file_path)?;
-        // Identify first so 4-byte mode (EN4B) is active before reading back a >16 MB chip;
-        // a standalone `verify` would otherwise read with 3-byte addressing.
-        self.identify_chip()?;
+        // Identify first so the chip is sized and 4-byte addressing is settled before
+        // reading back a >16 MB chip. Patient for the same reason the read path is:
+        // a verify that fails closed in 11 ms because the probe was mid-flicker tells
+        // you nothing about the chip.
+        self.identify_chip_patient()?;
         let chip_data = self.read_range(0, file_data.len())?;
         let mut hc = Sha256::new();
         hc.update(&chip_data);
@@ -1025,7 +1123,36 @@ impl<B: UsbBus> CH341ABackend<B> {
         let start = Instant::now();
         let firmware = std::fs::read(input_path)?;
         reject_blank_image(&firmware)?;
-        let chip = self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?;
+        // Wait for the probe here for the same reason reads do: the pads on a WSON
+        // part are under the package, so "press enter during a contact window" is not
+        // something a human can do. Safe at this point specifically because nothing
+        // has been erased or programmed yet -- this is still startup. It deliberately
+        // does NOT make the write itself tolerate a dropout; that is per-block
+        // erase/program/verify, and re-running the same command resumes it.
+        //
+        // Look FIRST and wait only on a miss, rather than polling before every write.
+        // A seated probe must cost no extra bus traffic: the write tests queue an exact
+        // response sequence and an unconditional probe ate the RDID meant for identify,
+        // which is the mock telling the truth about a real change to the wire.
+        //
+        // Identify NORMALLY here rather than via identify_chip_patient. The patient
+        // version keeps waiting for an id it can SIZE, which is right for a read but
+        // wrong here: a genuinely unsupported chip would spend the whole budget and then
+        // report "chip not detected" when it is present and answering. The honest answer
+        // is the unknown-capacity refusal below. Refusing loudly beats a false absence.
+        let chip = match self.identify_chip()? {
+            Some(chip) => chip,
+            None => {
+                let deadline = Instant::now() + self.chunk_patience;
+                let announce = format!(
+                    "no chip answering yet — waiting up to {}s for the probe to make \
+                     contact. Nothing has been erased or written; Ctrl-C is safe.",
+                    self.chunk_patience.as_secs()
+                );
+                self.wait_for_contact(deadline, &announce);
+                self.identify_chip()?.ok_or(BackendError::ChipNotDetected)?
+            }
+        };
         let chip_size = chip.size_bytes as usize;
         if chip_size == 0 {
             return Err(BackendError::Other(format!(
@@ -2448,6 +2575,40 @@ mod tests {
     /// command bytes already in the frame), and applies erase/program side-effects on CS-high.
     /// PAGE_PROGRAM uses real AND-into-flash semantics, so a missing erase-before-write would
     /// leave stale 0-bits and fail verification — exactly like silicon.
+    /// Wraps a bus and fails its first `n` transfers with a USB I/O error, modelling
+    /// a stall or a re-enumeration glitch on the LINK rather than a fault at the chip.
+    /// The distinction matters: a link glitch says nothing about whether the probe is
+    /// touching, so a read that is deliberately waiting for contact must ride it out.
+    struct ErringBus<B: UsbBus> {
+        inner: B,
+        fails_left: u32,
+    }
+    impl<B: UsbBus> ErringBus<B> {
+        fn new(inner: B, fails: u32) -> Self {
+            Self {
+                inner,
+                fails_left: fails,
+            }
+        }
+        fn tick(&mut self) -> Result<()> {
+            if self.fails_left > 0 {
+                self.fails_left -= 1;
+                return Err(BackendError::Usb(ratchet_usb::UsbError::Io));
+            }
+            Ok(())
+        }
+    }
+    impl<B: UsbBus> UsbBus for ErringBus<B> {
+        fn bulk_write(&mut self, data: &[u8]) -> Result<()> {
+            self.tick()?;
+            self.inner.bulk_write(data)
+        }
+        fn bulk_read(&mut self, len: usize) -> Result<Vec<u8>> {
+            self.tick()?;
+            self.inner.bulk_read(len)
+        }
+    }
+
     struct LoopbackFlash {
         flash: Vec<u8>,
         jedec: [u8; 3],
@@ -2486,6 +2647,15 @@ mod tests {
         /// is healthy before and after — so only comparing two reads catches it.
         corrupt_from: Option<usize>,
         read_pass: u8,
+        /// Model a probe whose MISO FLOATS instead of being pulled low: every read
+        /// answers 0xff. Distinct from `contact_lost` because it is the dangerous
+        /// one -- 0xff is indistinguishable from erased flash by inspection, so only
+        /// asking whether the id is a dead-bus value catches it.
+        floating: std::cell::Cell<bool>,
+        /// Model an id read through a marginal window: self-consistent garbage that
+        /// misses the chip DB, so it sizes to 0 and is not actionable.
+        garbage_id: Option<[u8; 3]>,
+        garbage_id_polls: std::cell::Cell<u32>,
     }
     impl LoopbackFlash {
         fn new(size: usize, jedec: [u8; 3]) -> Self {
@@ -2505,7 +2675,33 @@ mod tests {
                 rdid_polls_while_dead: 0,
                 corrupt_from: None,
                 read_pass: 0,
+                floating: std::cell::Cell::new(false),
+                garbage_id: None,
+                garbage_id_polls: std::cell::Cell::new(0),
             }
+        }
+        /// Model the probe not touching the chip AT ALL when the read starts, then
+        /// making contact after `polls` id requests. This is the user's actual
+        /// situation: they run the command, then seat the probe.
+        fn absent_until_poll(mut self, polls: u32) -> Self {
+            self.contact_lost.set(true);
+            self.dead_from.set(Some(0));
+            self.recover_after_polls = Some(polls);
+            self
+        }
+        /// Model a lifted probe whose MISO floats high: everything reads 0xff.
+        fn floating_high(self) -> Self {
+            self.floating.set(true);
+            self
+        }
+        /// Model an id read through a marginal contact window: answers `id` for the
+        /// first `polls` id requests, then the real one. With no SFDP table (the
+        /// default) an id that misses the chip DB sizes to 0 bytes, which is the
+        /// "chip is answering" / "chip not detected" contradiction from the field.
+        fn garbage_id_until_poll(mut self, id: [u8; 3], polls: u32) -> Self {
+            self.garbage_id = Some(id);
+            self.garbage_id_polls = std::cell::Cell::new(polls);
+            self
         }
         /// Lose contact at `offset` and never regain it, as a probe knocked off the
         /// chip does.
@@ -2555,6 +2751,10 @@ mod tests {
             if self.frame.is_empty() {
                 return 0;
             }
+            // A floating bus answers everything with 0xff, id requests included.
+            if self.floating.get() {
+                return 0xff;
+            }
             match self.frame[0] {
                 // Once contact is gone the chip cannot answer an id request either.
                 // This is the discriminator read_chunk_checked relies on to tell a
@@ -2562,7 +2762,10 @@ mod tests {
                 SPI_RDID if self.contact_lost.get() => 0,
                 SPI_RDID => {
                     if (1..=3).contains(&pos) {
-                        self.jedec[pos - 1]
+                        match self.garbage_id {
+                            Some(g) if self.garbage_id_polls.get() > 0 => g[pos - 1],
+                            _ => self.jedec[pos - 1],
+                        }
                     } else {
                         0
                     }
@@ -2617,7 +2820,18 @@ mod tests {
                     {
                         self.contact_lost.set(false);
                         self.dead_from.set(None);
+                        // Losing contact IS losing power, and a chip that loses power
+                        // comes back in its 3-byte power-on default. Modelling the
+                        // recovery without this made contact loss look free, which is
+                        // how a read that waits out flickers shipped while silently
+                        // reading at addr>>8 afterwards.
+                        self.four_byte = false;
                     }
+                }
+                // A marginal window settles after a few polls: the garbage id gives
+                // way to the real one.
+                SPI_RDID if self.garbage_id_polls.get() > 0 => {
+                    self.garbage_id_polls.set(self.garbage_id_polls.get() - 1);
                 }
                 // Each read transaction is a fresh pass over the wire, so corrupted
                 // regions hand back different bytes next time.
@@ -2856,6 +3070,215 @@ mod tests {
         assert!(
             std::fs::read(&path).unwrap() == content,
             "waiting out a flicker must still produce the chip byte for byte"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Reported from a real terminal: a read that was explicitly waiting 600s for a
+    // probe died ~2s in with "Error: usb error: I/O error". A USB fault is a transient
+    // LINK problem (a stall just cleared, a re-enumeration), not a verdict on the chip,
+    // and the whole point of the wait is to outlast exactly this.
+    #[test]
+    fn a_usb_glitch_while_waiting_for_contact_does_not_kill_the_read() {
+        const SIZE: usize = 16 * 1024 * 1024;
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("usb-glitch-wait.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        // Absent at the start, and the bus errors on the first few polls before the
+        // probe lands.
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).absent_until_poll(3);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(ErringBus::new(bus, 2));
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let r = backend
+            .read_chip(&path)
+            .expect("a transient USB error must not kill a read that is waiting");
+        assert!(r.success);
+        assert!(std::fs::read(&path).unwrap() == content);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Reported from a real terminal, and the message was the tell: "chip is answering
+    // -- starting the read" immediately followed by "Error: chip not detected". An id
+    // read through a marginal window can be self-consistent garbage that misses the
+    // chip DB and SFDP both, leaving size_bytes 0, which the caller turns into
+    // ChipNotDetected. A chip we cannot size is not an identification: keep waiting.
+    #[test]
+    fn an_id_we_cannot_size_is_not_treated_as_a_successful_identification() {
+        const SIZE: usize = 16 * 1024 * 1024;
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("unsizable-id.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        // Answers a garbage id (not in the DB, no SFDP table) for the first 3 polls,
+        // then settles on the real one.
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18])
+            .garbage_id_until_poll([0x1f, 0x8c, 0x42], 3);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let r = backend
+            .read_chip(&path)
+            .expect("an unsizable id must be waited through, not announced then failed");
+        assert!(r.success);
+        assert!(
+            std::fs::read(&path).unwrap() == content,
+            "the read must use the real chip, not the garbage id"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Reproduces the dump that started this: a 32 MB read that held contact, passed
+    // every gate, reported success, and was 128 KB of chip smeared across 32 MB.
+    //
+    // The probe flickers. A flicker is a power interruption, so the chip comes back in
+    // its 3-byte power-on default while use_4byte_addr is still true here. Plain READ
+    // (0x03) is mode-DEPENDENT: the chip then takes 3 of our 4 address bytes as the
+    // address and the 4th as data, and every read lands at addr>>8. Nothing catches it
+    // downstream because RDID answers the same in both modes and the wrong bytes are
+    // deterministic, so the per-chunk double-read cheerfully agrees with itself.
+    //
+    // The fix is the one page_program and erase already had: use the dedicated 4-byte
+    // opcode, which cannot be misframed by chip state.
+    #[test]
+    fn a_chip_that_power_cycles_mid_read_must_not_silently_read_at_the_wrong_address() {
+        const SIZE: usize = 32 * 1024 * 1024; // ef6019 = W25Q256JW, needs 4-byte addressing
+        let content: Vec<u8> = (0..SIZE)
+            .map(|i| (i.wrapping_mul(31) % 251) as u8 | 1)
+            .collect();
+        let path = test_tmp("power-cycle-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        // Contact drops early and returns 3 polls later, power-cycling the chip back
+        // into 3-byte mode exactly as real silicon does.
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x60, 0x19]).recovering_after(100_000, 3);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let r = backend
+            .read_chip(&path)
+            .expect("a flicker must not fail the read");
+        assert!(r.success);
+        let got = std::fs::read(&path).unwrap();
+        assert!(
+            got == content,
+            "a chip that reset to 3-byte mode must not be read at addr>>8: \
+             {} of {} bytes wrong",
+            got.iter().zip(&content).filter(|(a, b)| a != b).count(),
+            content.len()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The read waits for contact per CHUNK, but it still had to be STARTED, and
+    // identify failed closed in ~11 ms if the probe was not already touching. So the
+    // user had to hit enter inside a contact window they cannot see (WSON pads are
+    // under the package). That defeated the whole point: the command must be startable
+    // first and seated second.
+    #[test]
+    fn read_waits_for_contact_before_it_gives_up_on_identifying_the_chip() {
+        const SIZE: usize = 16 * 1024 * 1024; // ef4018 = W25Q128
+        let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("absent-at-start-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        // Nothing on the bus when the read starts; the probe lands 3 polls later.
+        let mut bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).absent_until_poll(3);
+        bus.flash.copy_from_slice(&content);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let r = backend
+            .read_chip(&path)
+            .expect("a probe seated shortly after the command starts must not fail the read");
+        assert!(r.success);
+        assert!(
+            std::fs::read(&path).unwrap() == content,
+            "waiting for the probe to arrive must still produce the chip byte for byte"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The same startup trap as the read above, one command later: write identified the
+    // chip in ~11ms and failed closed, so "seat the probe, THEN hit enter" was the only
+    // order that worked -- and on a WSON part the pads are under the package, so that is
+    // pressing enter inside a window you cannot see. Waiting is safe HERE and only here:
+    // this is startup, before any erase. The write itself still refuses to ride out a
+    // dropout; that is per-block erase/program/verify plus re-running to resume.
+    #[test]
+    fn write_waits_for_contact_before_it_gives_up_on_finding_the_chip() {
+        const SIZE: usize = 1024 * 1024;
+        let firmware: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        let path = test_tmp("absent-at-start-write.bin");
+        std::fs::write(&path, &firmware).unwrap();
+
+        // Nothing on the bus when the command starts; the probe lands 3 polls later.
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).absent_until_poll(3);
+        let mut backend = CH341ABackend::with_bus(bus);
+        backend.set_chunk_patience(Duration::from_secs(5));
+
+        let w = backend
+            .write_chip(
+                &path,
+                WriteOpts {
+                    skip_backup: true,
+                    skip_verify: false,
+                },
+            )
+            .expect("a probe seated shortly after the command starts must not fail the write");
+        assert!(w.verified);
+        assert_eq!(
+            backend.bus.as_ref().unwrap().flash,
+            firmware,
+            "waiting for the probe to arrive must still program the whole image"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ffffff is the dangerous dead-bus value: MISO floating high is byte-for-byte
+    // identical to erased flash, so nothing about the DATA can catch it. Before
+    // is_dead_bus, chip_answers only rejected 000000 -- fine once identify anchors an
+    // id (a float fails the equality check), but identify_chip_patient waits BEFORE an
+    // id exists, where expect is None and every guard is is_none_or(true). A floating
+    // probe would have read as a healthy chip and handed back 16 MB of 0xff as a
+    // "successful" backup.
+    #[test]
+    fn a_floating_bus_is_never_mistaken_for_a_chip_that_is_answering() {
+        const SIZE: usize = 16 * 1024 * 1024;
+        let path = test_tmp("floating-read.bin");
+        std::fs::remove_file(&path).ok();
+        super::super::resume::ResumeState::clear(&path);
+
+        let bus = LoopbackFlash::new(SIZE, [0xef, 0x40, 0x18]).floating_high();
+        let mut backend = CH341ABackend::with_bus(bus);
+        // No id is anchored yet, so this is exactly the unguarded window.
+        assert!(
+            !backend.chip_answers(),
+            "ffffff is a floating bus, not a chip answering"
+        );
+        assert!(
+            backend.identify_chip().unwrap().is_none(),
+            "ffffff must not identify as a part"
+        );
+        let err = backend
+            .read_chip(&path)
+            .expect_err("a floating bus must never produce a backup");
+        assert!(
+            matches!(err, BackendError::ChipNotDetected),
+            "expected ChipNotDetected, got {err:?}"
+        );
+        assert!(
+            !path.exists(),
+            "a floating bus must not leave a file on disk: 0xff is indistinguishable \
+             from erased flash and would pass every blank check as a real backup"
         );
         std::fs::remove_file(&path).ok();
     }
