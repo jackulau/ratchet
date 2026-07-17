@@ -74,6 +74,12 @@ enum Command {
         skip_backup: bool,
         #[arg(long)]
         skip_verify: bool,
+        /// Seconds to wait for a flickering probe, both when finding the chip at
+        /// startup and per block during the write. Raise it to start the command
+        /// first and seat the probe second: waiting costs only time, and a block
+        /// that has been programmed stays programmed.
+        #[arg(long, default_value = "120")]
+        patience: u64,
     },
     /// Erase the entire chip.
     Erase {
@@ -85,6 +91,11 @@ enum Command {
         file: String,
         #[arg(long)]
         json: bool,
+        /// Seconds to wait for a flickering probe. Same reason as read: a verify
+        /// that gives up because the probe was mid-flicker has told you nothing
+        /// about the chip.
+        #[arg(long, default_value = "120")]
+        patience: u64,
     },
     /// Analyze a BIOS image (UEFI volumes, vendor, regions, health).
     Analyze {
@@ -631,9 +642,14 @@ fn main() -> anyhow::Result<()> {
             json,
             skip_backup,
             skip_verify,
-        }) => cmd_write(&input, json, skip_backup, skip_verify)?,
+            patience,
+        }) => cmd_write(&input, json, skip_backup, skip_verify, patience)?,
         Some(Command::Erase { json }) => cmd_erase(json)?,
-        Some(Command::Verify { file, json }) => cmd_verify(&file, json)?,
+        Some(Command::Verify {
+            file,
+            json,
+            patience,
+        }) => cmd_verify(&file, json, patience)?,
         Some(Command::Analyze { file, json }) => cmd_analyze(&file, json)?,
         Some(Command::Diff { a, b, json }) => cmd_diff(&a, &b, json)?,
         Some(Command::Checksum { file, json }) => cmd_checksum(&file, json)?,
@@ -1254,10 +1270,17 @@ fn cmd_read(output: &str, json: bool, patience: u64, chunk_kb: usize) -> anyhow:
     })
 }
 
-fn cmd_write(input: &str, json: bool, skip_backup: bool, skip_verify: bool) -> anyhow::Result<()> {
+fn cmd_write(
+    input: &str,
+    json: bool,
+    skip_backup: bool,
+    skip_verify: bool,
+    patience: u64,
+) -> anyhow::Result<()> {
     use ratchet_core::backends::WriteOpts;
     let (mut m, kind) = open_dyn_checked("write")?;
     with_progress(&mut *m, "write", json);
+    m.set_chunk_patience(std::time::Duration::from_secs(patience));
     let r = m.write_chip(
         std::path::Path::new(input),
         WriteOpts {
@@ -1329,9 +1352,10 @@ fn check_exit_code(ok: bool) -> i32 {
     }
 }
 
-fn cmd_verify(file: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_verify(file: &str, json: bool, patience: u64) -> anyhow::Result<()> {
     let (mut m, kind) = open_dyn_checked("verify")?;
     with_progress(&mut *m, "verify", json);
+    m.set_chunk_patience(std::time::Duration::from_secs(patience));
     let r = m.verify_chip(std::path::Path::new(file))?;
     let env = AgentEnvelope::ok("verify", with_backend_field(&r, kind)?);
     emit_envelope(&env, json, || println!("matches={}", r.matches))?;
