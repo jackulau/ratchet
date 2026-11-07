@@ -354,13 +354,6 @@ Winbond, Macronix, GigaDevice, SST / Microchip, EON, Spansion / Cypress / Infine
   udev rule for `1a86:5512` (CH341A) / `1a86:55db` (CH347), or run with `sudo`.
 - **Windows**: vcpkg-installed libusb for build; WinUSB driver via [Zadig](https://zadig.akeo.ie/) for runtime.
 
-## History
-
-ratchet began as **biosMCP**, a CH341A-focused BIOS programmer built to replace AsProgrammer and
-NeoProgrammer. The original TypeScript prototype was rewritten as a native Rust workspace (the
-prior state is preserved at the `ts-final` git tag), then grew from a SPI-flash-only tool into the
-broader multi-protocol toolkit and was renamed ratchet to match its wider scope.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
