@@ -1,0 +1,47 @@
+README.md
+  s_bd4e1ce81a4fd8::t_5b7e7f8aa6d3b8 15,384
+  s_bd4e1ce81a4fd8::t_7098bfd534e806 1,3-6,8,10-11,13-14,16-18,20-38,40,42-45,47,49-55,57,59,61-87,91-93,95-101,106-107,110,112,115-116,119,122-123,126-127,129,132-134,137,140-142,145,148-149,152-160,162,164-165,167-168,170,172,180,183-184,190,196-208,212,216,221-227,229-270,272-273,276,280,287,296,298,300,303-304,307,319,324-367,369-383,385-390,396-403,406,408,410,412-415,417,419,421-425,427,429-433
+  s_bd4e1ce81a4fd8::t_a64cdbf1bb9161 177,179,181,187
+  s_bd4e1ce81a4fd8::t_1b8edc536357ee 228,368
+  s_bd4e1ce81a4fd8::t_f19307207d67bb 175,182,186,194,434-436,438
+CONTRIBUTING.md
+  s_bd4e1ce81a4fd8::t_5b7e7f8aa6d3b8 15
+  s_bd4e1ce81a4fd8::t_97016299fc6ee0 1-14,16-96
+docs/wson8-bios-recovery.md
+  s_bd4e1ce81a4fd8::t_a64cdbf1bb9161 1-20,22-64
+  s_bd4e1ce81a4fd8::t_1b8edc536357ee 21
+.github/ISSUE_TEMPLATE/hardware_report.yml
+  s_bd4e1ce81a4fd8::t_994314088f3478 1-73
+SECURITY.md
+  s_bd4e1ce81a4fd8::t_2922126620914e 1-33
+docs/assets/logo-light.svg
+  s_bd4e1ce81a4fd8::t_fb722ad0a671fb 1-8
+.github/ISSUE_TEMPLATE/feature_request.yml
+  s_bd4e1ce81a4fd8::t_9c635898a20317 1-23
+.github/pull_request_template.md
+  s_bd4e1ce81a4fd8::t_a142511982a5e9 1-15
+.github/ISSUE_TEMPLATE/config.yml
+  s_bd4e1ce81a4fd8::t_614d057e145b66 1-8
+.github/ISSUE_TEMPLATE/bug_report.yml
+  s_bd4e1ce81a4fd8::t_8f788eb74a7e02 1-72
+docs/assets/logo-dark.svg
+  s_bd4e1ce81a4fd8::t_fb722ad0a671fb 1-8
+CODE_OF_CONDUCT.md
+  s_bd4e1ce81a4fd8::t_6db988bbc4dec3 1-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b4f32b5c383cc4a4f38181eea870a1e4a81483ca",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
