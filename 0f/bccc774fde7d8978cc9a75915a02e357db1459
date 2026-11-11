@@ -1,0 +1,27 @@
+rust/Cargo.toml
+  s_bd4e1ce81a4fd8::t_5b7e7f8aa6d3b8 15
+rust/ratchet-cli/src/main.rs
+  s_bd4e1ce81a4fd8::t_c29683365738d3 1963
+rust/ratchet-core/src/programmers/avr_isp.rs
+  s_bd4e1ce81a4fd8::t_c9d203aad2ec63 251
+rust/ratchet-core/src/protocols/uart/master.rs
+  s_bd4e1ce81a4fd8::t_f28ca9e1acbe01 49-50
+rust/ratchet-mcp/src/main.rs
+  s_bd4e1ce81a4fd8::t_48f49bc232c1e5 657
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0fbccc774fde7d8978cc9a75915a02e357db1459",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
