@@ -1,0 +1,47 @@
+.github/ISSUE_TEMPLATE/bug_report.yml
+  s_bd4e1ce81a4fd8::t_8f788eb74a7e02 1-72
+.github/ISSUE_TEMPLATE/feature_request.yml
+  s_bd4e1ce81a4fd8::t_9c635898a20317 1-23
+.github/pull_request_template.md
+  s_bd4e1ce81a4fd8::t_a142511982a5e9 1-15
+README.md
+  s_bd4e1ce81a4fd8::t_1b8edc536357ee 229,369
+  s_bd4e1ce81a4fd8::t_5b7e7f8aa6d3b8 15,89,385
+  s_bd4e1ce81a4fd8::t_a64cdbf1bb9161 177-180,182,188
+  s_bd4e1ce81a4fd8::t_7098bfd534e806 1,3-6,8,10-11,13-14,16-18,20-36,38,40-43,45,47-53,55,57,59-85,91,93-99,104-105,108,110,113-114,117,120-121,124-125,127,130-132,135,138-140,143,146-147,150-158,160,162-163,165-166,168,170,173,175,181,184-185,192,194-206,210,214,219-228,230-268,270-271,274,278,285,294,296,298,301-302,305,317,322-368,370-384,386-388,394-401,404,406,408,410-413,415,417,419-421,423,425-432,434
+  s_bd4e1ce81a4fd8::t_c47a5df7c8f62b 90
+docs/assets/logo-light.svg
+  s_bd4e1ce81a4fd8::t_fb722ad0a671fb 1-8
+.github/ISSUE_TEMPLATE/hardware_report.yml
+  s_bd4e1ce81a4fd8::t_994314088f3478 1-73
+CODE_OF_CONDUCT.md
+  s_bd4e1ce81a4fd8::t_6db988bbc4dec3 1-27
+docs/wson8-bios-recovery.md
+  s_bd4e1ce81a4fd8::t_a64cdbf1bb9161 1-20,22-64
+  s_bd4e1ce81a4fd8::t_1b8edc536357ee 21
+CONTRIBUTING.md
+  s_bd4e1ce81a4fd8::t_5b7e7f8aa6d3b8 15
+  s_bd4e1ce81a4fd8::t_97016299fc6ee0 1-14,16-96
+SECURITY.md
+  s_bd4e1ce81a4fd8::t_2922126620914e 1-33
+.github/ISSUE_TEMPLATE/config.yml
+  s_bd4e1ce81a4fd8::t_614d057e145b66 1-8
+docs/assets/logo-dark.svg
+  s_bd4e1ce81a4fd8::t_fb722ad0a671fb 1-8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "63d6462e446bb6cbf277d6d155f5b4f1a738f281",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
