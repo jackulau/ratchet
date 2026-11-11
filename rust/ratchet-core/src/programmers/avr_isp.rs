@@ -248,7 +248,7 @@ pub fn parse_intel_hex(text: &str) -> Result<HexImage> {
 }
 
 fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd hex length".into());
     }
     let mut out = Vec::with_capacity(s.len() / 2);

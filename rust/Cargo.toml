@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "2.0.0-alpha.1"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "MIT"
 authors = ["ratchet contributors"]
 repository = "https://github.com/jackulau/ratchet"

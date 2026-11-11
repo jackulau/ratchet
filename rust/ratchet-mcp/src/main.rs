@@ -654,7 +654,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, (i32, String)> {
         .chars()
         .filter(|c| c.is_ascii_hexdigit())
         .collect();
-    if cleaned.len() % 2 != 0 {
+    if !cleaned.len().is_multiple_of(2) {
         return Err((
             -32602,
             "data_hex must have an even number of hex digits".into(),

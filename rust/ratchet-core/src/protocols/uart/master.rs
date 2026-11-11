@@ -46,8 +46,8 @@ impl Parity {
         let ones = (byte & mask).count_ones();
         match self {
             Parity::None => None,
-            Parity::Odd => Some(ones % 2 == 0), // parity bit makes total odd
-            Parity::Even => Some(ones % 2 != 0), // parity bit makes total even
+            Parity::Odd => Some(ones.is_multiple_of(2)), // parity bit makes total odd
+            Parity::Even => Some(!ones.is_multiple_of(2)), // parity bit makes total even
             Parity::Mark => Some(true),
             Parity::Space => Some(false),
         }

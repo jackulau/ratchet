@@ -1960,7 +1960,7 @@ fn parse_hex_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
         .chars()
         .filter(|c| c.is_ascii_hexdigit())
         .collect();
-    if cleaned.len() % 2 != 0 {
+    if !cleaned.len().is_multiple_of(2) {
         anyhow::bail!(
             "hex data must have an even number of digits, got {}",
             cleaned.len()
