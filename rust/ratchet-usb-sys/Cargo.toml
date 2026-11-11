@@ -13,5 +13,7 @@ links = "usb-1.0"
 name = "ratchet_usb_sys"
 
 [build-dependencies]
-bindgen = "0.71"
+# 0.73 or newer: bindgen 0.71 emits `libusb_transfer` with no fields when it
+# parses libusb.h with libclang 22, which the generated layout assertions catch.
+bindgen = "0.73"
 pkg-config = "0.3"
