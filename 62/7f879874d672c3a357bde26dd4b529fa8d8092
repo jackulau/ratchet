@@ -1,0 +1,22 @@
+rust/ratchet-usb-sys/Cargo.toml
+  s_bd4e1ce81a4fd8::t_ab67d0789fceb0 18
+  s_bd4e1ce81a4fd8::t_c3392cf7075f32 16-17
+rust/Cargo.lock
+  s_bd4e1ce81a4fd8::t_17ff413606c628 72,74,667,669
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "627f879874d672c3a357bde26dd4b529fa8d8092",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
