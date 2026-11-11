@@ -1,0 +1,159 @@
+name: release
+
+# Builds the `ratchet` and `ratchet-mcp` binaries for each supported target.
+#
+#   - Pushing a `v*` tag builds every target and publishes a GitHub Release
+#     with the tarballs and a SHA256SUMS file (the layout install.sh expects).
+#   - Pull requests that touch the release pipeline, and manual runs, build
+#     and package every target but publish nothing, so the pipeline is proven
+#     before a tag is ever pushed.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - install.sh
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds use the oldest hosted image so the binaries run on
+          # older glibc versions too.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the workspace version
+        id: version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' rust/Cargo.toml | head -n 1)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Workspace version: $version"
+
+      # A tag that disagrees with Cargo.toml would publish binaries that
+      # report a different version than the release they came from.
+      - name: Check the tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "v${{ steps.version.outputs.version }}" = "$GITHUB_REF_NAME"
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev pkg-config clang
+
+      # PKG_CONFIG_ALL_STATIC links Homebrew's libusb.a into the binary, so a
+      # downloaded macOS build runs without Homebrew installed.
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libusb pkgconf
+          echo "PKG_CONFIG_ALL_STATIC=1" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
+
+      - name: Build
+        working-directory: rust
+        run: cargo build --release --locked -p ratchet-cli -p ratchet-mcp
+
+      - name: Check the binaries
+        run: |
+          rust/target/release/ratchet --version
+          rust/target/release/ratchet-mcp --list-tools > /dev/null
+          RATCHET_FORCE_MOCK=1 rust/target/release/ratchet self-test
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            otool -L rust/target/release/ratchet rust/target/release/ratchet-mcp
+            # A reference to a Homebrew path would mean libusb was not linked statically.
+            if otool -L rust/target/release/ratchet rust/target/release/ratchet-mcp | grep -E '/opt/homebrew|/usr/local'; then
+              echo "::error::macOS binary depends on a Homebrew library"
+              exit 1
+            fi
+          else
+            ldd rust/target/release/ratchet
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          name="ratchet-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p stage dist
+          cp rust/target/release/ratchet rust/target/release/ratchet-mcp stage/
+          cp LICENSE README.md packaging/70-ratchet.rules stage/
+          tar -czf "dist/$name.tar.gz" -C stage .
+          tar -tzf "dist/$name.tar.gz"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: publish GitHub release
+    # Only a pushed tag publishes; a manual run against a tag stays a dry run.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: dist
+        run: |
+          sha256sum ./*.tar.gz | sed 's# \./# #' > SHA256SUMS
+          cat SHA256SUMS
+
+      # A tag with a pre-release suffix (v2.0.0-alpha.1) is published as a
+      # pre-release, so it never becomes the repository's "latest" release.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          case "$GITHUB_REF_NAME" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --title "ratchet ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --verify-tag \
+            "${flags[@]}"
