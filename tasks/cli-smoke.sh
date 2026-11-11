@@ -90,6 +90,8 @@ head -c $((4 * 1024 * 1024)) "$RATCHET" > "$IMG"
 run "write (auto backup + verify)"      $RATCHET write "$IMG"
 run "write --skip-backup --skip-verify" $RATCHET write "$IMG" --skip-backup --skip-verify
 expect_fail "write refuses blank image" $RATCHET write "$DUMP"
+# A write that did not happen must not exit 0.
+expect_fail "write of a missing image exits non-zero" $RATCHET write "$TMP/no-such-image.bin"
 # Exit-code contract (flashrom-style): verify exits 0 on a match, non-zero on a
 # mismatch — scripts gate on the exit code instead of parsing JSON. Mock state
 # is per-process, so the pristine dump matches and the derived image does not.
@@ -127,6 +129,17 @@ expect_fail "full-backup refuses clobber" bash -c "cd '$TMP' && '$PWD/$RATCHET' 
 run "full-backup --force overwrites" bash -c "cd '$TMP' && '$PWD/$RATCHET' full-backup --force"
 run "full-repair --skip-write" $RATCHET full-repair --skip-write
 run "full-repair"        $RATCHET full-repair
+# A pipeline that stops at a failed step is a failed repair: non-zero exit and
+# an ok:false envelope, never a success wrapper around success=false.
+expect_fail "full-repair exits non-zero when a step fails" \
+  $RATCHET full-repair --reference "$TMP/no-such-reference.bin"
+if $RATCHET full-repair --reference "$TMP/no-such-reference.bin" --json 2>/dev/null \
+  | grep -q '"ok":false.*"repair_failed"'; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1)); FAILED_CMDS+=("full-repair failure envelope is ok:false")
+  echo "  FAIL: full-repair failure envelope is ok:false" >&2
+fi
 
 # ── Pure analysis on the dump ────────────────────────────────
 run "analyze"            $RATCHET analyze "$DUMP"

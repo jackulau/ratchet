@@ -821,10 +821,28 @@ fn call_write_chip(args: &Value) -> Result<Value, (i32, String)> {
     let r = m
         .write_chip(std::path::Path::new(&input), opts)
         .map_err(map_err)?;
+    // A write that did not complete or did not verify is a tool error, never a
+    // result the agent has to inspect field by field to find out it failed.
+    if let Some(reason) = r.failure(!opts.skip_verify) {
+        return Err(map_err(write_failure_message(
+            &reason,
+            r.backup_path.as_deref(),
+        )));
+    }
     Ok(with_backend_field(
         serde_json::to_value(&r).unwrap_or(Value::Null),
         kind,
     ))
+}
+
+/// The error text for a failed `write_chip`. It names the pre-write backup when
+/// there is one, since an error response carries no result fields and the
+/// backup is what the caller needs in order to recover.
+fn write_failure_message(reason: &str, backup_path: Option<&str>) -> String {
+    match backup_path {
+        Some(path) => format!("write failed: {reason} (pre-write backup: {path})"),
+        None => format!("write failed: {reason}"),
+    }
 }
 
 fn call_verify_chip(args: &Value) -> Result<Value, (i32, String)> {
@@ -1090,6 +1108,18 @@ mod tests {
         let (code, msg) = tool_call(&json!({"name":"bogus_tool","arguments":{}})).unwrap_err();
         assert_eq!(code, -32601);
         assert!(msg.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn write_failure_message_names_the_backup() {
+        assert_eq!(
+            write_failure_message("no match", Some("/b.bin")),
+            "write failed: no match (pre-write backup: /b.bin)"
+        );
+        assert_eq!(
+            write_failure_message("File not found: x", None),
+            "write failed: File not found: x"
+        );
     }
 
     #[test]
