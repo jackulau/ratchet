@@ -1,0 +1,29 @@
+.github/ISSUE_TEMPLATE/hardware_report.yml
+  s_bd4e1ce81a4fd8::t_7bc18090c62ce1 66
+rust/Cargo.toml
+  s_bd4e1ce81a4fd8::t_7bc18090c62ce1 13,22-24
+.github/ISSUE_TEMPLATE/bug_report.yml
+  s_bd4e1ce81a4fd8::t_7bc18090c62ce1 31
+install.sh
+  s_bd4e1ce81a4fd8::t_7bc18090c62ce1 6-7,62
+README.md
+  s_bd4e1ce81a4fd8::t_7bc18090c62ce1 14,92-104,125,132,135-136,162-165
+rust/Cargo.lock
+  s_bd4e1ce81a4fd8::t_3aa3f0bb3f1efc 3,499,510,522,532,543,551
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f035b4ba8c9124e5860e6799b9c53122fbf31017",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
