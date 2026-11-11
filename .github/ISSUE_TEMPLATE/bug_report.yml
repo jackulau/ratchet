@@ -1,0 +1,72 @@
+name: Bug report
+description: Something ratchet did wrong, or failed to do
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. If a write or erase went wrong, **keep the board powered off** and keep every backup file ratchet produced until the issue is understood.
+
+        Never attach a full BIOS dump to a public issue: dumps can contain serial numbers, MAC addresses, and license keys.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you ran, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Command and output
+      description: The exact command and its full output. Adding `--json` gives the most detail.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ratchet version
+      description: Output of `ratchet --version`, plus the commit if you built from source.
+      placeholder: ratchet 2.0.0-alpha.1 (commit 1d93fd5)
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: programmer
+    attributes:
+      label: Programmer
+      options:
+        - CH341A
+        - CH347
+        - None (mock backend or an offline command)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: chip
+    attributes:
+      label: Flash chip and connection
+      description: Full part number as printed on the chip, the JEDEC ID from `ratchet identify`, and how it is connected.
+      placeholder: W25Q128JVSQ, ef4018, SOIC-8 clip in circuit
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `ratchet status --json`
+      render: json
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Board model, level shifter or adapter, whether the read is stable (`ratchet monitor`), and anything you already tried.

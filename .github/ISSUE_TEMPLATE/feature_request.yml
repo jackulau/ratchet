@@ -1,0 +1,23 @@
+name: Feature request
+description: A chip, programmer, protocol, or capability ratchet should have
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The task or hardware you have in front of you. A concrete situation is more useful than a proposed design.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: The command, tool, or behavior you would like. For a missing chip, include the full part number, JEDEC ID, and a datasheet link.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: How do you handle it today?
+      description: Other tools or workarounds you use, if any.

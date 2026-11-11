@@ -1,0 +1,73 @@
+name: Hardware report
+description: Tell us a programmer, chip, or board that works (or does not)
+labels: [hardware-report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        CI proves the protocol against emulated hardware only. Reports from real boards are how the compatibility picture gets filled in, and a "this works" report is as useful as a failure.
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Works
+        - Partly works
+        - Does not work
+    validations:
+      required: true
+  - type: dropdown
+    id: programmer
+    attributes:
+      label: Programmer
+      options:
+        - CH341A
+        - CH347
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: chip
+    attributes:
+      label: Flash chip
+      description: Full part number as printed on the chip, and the JEDEC ID from `ratchet identify`.
+      placeholder: MX25L12873F, c22018
+    validations:
+      required: true
+  - type: input
+    id: connection
+    attributes:
+      label: Connection
+      description: Clip, probe, socket, or breakout, plus any level shifter, and whether the chip was in circuit.
+      placeholder: SOIC-8 clip, in circuit, 3.3 V
+    validations:
+      required: true
+  - type: input
+    id: board
+    attributes:
+      label: Board or device
+      placeholder: ASUS PRIME B450M-A rev 1.02
+  - type: checkboxes
+    id: operations
+    attributes:
+      label: Operations tested
+      options:
+        - label: identify
+        - label: read (two dumps compared equal)
+        - label: write
+        - label: verify
+        - label: erase
+        - label: I2C
+        - label: JTAG
+  - type: input
+    id: version
+    attributes:
+      label: ratchet version and operating system
+      placeholder: ratchet 2.0.0-alpha.1, macOS 26 on Apple silicon
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Timings, flags you needed (`--chunk-kb`, `--patience`), quirks, or output worth keeping.

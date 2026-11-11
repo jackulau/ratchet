@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/jackulau/ratchet/blob/main/SECURITY.md
+    about: Please report security issues privately. See the security policy.
+  - name: BIOS recovery walkthrough
+    url: https://github.com/jackulau/ratchet#recover-a-motherboard-bios
+    about: Step-by-step recovery instructions, worth reading before filing a "my board will not boot" issue.
