@@ -28,7 +28,7 @@ body:
     attributes:
       label: ratchet version
       description: Output of `ratchet --version`, plus the commit if you built from source.
-      placeholder: ratchet 2.0.0 (output of `ratchet --version`)
+      placeholder: ratchet 2.0.1 (output of `ratchet --version`)
     validations:
       required: true
   - type: dropdown

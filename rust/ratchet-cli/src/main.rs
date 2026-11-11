@@ -615,6 +615,39 @@ fn emit_envelope<T: serde::Serialize>(
     Ok(())
 }
 
+/// Envelope for an operation that ran but did not achieve its goal. `ok` is
+/// false and `error` says why, while `data` still carries what happened (the
+/// backup path, the per-step results), because that is what the caller needs
+/// in order to recover. The caller exits non-zero after emitting it.
+fn failed_envelope(
+    command: &str,
+    code: &str,
+    message: String,
+    data: serde_json::Value,
+) -> AgentEnvelope<serde_json::Value> {
+    AgentEnvelope {
+        ok: false,
+        command: command.into(),
+        data: Some(data),
+        error: Some(AgentError {
+            code: code.into(),
+            message,
+            hint: None,
+        }),
+        next_action: None,
+    }
+}
+
+/// Why a repair pipeline run must be reported as failed, or `None` if it passed.
+fn repair_failure(result: &ratchet_core::workflows::pipeline::PipelineResult) -> Option<String> {
+    if result.success {
+        return None;
+    }
+    let step = result.error_step.as_deref().unwrap_or("unknown step");
+    let detail = result.error_detail.as_deref().unwrap_or("no detail");
+    Some(format!("step '{step}' failed: {detail}"))
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.self_test_flag {
@@ -1288,16 +1321,27 @@ fn cmd_write(
             skip_verify,
         },
     )?;
-    let env = AgentEnvelope::ok("write", with_backend_field(&r, kind)?);
-    emit_envelope(&env, json, || {
-        println!(
-            "write success={} verified={} backup={:?} backend={}",
-            r.success,
-            r.verified,
-            r.backup_path,
-            kind.as_str()
-        );
-    })
+    let data = with_backend_field(&r, kind)?;
+    let summary = format!(
+        "write success={} verified={} backup={:?} backend={}",
+        r.success,
+        r.verified,
+        r.backup_path,
+        kind.as_str()
+    );
+    // A write that did not complete, or that was meant to be verified and was
+    // not, must not exit 0: scripts and agents gate on the exit code, and the
+    // next thing they do is power the board from this chip.
+    if let Some(reason) = r.failure(!skip_verify) {
+        let env = failed_envelope("write", "write_failed", reason.clone(), data);
+        emit_envelope(&env, json, || {
+            println!("{summary}");
+            eprintln!("error: {reason}");
+        })?;
+        std::process::exit(1);
+    }
+    let env = AgentEnvelope::ok("write", data);
+    emit_envelope(&env, json, || println!("{summary}"))
 }
 
 fn cmd_erase(json: bool) -> anyhow::Result<()> {
@@ -1713,7 +1757,12 @@ fn cmd_repl() -> anyhow::Result<()> {
             },
             ReplCommand::Write { path } => {
                 match backend.write_chip(Path::new(&path), Default::default()) {
-                    Ok(r) => println!("write success={} verified={}", r.success, r.verified),
+                    Ok(r) => {
+                        println!("write success={} verified={}", r.success, r.verified);
+                        if let Some(reason) = r.failure(true) {
+                            println!("error: {reason}");
+                        }
+                    }
                     Err(e) => println!("error: {e}"),
                 }
             }
@@ -1826,8 +1875,8 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
     }
     ctx.skip_write = skip_write;
     let result = run_pipeline(&build_repair_pipeline(), &mut ctx);
-    let env = AgentEnvelope::ok("full-repair", with_backend_field(&result, kind)?);
-    emit_envelope(&env, json, || {
+    let data = with_backend_field(&result, kind)?;
+    let human = || {
         println!(
             "full-repair: success={} steps={}/{}",
             result.success,
@@ -1840,7 +1889,20 @@ fn cmd_full_repair(reference: Option<&str>, skip_write: bool, json: bool) -> any
                 s.number, s.name, s.detail, s.duration_ms
             );
         }
-    })
+    };
+    // A pipeline that stopped at a failed step is a failed repair. It used to be
+    // wrapped in an `ok: true` envelope and exit 0, so a caller that gated on
+    // either one was told a board had been repaired when the run had aborted.
+    if let Some(reason) = repair_failure(&result) {
+        let env = failed_envelope("full-repair", "repair_failed", reason.clone(), data);
+        emit_envelope(&env, json, || {
+            human();
+            eprintln!("error: {reason}");
+        })?;
+        std::process::exit(1);
+    }
+    let env = AgentEnvelope::ok("full-repair", data);
+    emit_envelope(&env, json, human)
 }
 
 fn cmd_full_backup(json: bool, force: bool) -> anyhow::Result<()> {
@@ -1978,6 +2040,48 @@ fn parse_hex_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_envelope_is_not_ok_and_keeps_the_data() {
+        let env = failed_envelope(
+            "write",
+            "write_failed",
+            "read-back mismatch".to_string(),
+            json!({"backupPath": "/b.bin", "verified": false}),
+        );
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["command"], "write");
+        assert_eq!(v["error"]["code"], "write_failed");
+        assert_eq!(v["error"]["message"], "read-back mismatch");
+        // The backup path is how the caller recovers, so it must survive.
+        assert_eq!(v["data"]["backupPath"], "/b.bin");
+    }
+
+    #[test]
+    fn repair_failure_names_the_failed_step() {
+        use ratchet_core::workflows::pipeline::PipelineResult;
+        let passed = PipelineResult {
+            success: true,
+            steps_completed: 7,
+            step_results: Vec::new(),
+            error_step: None,
+            error_detail: None,
+            total_duration_ms: 0,
+        };
+        assert_eq!(repair_failure(&passed), None);
+        let failed = PipelineResult {
+            success: false,
+            steps_completed: 4,
+            error_step: Some("Repair".to_string()),
+            error_detail: Some("Reference read failed".to_string()),
+            ..passed
+        };
+        assert_eq!(
+            repair_failure(&failed).as_deref(),
+            Some("step 'Repair' failed: Reference read failed")
+        );
+    }
 
     #[test]
     fn parse_hex_bytes_tolerant() {

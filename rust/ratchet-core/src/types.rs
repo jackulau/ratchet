@@ -81,6 +81,32 @@ pub struct WriteResult {
     pub error: Option<String>,
 }
 
+impl WriteResult {
+    /// Why a caller must report this write as failed, or `None` when it stands.
+    ///
+    /// A write that says `success: false`, or that was asked to verify and came
+    /// back unverified, has not put the image on the chip as far as anyone can
+    /// tell. Front ends route that through this method so it becomes an error
+    /// (a non-zero exit, a JSON-RPC error) instead of a field inside a response
+    /// that otherwise reads as success.
+    pub fn failure(&self, verify_requested: bool) -> Option<String> {
+        if !self.success {
+            return Some(
+                self.error
+                    .clone()
+                    .unwrap_or_else(|| "the write did not complete".to_string()),
+            );
+        }
+        if verify_requested && !self.verified {
+            return Some(
+                "the chip was programmed but its contents were not verified against the image"
+                    .to_string(),
+            );
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EraseResult {
     pub success: bool,
@@ -171,3 +197,43 @@ pub struct ConnectionTestResult {
 }
 
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(u8, u64, u64, f64, f64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_result(success: bool, verified: bool, error: Option<&str>) -> WriteResult {
+        WriteResult {
+            success,
+            backup_path: None,
+            verified,
+            duration_ms: 0,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn verified_write_is_not_a_failure() {
+        assert_eq!(write_result(true, true, None).failure(true), None);
+    }
+
+    #[test]
+    fn skipped_verify_is_not_a_failure_when_it_was_not_requested() {
+        assert_eq!(write_result(true, false, None).failure(false), None);
+    }
+
+    #[test]
+    fn unverified_write_is_a_failure_when_verify_was_requested() {
+        let why = write_result(true, false, None).failure(true).unwrap();
+        assert!(why.contains("not verified"), "{why}");
+    }
+
+    #[test]
+    fn unsuccessful_write_is_a_failure_and_carries_the_backend_error() {
+        let r = write_result(false, false, Some("File not found: x.bin"));
+        assert_eq!(r.failure(true).as_deref(), Some("File not found: x.bin"));
+        // Also when verify was skipped: the write itself did not happen.
+        assert_eq!(r.failure(false).as_deref(), Some("File not found: x.bin"));
+        assert!(write_result(false, false, None).failure(false).is_some());
+    }
+}

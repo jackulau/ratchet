@@ -623,11 +623,27 @@ impl<T: Transport + Send> Ch347Backend<T> {
             }
         }
 
-        // 4. Read back and compare unless skipped — no more hardcoded `verified: true`.
+        // 4. Read back and compare unless skipped. A mismatch is an error, not a
+        //    `verified: false` inside a success: that shape is also what a skipped
+        //    verify returns, so a caller could not tell "not checked" from "checked
+        //    and wrong", and the CLI exited 0 on a chip holding a corrupt image.
         let verified = if opts.skip_verify {
             false
         } else {
-            self.verify_against_file(input_path)?.matches
+            let v = self.verify_against_file(input_path)?;
+            if !v.matches {
+                let backup = match &backup_path {
+                    Some(p) => format!(" The pre-write contents are saved at {p}."),
+                    None => String::new(),
+                };
+                return Err(BackendError::Other(format!(
+                    "verify failed after write: the chip does not match the image \
+                     (chip sha256 {}, image sha256 {}). The chip may hold a partial \
+                     image.{backup}",
+                    v.chip_checksum, v.file_checksum
+                )));
+            }
+            true
         };
 
         Ok(WriteResult {
@@ -1461,5 +1477,171 @@ mod tests {
         assert!(sent(SPI_CMD_EWSR), "EWSR must precede the WRSR");
         assert!(sent(SPI_CMD_WRSR), "WRSR must clear the protection bits");
         assert!(sent(SPI_CMD_RDSR), "a WIP poll must follow the WRSR");
+    }
+
+    /// A SPI NOR flash simulated behind the CH347 packet framing, so the whole
+    /// write path (identify, erase, program, read back) runs against something
+    /// that behaves like a chip instead of against a queue of canned replies.
+    /// It answers RDID and READ, applies sector erases and page programs when CS
+    /// is released, and reports every status register as zero (idle, unprotected).
+    struct SimFlash {
+        mem: Vec<u8>,
+        jedec: [u8; 3],
+        /// Bytes clocked in since CS was asserted.
+        txn: Vec<u8>,
+        /// Reply to the packet most recently written.
+        reply: Vec<u8>,
+        /// Page programs at or above this address are dropped, the way worn or
+        /// hardware-protected cells ignore them.
+        dead_from: Option<usize>,
+    }
+
+    impl SimFlash {
+        /// W25Q80BV (1 MB), holding stale data so a write has to erase first.
+        fn w25q80() -> Self {
+            Self {
+                mem: vec![0x00; 1024 * 1024],
+                jedec: [0xef, 0x40, 0x14],
+                txn: Vec::new(),
+                reply: Vec::new(),
+                dead_from: None,
+            }
+        }
+
+        fn addr(bytes: &[u8]) -> usize {
+            bytes.iter().fold(0usize, |a, b| (a << 8) | *b as usize)
+        }
+
+        /// One byte shifted in on MOSI; returns the byte shifted out on MISO.
+        fn clock(&mut self, mosi: u8) -> u8 {
+            let pos = self.txn.len();
+            self.txn.push(mosi);
+            match self.txn[0] {
+                SPI_CMD_RDID if pos >= 1 => self.jedec.get(pos - 1).copied().unwrap_or(0),
+                SPI_CMD_READ if pos >= 4 => {
+                    let at = Self::addr(&self.txn[1..4]) + (pos - 4);
+                    self.mem.get(at).copied().unwrap_or(0xff)
+                }
+                _ => 0,
+            }
+        }
+
+        /// CS released: erase and program commands take effect now.
+        fn release(&mut self) {
+            let txn = std::mem::take(&mut self.txn);
+            match txn.first() {
+                Some(&SPI_CMD_SECTOR_ERASE) if txn.len() >= 4 => {
+                    let start = Self::addr(&txn[1..4]) & !0xfff;
+                    self.mem[start..start + 4096].fill(0xff);
+                }
+                Some(&SPI_CMD_PAGE_PROGRAM) if txn.len() > 4 => {
+                    let start = Self::addr(&txn[1..4]);
+                    for (i, byte) in txn[4..].iter().enumerate() {
+                        let at = start + i;
+                        if self.dead_from.is_some_and(|dead| at >= dead) {
+                            continue;
+                        }
+                        // Programming can only clear bits.
+                        self.mem[at] &= byte;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Transport for SimFlash {
+        fn write(&mut self, pkt: &[u8]) -> Result<()> {
+            if pkt[0] != CH347_CMD_SPI_CS_XFER {
+                self.reply.clear();
+                return Ok(());
+            }
+            let mut reply = vec![0u8; 4];
+            if pkt[3] & 0x80 != 0 {
+                self.release();
+            } else {
+                for byte in &pkt[4..] {
+                    let miso = self.clock(*byte);
+                    reply.push(miso);
+                }
+            }
+            self.reply = reply;
+            Ok(())
+        }
+
+        fn read(&mut self, len: usize) -> Result<Vec<u8>> {
+            let mut reply = std::mem::take(&mut self.reply);
+            reply.resize(len, 0);
+            Ok(reply)
+        }
+    }
+
+    /// A non-blank image that ends mid-page and spans two 4 KB sectors.
+    fn test_image() -> (tempfile::NamedTempFile, Vec<u8>) {
+        let image: Vec<u8> = (0..6000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), &image).unwrap();
+        (file, image)
+    }
+
+    const NO_BACKUP: WriteOpts = WriteOpts {
+        skip_backup: true,
+        skip_verify: false,
+    };
+
+    #[test]
+    fn backend_write_chip_programs_and_verifies_the_image() {
+        let (file, image) = test_image();
+        let mut b = Ch347Backend::new(SimFlash::w25q80());
+        let res = Backend::write_chip(&mut b, file.path(), NO_BACKUP).unwrap();
+        assert!(res.success && res.verified);
+        let mem = &b.protocol().transport_mut().mem;
+        assert_eq!(
+            &mem[..image.len()],
+            &image[..],
+            "the image must be on the chip"
+        );
+        assert!(
+            mem[image.len()..8192].iter().all(|b| *b == 0xff),
+            "the rest of the last erased sector stays blank"
+        );
+        assert!(
+            mem[8192..].iter().all(|b| *b == 0x00),
+            "sectors past the image are not touched"
+        );
+    }
+
+    #[test]
+    fn backend_write_chip_fails_when_the_read_back_does_not_match() {
+        // The second sector ignores programming, so the chip ends up holding half
+        // the image. That used to come back as Ok { success: true, verified: false },
+        // which the CLI printed and then exited 0 on.
+        let (file, image) = test_image();
+        let mut sim = SimFlash::w25q80();
+        sim.dead_from = Some(4096);
+        let mut b = Ch347Backend::new(sim);
+        let err = Backend::write_chip(&mut b, file.path(), NO_BACKUP).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("verify failed after write"), "{msg}");
+        // The mismatch is real: the second sector never took the data.
+        let mem = &b.protocol().transport_mut().mem;
+        assert_ne!(&mem[..image.len()], &image[..]);
+    }
+
+    #[test]
+    fn backend_write_chip_skip_verify_reports_unverified_without_reading_back() {
+        // --skip-verify is the one case where `verified: false` is a success: the
+        // caller asked not to check, and the result says it was not checked.
+        let (file, _) = test_image();
+        let mut sim = SimFlash::w25q80();
+        sim.dead_from = Some(4096);
+        let mut b = Ch347Backend::new(sim);
+        let opts = WriteOpts {
+            skip_backup: true,
+            skip_verify: true,
+        };
+        let res = Backend::write_chip(&mut b, file.path(), opts).unwrap();
+        assert!(res.success);
+        assert!(!res.verified);
     }
 }

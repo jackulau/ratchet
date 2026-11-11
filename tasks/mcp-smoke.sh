@@ -111,6 +111,8 @@ check "analyze_image reports file size" "$RESP_ANALYZE" '"result"' 'fileSize'
 # ── Confirm gate: destructive tools refuse without confirm=true ──
 check "write_chip without confirm fails" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_chip","arguments":{"input":"/tmp/x.bin"}}}' | tail -1)" '"error"' 'confirm'
+check "write_chip of a missing image is an error, not a result" \
+  "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_chip","arguments":{"input":"/nonexistent/ratchet-smoke.bin","confirm":true}}}' | tail -1)" '"error"' 'write failed'
 check "erase_chip without confirm fails" \
   "$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"erase_chip","arguments":{}}}' | tail -1)" '"error"' 'confirm'
 check "region_erase without confirm fails" \

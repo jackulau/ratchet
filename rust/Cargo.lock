@@ -496,7 +496,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "ratchet-cli"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "ratchet-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "ratchet-usb",
  "serde",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "ratchet-mcp"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "ratchet-core",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "ratchet-node"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "ratchet-usb"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "ratchet-usb-sys",
  "thiserror",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "ratchet-usb-sys"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bindgen",
  "pkg-config",

@@ -284,7 +284,7 @@ ratchet chip-info ef4017 --json
 ratchet analyze backup.bin --json | jq '.data.regions'
 ```
 
-Exit codes are meant to be scripted against: `verify` exits non-zero on a mismatch and `blank-check` exits non-zero when the chip is not blank.
+Exit codes are meant to be scripted against: `verify` exits non-zero on a mismatch, `blank-check` exits non-zero when the chip is not blank, and `write` and `full-repair` exit non-zero when the write does not verify or a repair step fails. In those cases `--json` prints an envelope with `"ok": false` and the reason in `error`.
 
 <details>
 <summary>More examples: I2C, EEPROM, JTAG, and offline tools</summary>
@@ -353,7 +353,7 @@ Destructive tools (`write_chip`, `erase_chip`, `region_erase`, `wp_disable`, `i2
 ratchet is built to not brick your board. Each item here is enforced in code and covered by the unit tests and the smoke suites in `tasks/`.
 
 - **Backup before writing.** On by default. On a CH341A, an existing complete backup for the same chip ID and size is reused rather than overwritten, so keep your own copy per board (see [Things to know](#things-to-know)). Opt out with `--skip-backup`.
-- **Read-back verify after every write.** `write` reads the chip back, compares it to the file, and reports `verified`. Opt out with `--skip-verify`.
+- **Read-back verify after every write.** `write` reads the chip back and compares it to the file. A mismatch is an error and a non-zero exit, not a `verified: false` to go looking for. Opt out with `--skip-verify`.
 - **Blank-image guard.** `write` refuses an all-0xFF or all-0x00 image. Use `erase` to blank a chip on purpose.
 - **Capacity and write-protect guards.** Images larger than the chip, chips the database cannot size, and chips with block-protect bits set are refused instead of being written blind.
 - **No silent mock writes.** Destructive commands refuse to run when no programmer is attached and the factory fell back to the mock backend. Only an explicit `RATCHET_FORCE_MOCK=1` allows it.
@@ -363,7 +363,7 @@ ratchet is built to not brick your board. Each item here is enforced in code and
 <summary>The full list</summary>
 
 - **Pre-write backup details.** CH341A uses a stable backup keyed by chip ID and size and preserves an existing complete backup across retries. CH347 creates a timestamped backup. Keep your own board-specific copy before writing.
-- **Gateable exit codes.** `verify` exits non-zero on a mismatch and `blank-check` exits non-zero when the chip is not blank (the JSON envelope is still emitted first), so shell scripts can branch on them as they would with flashrom.
+- **Gateable exit codes.** `verify` exits non-zero on a mismatch and `blank-check` exits non-zero when the chip is not blank (the JSON envelope is still emitted first), so shell scripts can branch on them as they would with flashrom. `write` exits non-zero when the write fails or does not verify, and `full-repair` exits non-zero when any step fails; both then emit an `"ok": false` envelope that still carries the backup path or the per-step results. Over MCP, a failed `write_chip` is a JSON-RPC error.
 - **`wp-disable` remedy.** A `write protected` refusal has an in-tool fix: `wp-disable` clears the block-protect bits (confirm-gated on MCP, destructive-gated on the CLI) and exits non-zero if protection survives, as with a hardware WP pin or an OTP lock.
 - **Erase before program, with WIP polling.** Sectors are erased before programming, and the write-in-progress status bit is polled after every erase and page program, so the next command never races a busy chip (a chip erase can take tens of seconds).
 - **Unknown capacity is refused.** Chips the database cannot size (`unknown chip capacity`) are refused outright instead of written blind.
