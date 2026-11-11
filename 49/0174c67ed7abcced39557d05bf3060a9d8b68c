@@ -1,0 +1,29 @@
+.github/workflows/release.yml
+  s_bd4e1ce81a4fd8::t_b539c990e785d6 1-158
+install.sh
+  s_bd4e1ce81a4fd8::t_9f4e5fa3c28965 2-4,6-12,24-29,37-41,52-58,61-67,69-71,79,82-91,93-110,113,117,123,131-136,141-142,145-148
+packaging/99-ratchet.rules
+  s_bd4e1ce81a4fd8::t_ad1810c723b016 18-19
+.github/dependabot.yml
+  s_bd4e1ce81a4fd8::t_43c0464c404c7c 1-19
+.github/workflows/ci.yml
+  s_bd4e1ce81a4fd8::t_4a29aa429de076 7-16,20,23-24,27,51,57-91,95,106-134
+.github/workflows/audit.yml
+  s_bd4e1ce81a4fd8::t_dc2477c3ebdad3 1-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "490174c67ed7abcced39557d05bf3060a9d8b68c",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
