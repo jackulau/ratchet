@@ -1,0 +1,23 @@
+.github/workflows/release.yml
+  s_bd4e1ce81a4fd8::t_da0aa6fe17a5d5 13
+.github/workflows/ci.yml
+  s_bd4e1ce81a4fd8::t_fbc208923d719d 5
+.github/workflows/audit.yml
+  s_bd4e1ce81a4fd8::t_5dc3e8fd4ab9dd 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cb64313f59b053cdf25ec2d99a67c99c0dad9f68",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
