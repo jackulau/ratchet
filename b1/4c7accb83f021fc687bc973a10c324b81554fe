@@ -1,0 +1,23 @@
+docs/wson8-bios-recovery.md
+  s_bd4e1ce81a4fd8::t_972dee3808b09b 17
+README.md
+  s_bd4e1ce81a4fd8::t_972dee3808b09b 36,50,52,119,122,168,241,262,319,336,338,358,362,375,388
+CONTRIBUTING.md
+  s_bd4e1ce81a4fd8::t_972dee3808b09b 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b14c7accb83f021fc687bc973a10c324b81554fe",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
