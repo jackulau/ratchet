@@ -3,9 +3,8 @@
 # platform from GitHub Releases and verifies their checksum. No Node.js / npm
 # required.
 #
-# Releases are built by .github/workflows/release.yml. Until the first release
-# is tagged, install from source with `cargo install --path rust/ratchet-cli`
-# (see README).
+# Releases are built by .github/workflows/release.yml. To build from source
+# instead, see the README.
 #
 # Environment:
 #   RATCHET_VERSION      tag to install (default: the newest release)
@@ -60,7 +59,7 @@ tag_from() {
 if [ -z "${RATCHET_VERSION:-}" ]; then
   echo "  → Resolving the newest release from GitHub..."
   # `releases/latest` skips pre-releases, so fall back to the newest release of
-  # any kind while the project only has pre-releases.
+  # any kind when there is no stable one.
   TAG="$(tag_from "https://api.github.com/repos/${REPO}/releases/latest")"
   if [ -z "$TAG" ]; then
     TAG="$(tag_from "https://api.github.com/repos/${REPO}/releases?per_page=1")"

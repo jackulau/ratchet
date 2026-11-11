@@ -11,6 +11,7 @@ Back up, analyze, and reflash a motherboard's BIOS chip from the terminal,<br>
 or let an AI agent drive it through the built-in MCP server.
 
 [![CI](https://github.com/jackulau/ratchet/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jackulau/ratchet/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jackulau/ratchet?color=blue)](https://github.com/jackulau/ratchet/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg?logo=rust)](rust/Cargo.toml)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#requirements)
@@ -88,7 +89,19 @@ ratchet verify new_bios.bin # confirm independently
 
 ## Install
 
-ratchet installs from source with cargo in three steps. The build needs Rust 1.88 or newer, libusb-1.0, pkg-config, and libclang (used to generate the libusb bindings).
+### Pre-built binaries (Linux and macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jackulau/ratchet/main/install.sh | bash
+```
+
+The installer picks the newest [release](https://github.com/jackulau/ratchet/releases) for your machine (x86_64 or aarch64 Linux, Apple silicon or Intel macOS), verifies the download against the release's `SHA256SUMS`, and installs `ratchet` and `ratchet-mcp` into `/usr/local/bin`, or `~/.local/bin` if that is not writable. Set `RATCHET_INSTALL_DIR` to choose the directory and `RATCHET_VERSION` (for example `v2.0.0`) to pin a version.
+
+On Linux the binaries need the libusb runtime: `sudo apt install libusb-1.0-0` on Debian / Ubuntu. macOS needs nothing extra.
+
+### Build from source
+
+The build needs Rust 1.88 or newer, libusb-1.0, pkg-config, and libclang (used to generate the libusb bindings).
 
 **1. Install the build dependencies**
 
@@ -109,17 +122,18 @@ cargo install --path ratchet-mcp   # the `ratchet-mcp` MCP server (optional)
 
 Both binaries land in `~/.cargo/bin/`.
 
-**3. Check it works**
+### Check it works
 
 ```bash
 ratchet --version
 ratchet status       # reports the programmer it found, or the mock backend if none is attached
 ```
 
-On Linux, install the udev rule so you do not need `sudo` to reach the programmer. From the repository root:
+On Linux, install the udev rule so you do not need `sudo` to reach the programmer:
 
 ```bash
-sudo install -m 644 packaging/70-ratchet.rules /etc/udev/rules.d/
+curl -fsSL https://raw.githubusercontent.com/jackulau/ratchet/main/packaging/70-ratchet.rules \
+  | sudo tee /etc/udev/rules.d/70-ratchet.rules >/dev/null
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
@@ -145,8 +159,11 @@ cargo build --release
 **Uninstall**
 
 ```bash
+# installed with install.sh (use the directory the installer reported)
+rm -f /usr/local/bin/ratchet /usr/local/bin/ratchet-mcp
+
+# installed with cargo; add --root /opt/ratchet if you installed with --root
 cargo uninstall ratchet-cli ratchet-mcp
-# add --root /opt/ratchet if you installed with --root
 ```
 
 If you built from a checkout, delete the cloned directory. If you registered the MCP server with Claude Desktop, remove the `"ratchet"` entry under `mcpServers` in its config file and restart it.

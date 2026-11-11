@@ -63,7 +63,7 @@ body:
     id: version
     attributes:
       label: ratchet version and operating system
-      placeholder: ratchet 2.0.0-alpha.1, macOS 26 on Apple silicon
+      placeholder: ratchet 2.0.0, macOS 26 on Apple silicon
     validations:
       required: true
   - type: textarea
