@@ -1,0 +1,23 @@
+.github/workflows/audit.yml
+  s_bd4e1ce81a4fd8::t_ff46db72752de9 10
+.github/workflows/ci.yml
+  s_bd4e1ce81a4fd8::t_732b7d042aced1 5
+.github/workflows/release.yml
+  s_bd4e1ce81a4fd8::t_ddf888cb63e368 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "517fa7765526fbb84028417a87ae7d7f7c906296",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "unknown"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
