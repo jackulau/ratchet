@@ -1,0 +1,45 @@
+rust/ratchet-core/src/types.rs
+  s_bd4e1ce81a4fd8::t_c292b0edd09e87 84-109
+  s_bd4e1ce81a4fd8::t_a80213ed5b22ff 200-239
+rust/ratchet-cli/src/main.rs
+  s_bd4e1ce81a4fd8::t_3233cf99b2823a 618-650,1324-1344,1760-1765,1878-1879,1892-1905,2044-2084
+  s_bd4e1ce81a4fd8::t_d69163df1467d9 2085
+.github/ISSUE_TEMPLATE/hardware_report.yml
+  s_bd4e1ce81a4fd8::t_0cd75dabf73dff 66
+README.md
+  s_bd4e1ce81a4fd8::t_0cd75dabf73dff 287,356,366
+rust/ratchet-mcp/src/main.rs
+  s_bd4e1ce81a4fd8::t_0cd75dabf73dff 827-830
+  s_bd4e1ce81a4fd8::t_3233cf99b2823a 824-826,831,838-847,1113-1123
+  s_bd4e1ce81a4fd8::t_cefd3f31c3ff0c 1124
+rust/Cargo.toml
+  s_bd4e1ce81a4fd8::t_0cd75dabf73dff 13,22-24
+rust/ratchet-core/src/backends/ch347.rs
+  s_bd4e1ce81a4fd8::t_c292b0edd09e87 626-629,633-646
+  s_bd4e1ce81a4fd8::t_0cd75dabf73dff 1599-1603
+  s_bd4e1ce81a4fd8::t_a80213ed5b22ff 1481-1598,1604-1646
+.github/ISSUE_TEMPLATE/bug_report.yml
+  s_bd4e1ce81a4fd8::t_0cd75dabf73dff 31
+rust/Cargo.lock
+  s_bd4e1ce81a4fd8::t_1eaccf98a3e192 499,510,522,532,543,551
+tasks/cli-smoke.sh
+  s_bd4e1ce81a4fd8::t_142715b156bada 93-94,132-142
+tasks/mcp-smoke.sh
+  s_bd4e1ce81a4fd8::t_c03b1f3e71346d 114-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "301fce87dbae5fe53fca0b85950c4b3f71919a0e",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
