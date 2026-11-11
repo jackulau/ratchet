@@ -1,0 +1,23 @@
+.github/workflows/release.yml
+  s_bd4e1ce81a4fd8::t_972dee3808b09b 112,126-127
+packaging/70-ratchet.rules
+  s_bd4e1ce81a4fd8::t_972dee3808b09b 1-22
+install.sh
+  s_bd4e1ce81a4fd8::t_972dee3808b09b 117-120,127-130,155-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d14dfab59e3646ba55f36ea36bfbb3c3565c0c0d",
+  "prompts": {},
+  "sessions": {
+    "s_bd4e1ce81a4fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "349b63a4-8165-4169-974f-11fedfd17d37",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Jack <72348727+Jack-GitHub12@users.noreply.github.com>"
+    }
+  }
+}
